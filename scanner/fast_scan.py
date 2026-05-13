@@ -107,8 +107,9 @@ def _run_es(args, timeout=120):
         cmd = [es_exe] + args
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, creationflags=subprocess.CREATE_NO_WINDOW)
-        return result.stdout.strip(), result.returncode
+        result = subprocess.run(cmd, capture_output=True, timeout=timeout, creationflags=subprocess.CREATE_NO_WINDOW)
+        text = result.stdout.decode("utf-8", errors="replace").strip()
+        return text, result.returncode
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         logger.warning(f"es.exe 调用失败: {e}")
         return "", -1
@@ -134,7 +135,7 @@ def _list_all_image_files():
     ext_query = "ext:%s" % ";".join(ext_list)
     logger.info("查询: %s (全局扩展名搜索, Python侧过滤路径)" % ext_query)
 
-    out, code = _run_es(["-csv", "-no-header", ext_query], timeout=120)
+    out, code = _run_es(["-utf8", "-csv", "-no-header", ext_query], timeout=120)
 
     if code == 0 and out:
         files = _parse_es_csv(out)
@@ -339,8 +340,7 @@ def fast_scan(num_files=1000, progress_callback=None):
 
     if code != 0 or not out:
         logger.warning("es.exe 返回空或失败")
-        from scanner.file_scanner import scan_drive
-        return scan_drive(progress_callback)
+        return None
 
     files = []
     for line in out.strip().split("\n"):

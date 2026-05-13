@@ -3,11 +3,41 @@ from contextlib import contextmanager
 
 from logger_setup import logger
 from config import DB_PATH
+from infra.db.repositories.files_repo import FilesRepository
+from infra.db.repositories.folder_categories_repo import FolderCategoriesRepository
+from infra.db.repositories.photo_metadata_repo import PhotoMetadataRepository
+from infra.db.repositories.memories_repo import MemoriesRepository
+from infra.db.repositories.click_history_repo import ClickHistoryRepository
+from infra.db.repositories.photo_tags_repo import PhotoTagsRepository
 
 
 class Database:
     def __init__(self, db_path=None):
         self.db_path = db_path or DB_PATH
+
+    @property
+    def files(self):
+        return FilesRepository(self)
+
+    @property
+    def folder_categories(self):
+        return FolderCategoriesRepository(self)
+
+    @property
+    def photo_metadata(self):
+        return PhotoMetadataRepository(self)
+
+    @property
+    def memories(self):
+        return MemoriesRepository(self)
+
+    @property
+    def click_history(self):
+        return ClickHistoryRepository(self)
+
+    @property
+    def photo_tags(self):
+        return PhotoTagsRepository(self)
 
     @contextmanager
     def connect(self):

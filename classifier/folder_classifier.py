@@ -14,7 +14,6 @@ from config import (
     CATEGORY_ADULT,
     CATEGORY_NAMES,
     SOURCE_DRIVE,
-    get_openai_client,
 )
 from db_manager import Database
 
@@ -146,12 +145,14 @@ def classify_branches_with_llm(branch_names):
 返回 JSON 对象，key=文件夹名，value=分类数字(0-4)："""
 
     try:
-        response = client.chat.completions.create(
+        from infra.llm.client import get_llm_client
+        llm = get_llm_client()
+        response = llm.chat(
             model=DEEPSEEK_MODEL,
             messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
             temperature=0.1,
             max_tokens=4096,
-            response_format={"type": "json_object"},
         )
         result_text = response.choices[0].message.content.strip()
         return json.loads(result_text)
@@ -293,12 +294,13 @@ def find_similar_photos_in_folder(target_file_id, folder_path):
 注意：只返回高度确定属于同一组的照片。如果目标照片特征孤立，返回空列表。"""
 
     try:
-        client = get_openai_client()
-        response = client.chat.completions.create(
+        from infra.llm.client import get_llm_client
+        llm = get_llm_client()
+        response = llm.chat(
             model=DEEPSEEK_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
             response_format={"type": "json_object"},
+            temperature=0.3,
         )
         text = response.choices[0].message.content.strip()
         result = json.loads(text)

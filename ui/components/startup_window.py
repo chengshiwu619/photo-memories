@@ -1,161 +1,15 @@
 import os
-import threading
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QProgressBar, QApplication, QMessageBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont
 
 from logger_setup import logger
 
 
-class StartupWorker(QThread):
-    stage_changed = pyqtSignal(str)
-    progress = pyqtSignal(int, int)
-    all_done = pyqtSignal()
-    error_occurred = pyqtSignal(str)
-    interactive_classify_needed = pyqtSignal(list)
-    background_scan_needed = pyqtSignal()
-    background_index_needed = pyqtSignal()
-
-    def __init__(self):
-        super().__init__()
-        self._cancelled = False
-        self._classify_event = threading.Event()
-        self._classify_results = []
-
-    def cancel(self):
-        self._cancelled = True
-        from scanner.fast_scan import set_stopped as scan_stopped
-        from indexer.photo_indexer import set_stopped as index_stopped
-        scan_stopped()
-        index_stopped()
-        self._classify_event.set()
-        logger.info("用户取消启动流程")
-
-    def set_classify_results(self, results):
-        self._classify_results = results
-        self._classify_event.set()
-
-    def run(self):
-        try:
-            from scanner.fast_scan import full_scan as scan_drive, clear_checkpoint as clear_scan
-            from classifier.folder_classifier import classify_folders, propagate_branch_category
-            from indexer.photo_indexer import index_photos, clear_checkpoint as clear_index
-            from memory.memory_generator import generate_all_memories
-
-            clear_scan()
-            clear_index()
-
-            self.stage_changed.emit("正在扫描 Y 盘文件...")
-            self.progress.emit(0, 0)
-            logger.info("启动阶段 1/4: 扫描文件")
-            bg_scan_needed = False
-            if _skip_scan():
-                result = {"total": _db_file_count(), "new": 0, "removed": 0}
-                logger.info("测试模式: 跳过扫描")
-            else:
-                result = scan_drive(progress_callback=self._on_scan_progress, batch_limit=500)
-            if self._cancelled:
-                self.error_occurred.emit("扫描已取消")
-                return
-            if result.get("batch_limit_reached"):
-                bg_scan_needed = True
-                logger.info(f"扫描热身: {result.get('new', 0)} 条, 剩余后台继续")
-            elif result.get("paused"):
-                self.error_occurred.emit("扫描已取消")
-                return
-            logger.info(f"扫描阶段完成: 总计 {result.get('total', 0)} 文件")
-
-            self.stage_changed.emit("正在 LLM 预分类文件夹...")
-            self.progress.emit(0, 0)
-            logger.info("启动阶段 2/4: 分类文件夹")
-            classify_result = classify_folders(progress_callback=self._on_classify_progress)
-            if self._cancelled:
-                self.error_occurred.emit("分类已取消")
-                return
-            logger.info(f"分类完成: 已分类 {classify_result.get('classified', 0)}, 需确认 {len(classify_result.get('needs_user', []))}")
-
-            needs_user = classify_result.get("needs_user", [])
-            if needs_user and not self._cancelled:
-                logger.info(f"请求用户确认 {len(needs_user)} 个分支文件夹分类")
-                self.interactive_classify_needed.emit(needs_user)
-                self._classify_event.wait()
-                self._classify_event.clear()
-                if self._cancelled:
-                    self.error_occurred.emit("分类已取消")
-                    return
-                for branch_path, category in self._classify_results:
-                    propagate_branch_category(branch_path, category)
-                logger.info(f"用户确认 {len(self._classify_results)} 个分支分类")
-
-            self.stage_changed.emit("正在生成缩略图...")
-            self.progress.emit(0, 0)
-            logger.info("启动阶段 3/4: 生成缩略图")
-            bg_needed = False
-            try:
-                if _skip_index():
-                    logger.info("缩略图已足够 (>=100), 跳过前台索引，稍后后台补索引")
-                    index_result = {"total": 0, "indexed": 0}
-                    bg_needed = True
-                else:
-                    index_result = index_photos(progress_callback=self._on_index_progress, batch_limit=100)
-                if self._cancelled:
-                    self.error_occurred.emit("索引已取消")
-                    return
-                if index_result.get("batch_limit_reached"):
-                    bg_needed = True
-                    logger.info(f"索引热身完成: {index_result.get('indexed', 0)}/{index_result.get('total', 0)}, 剩余后台继续")
-                elif index_result.get("paused"):
-                    self.error_occurred.emit("索引已取消")
-                    return
-                else:
-                    logger.info(f"索引完成: {index_result.get('indexed', 0)}/{index_result.get('total', 0)}")
-            except Exception as e:
-                logger.warning(f"索引异常，跳过: {e}")
-
-            self.stage_changed.emit("正在生成回忆...")
-            self.progress.emit(0, 0)
-            logger.info("启动阶段 4/4: 生成回忆")
-            memories_result = generate_all_memories(progress_callback=self._on_memory_progress)
-            if self._cancelled:
-                self.error_occurred.emit("回忆生成已取消")
-                return
-            logger.info("所有阶段完成")
-
-            self.stage_changed.emit("初始化完成")
-            self.progress.emit(100, 100)
-            if bg_scan_needed:
-                self.background_scan_needed.emit()
-            if bg_needed:
-                self.background_index_needed.emit()
-            self.all_done.emit()
-
-        except Exception as e:
-            logger.exception("启动流程异常")
-            self.error_occurred.emit(str(e))
-
-    def _on_scan_progress(self, scanned, found):
-        self.progress.emit(scanned, found)
-        self.stage_changed.emit(f"扫描中... 已发现 {found} 个文件")
-
-    def _on_classify_progress(self, current, total):
-        if total > 0:
-            self.progress.emit(current, total)
-            self.stage_changed.emit(f"分类中... {current}/{total}")
-
-    def _on_index_progress(self, current, total):
-        if total > 0:
-            self.progress.emit(current, total)
-            self.stage_changed.emit(f"索引中... {current}/{total}")
-
-    def _on_memory_progress(self, current, total, category_name, state):
-        self.progress.emit(current, total)
-        if state == "thinking":
-            self.stage_changed.emit(f"回忆生成中... {category_name}")
-        else:
-            self.stage_changed.emit(f"回忆完成: {category_name}")
+from services.pipeline import Pipeline, ScanStage, ClassifyStage, IndexStage, MemoryStage
 
 
 class StartupWindow(QWidget):
@@ -259,17 +113,22 @@ class StartupWindow(QWidget):
         self.move(x, y)
 
     def start(self):
-        self.worker = StartupWorker()
-        self.worker.stage_changed.connect(self.stage_label.setText)
-        self.worker.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
-        self.worker.all_done.connect(self._on_all_done, Qt.ConnectionType.QueuedConnection)
-        self.worker.error_occurred.connect(self._on_error, Qt.ConnectionType.QueuedConnection)
-        self.worker.interactive_classify_needed.connect(self._on_classify_needed, Qt.ConnectionType.QueuedConnection)
-        self.worker.background_scan_needed.connect(self.background_scan_needed.emit)
-        self.worker.background_index_needed.connect(self.background_index_needed.emit)
-        self.worker.finished.connect(self._on_worker_finished)
-        self.worker.start()
-        logger.info("一键启动流程开始")
+        pipeline = Pipeline()
+        pipeline.add_stage(ScanStage())
+        pipeline.add_stage(ClassifyStage())
+        pipeline.add_stage(IndexStage())
+        pipeline.add_stage(MemoryStage())
+        self.worker = pipeline
+        pipeline.stage_changed.connect(self.stage_label.setText)
+        pipeline.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
+        pipeline.all_done.connect(self._on_all_done, Qt.ConnectionType.QueuedConnection)
+        pipeline.error_occurred.connect(self._on_error, Qt.ConnectionType.QueuedConnection)
+        pipeline.interactive_classify_needed.connect(self._on_classify_needed, Qt.ConnectionType.QueuedConnection)
+        pipeline.background_scan_needed.connect(self.background_scan_needed.emit)
+        pipeline.background_index_needed.connect(self.background_index_needed.emit)
+        pipeline.finished.connect(self._on_worker_finished)
+        pipeline.start()
+        logger.info("Pipeline 启动流程开始")
 
     def _on_progress(self, current, total):
         if total > 0:
@@ -403,26 +262,4 @@ class StartupWindow(QWidget):
         super().mouseMoveEvent(event)
 
 
-def _skip_scan():
-    return os.environ.get("PHOTO_TEST_MODE", "").lower() in ("1", "true", "yes")
 
-
-def _skip_index():
-    from db_manager import Database
-    try:
-        db = Database()
-        with db.connect() as conn:
-            n = conn.execute(
-                "SELECT COUNT(*) FROM photo_metadata WHERE thumbnail_path IS NOT NULL"
-            ).fetchone()[0]
-        return n >= 100
-    except Exception:
-        return False
-
-
-def _db_file_count():
-    from db_manager import Database
-    db = Database()
-    with db.connect() as conn:
-        n = conn.execute("SELECT COUNT(1) FROM files").fetchone()[0]
-    return n

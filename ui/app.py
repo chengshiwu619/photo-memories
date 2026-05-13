@@ -22,6 +22,8 @@ from ui.recommendation import rank_category_photos, load_category_photos_batch, 
 from ui.recommendation import CATEGORY_COLORS, PAGE_SIZE
 
 
+from services.background_task_manager import BackgroundTaskManager
+
 _bg_threads = []
 
 CATEGORIES = [
@@ -80,6 +82,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         logger.info("MainWindow 正在关闭，等待后台线程...")
+        BackgroundTaskManager.get_instance().wait_all(5000)
         for t in _bg_threads[:]:
             t.wait(5000)
             if t.isRunning():
@@ -522,6 +525,7 @@ def main():
             bg = BgScanWorker()
             bg.finished.connect(lambda: logger.info("后台扫描线程结束"))
             bg.start()
+            BackgroundTaskManager.get_instance().register(bg)
             _bg_threads.append(bg)
             logger.info("后台扫描线程已启动")
 
@@ -555,6 +559,7 @@ def main():
             bg.progress.connect(lambda cur, tot: logger.info(f"后台索引: {cur}/{tot}"))
             bg.finished.connect(lambda: logger.info("后台索引线程结束"))
             bg.start()
+            BackgroundTaskManager.get_instance().register(bg)
             _bg_threads.append(bg)
             logger.info("后台索引线程已启动")
 

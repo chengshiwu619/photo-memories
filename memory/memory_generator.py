@@ -110,7 +110,8 @@ def generate_memories_for_category(category):
         logger.info(f"分类 '{category_name}' 照片不足 (<5), 跳过")
         return {"category": category_name, "generated": 0, "reason": "照片太少"}
 
-    client = get_openai_client()
+    from infra.llm.client import get_llm_client
+    llm = get_llm_client()
 
     focused = pick_focused_photos(photos)
     context = build_photo_context(focused)
@@ -138,11 +139,11 @@ def generate_memories_for_category(category):
 {{"title": "标题", "description": "描述"}}"""
 
     try:
-        response = client.chat.completions.create(
+        response = llm.chat(
             model=DEEPSEEK_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=temp,
             response_format={"type": "json_object"},
+            temperature=temp,
         )
         text = response.choices[0].message.content.strip()
         result = json.loads(text)

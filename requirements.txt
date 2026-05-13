@@ -2,5 +2,7 @@ openai>=1.0.0
 Pillow>=10.0.0
 pillow-heif>=1.0.0
 python-dotenv>=1.0.0
+pydantic-settings>=2.0.0
+tenacity>=8.0.0
 PyQt6>=6.5.0
 exifread>=3.0.0
