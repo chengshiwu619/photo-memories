@@ -91,6 +91,8 @@ def get_openai_client():
 
 
 def is_configured():
+    if not os.path.isfile(ENV_FILE):
+        return False
     return get_settings().is_configured()
 
 
@@ -114,8 +116,12 @@ def save_config(source_drive, data_dir, api_key, base_url="https://api.deepseek.
     _sync_module_vars_from_settings()
     _OPENAI_CLIENT = None
 
-    os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs(THUMBNAIL_DIR, exist_ok=True)
+    s = get_settings()
+    os.makedirs(s.photo_data_dir, exist_ok=True)
+    os.makedirs(s.thumbnail_dir, exist_ok=True)
+
+    from infra.llm.client import LLMClient
+    LLMClient.reset()
 
 
 def reload_config():
@@ -126,10 +132,15 @@ def reload_config():
     _sync_module_vars_from_settings()
     _OPENAI_CLIENT = None
 
-    os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs(THUMBNAIL_DIR, exist_ok=True)
+    s = get_settings()
+    os.makedirs(s.photo_data_dir, exist_ok=True)
+    os.makedirs(s.thumbnail_dir, exist_ok=True)
+
+    from infra.llm.client import LLMClient
+    LLMClient.reset()
 
 
 _sync_module_vars_from_settings()
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(THUMBNAIL_DIR, exist_ok=True)
+_s = get_settings()
+os.makedirs(_s.photo_data_dir, exist_ok=True)
+os.makedirs(_s.thumbnail_dir, exist_ok=True)

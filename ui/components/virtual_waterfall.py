@@ -1,6 +1,6 @@
-from PyQt6.QtWidgets import QWidget, QLabel, QFrame, QScrollArea, QVBoxLayout
-from PyQt6.QtCore import Qt, QRect, pyqtSignal, QSize
-from PyQt6.QtGui import QPixmap, QPainter
+from PyQt6.QtWidgets import QWidget, QLabel, QFrame, QScrollArea
+from PyQt6.QtCore import Qt, QRect, pyqtSignal, QSize, QTimer
+from PyQt6.QtGui import QPixmap, QPixmapCache
 
 
 COL_COUNT = 3
@@ -21,16 +21,34 @@ class VirtualPhotoCard(QFrame):
         self.thumb_label = QLabel(self)
         self.thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.thumb_label.setFixedSize(width, height)
-        self.thumb_label.setScaledContents(True)
+        self.thumb_label.setText("…")
+        self.thumb_label.setStyleSheet("color: #444; font-size: 12px; background: #222;")
 
-        thumb = photo_data.get("thumbnail_path", "")
-        if thumb:
-            pixmap = QPixmap(thumb)
-            if not pixmap.isNull():
-                self.thumb_label.setPixmap(pixmap)
-            else:
-                self.thumb_label.setText("?")
-                self.thumb_label.setStyleSheet("color: #666; font-size: 12px; background: #333;")
+    def _scaled_pixmap(self, pixmap):
+        label_size = self.thumb_label.size()
+        scaled = pixmap.scaled(
+            label_size,
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        x = (scaled.width() - label_size.width()) // 2
+        y = (scaled.height() - label_size.height()) // 2
+        return scaled.copy(x, y, label_size.width(), label_size.height())
+
+    def load_thumbnail(self):
+        thumb = self.photo_data.get("thumbnail_path", "")
+        if not thumb:
+            self.thumb_label.setText("?")
+            self.thumb_label.setStyleSheet("color: #666; font-size: 12px; background: #333;")
+            return
+        pixmap = QPixmapCache.find(thumb)
+        if pixmap:
+            self.thumb_label.setPixmap(self._scaled_pixmap(pixmap))
+            return
+        pixmap = QPixmap(thumb)
+        if not pixmap.isNull():
+            QPixmapCache.insert(thumb, pixmap)
+            self.thumb_label.setPixmap(self._scaled_pixmap(pixmap))
         else:
             self.thumb_label.setText("?")
             self.thumb_label.setStyleSheet("color: #666; font-size: 12px; background: #333;")
@@ -54,16 +72,9 @@ class VirtualWaterfallLayout:
         self._col_heights = [0] * self._col_count
 
         for photo in self._photos:
-            thumb = photo.get("thumbnail_path", "")
-            height = self._card_width
-            if thumb:
-                pixmap = QPixmap(thumb)
-                if not pixmap.isNull():
-                    pw, ph = pixmap.width(), pixmap.height()
-                    if pw > 0:
-                        height = int(self._card_width * ph / pw)
-                        height = max(60, min(height, 800))
-            height += GAP
+            pw = photo.get("width") or 1
+            ph = photo.get("height") or 1
+            height = max(60, min(int(self._card_width * ph / pw), 800)) + GAP
 
             col = self._col_heights.index(min(self._col_heights))
             x = col * (self._card_width + GAP)
@@ -71,7 +82,7 @@ class VirtualWaterfallLayout:
             self._positions.append((x, y, self._card_width, height))
             self._col_heights[col] += height
 
-        self._total_height = max(self._col_heights) + GAP
+        self._total_height = max(self._col_heights) + GAP if self._col_heights else GAP
 
     def update_card_width(self, width):
         self._card_width = max(80, width)
@@ -126,7 +137,40 @@ class VirtualCategoryPage(QScrollArea):
         self._viewport.setStyleSheet("background: #111;")
         self.setWidget(self._viewport)
 
+        self._empty_label = QLabel("索引中，照片即将出现…", self)
+        self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_label.setStyleSheet("color: #555; font-size: 14px; background: transparent;")
+        self._empty_label.hide()
+
         self.verticalScrollBar().valueChanged.connect(self._on_scroll)
+
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(150)
+        self._resize_timer.timeout.connect(self._do_relayout)
+
+        self.memory_summary = QLabel(self._viewport)
+        self.memory_summary.setStyleSheet("""
+            font-size: 12px; color: #aaa; padding: 6px 10px;
+            background: rgba(0,0,0,0.5);
+        """)
+        self.memory_summary.setWordWrap(True)
+        self.memory_summary.hide()
+
+    @property
+    def scroll(self):
+        return self
+
+    def set_memory_summary(self, text):
+        if text:
+            self.memory_summary.setText(text)
+            self.memory_summary.show()
+            self.memory_summary.raise_()
+        else:
+            self.memory_summary.hide()
+
+    def load_photos(self, photos):
+        self.set_photos(photos)
 
     def set_photos(self, photos):
         self._photos = list(photos)
@@ -135,6 +179,12 @@ class VirtualCategoryPage(QScrollArea):
         self._destroy_visible_cards()
         self._recompute_layout()
         self._render_visible()
+        if self._photos:
+            self._empty_label.hide()
+        else:
+            self._empty_label.setGeometry(self.geometry())
+            self._empty_label.raise_()
+            self._empty_label.show()
 
     def append_photos(self, new_photos):
         if not new_photos:
@@ -160,13 +210,16 @@ class VirtualCategoryPage(QScrollArea):
     def _render_visible(self):
         scroll_y = self.verticalScrollBar().value()
         vp_h = self.viewport().height()
-        for idx, x, y, w, h in self._layout.cards_in_range(scroll_y, vp_h):
+        cards = self._layout.cards_in_range(scroll_y, vp_h) if self._layout else []
+        for idx, x, y, w, h in cards:
             if idx in self._card_widgets:
                 continue
             photo = self._layout.photo_at(idx)
             card = VirtualPhotoCard(photo, w, h, self._viewport)
             card.move(x, y)
+            card.load_thumbnail()
             card.clicked.connect(self.photo_clicked)
+            card.show()
             self._card_widgets[idx] = card
 
         visible_indices = {idx for idx, _, _, _, _ in self._layout.cards_in_range(scroll_y, vp_h)}
@@ -186,9 +239,12 @@ class VirtualCategoryPage(QScrollArea):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if self._photos:
-            self._destroy_visible_cards()
-            self._recompute_layout()
-            self._render_visible()
+            self._resize_timer.start()
+
+    def _do_relayout(self):
+        self._destroy_visible_cards()
+        self._recompute_layout()
+        self._render_visible()
 
     def clear(self):
         self._destroy_visible_cards()

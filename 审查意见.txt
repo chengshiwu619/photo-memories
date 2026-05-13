@@ -1,0 +1,354 @@
+# 代码评审（第二轮）
+
+先说整体印象：重构方向很对，阶段 0 / A0 / A1 的地基都打得不错。但在实际集成时引入了几处会在运行时直接崩溃的 bug，另外还有一些"新代码写了但没接入"的情况。下面按严重度分类。
+
+---
+
+## 🔴 一、必须立刻修复的 Bug（会运行时崩溃）
+
+### 1.1 `classifier/folder_classifier.py` 有两处会抛 NameError
+
+第 107 行 typo（你自己的 `重构摘要.txt` 里也标注了）：
+
+```python
+# ❌ 当前
+logger.info(f"分类历史已写入 {CLASSASSIFICATION_HISTORY_FILE}: {len(rows)} 条")
+
+# ✅ 修复
+logger.info(f"分类历史已写入 {CLASSIFICATION_HISTORY_FILE}: {len(rows)} 条")
+```
+
+`classify_branches_with_llm()` 开头的死代码：
+
+```python
+def classify_branches_with_llm(branch_names):
+    client = get_openai_client()   # ❌ 未 import，会 NameError
+    ...
+    # 后面实际用的是：
+    from infra.llm.client import get_llm_client
+    llm = get_llm_client()
+```
+
+`get_openai_client` 在 import 列表里没有。删掉这一行即可。这两个 bug 任何一次触发分类流程都会爆——必须立刻修。
+
+---
+
+### 1.2 `services/pipeline.py` ClassifyStage 交互逻辑失效（严重）
+
+当前 Pipeline 的分类流程有时序错误：
+
+```python
+# services/pipeline.py Pipeline.run()
+if isinstance(stage, ClassifyStage):
+    self._classify_event.clear()
+    result = stage.run(progress_callback=self._on_progress)   # ① 先跑 stage.run()
+    needs_user = result.get("needs_user", [])
+    if needs_user:
+        self.interactive_classify_needed.emit(needs_user)     # ② 才让用户选
+        self._classify_event.wait()
+        self._classify_event.clear()
+        stage.set_interactive_results(self._pending_classify_results)  # ③ 把结果传回
+        # 但 stage.run() 已经返回了，传回来也没用！
+```
+
+再看 `ClassifyStage.run()`：
+
+```python
+def run(self, progress_callback=None) -> dict:
+    result = classify_folders(progress_callback=progress_callback)
+    needs_user = result.get("needs_user", [])
+    for branch_path, category in self._interactive_results:   # ← 永远是空 list
+        propagate_branch_category(branch_path, category)
+    return {"classified": result.get("classified", 0), "needs_user": needs_user}
+```
+
+结果：用户在对话框里选的分类永远不会被传播到子文件夹。这是重构引入的新 bug（旧 StartupWorker 里是 wait 完再 propagate 的）。
+
+建议修复：把 ClassifyStage 拆成两阶段，或者把 propagate 逻辑搬到 Pipeline 里：
+
+```python
+class ClassifyStage(Stage):
+    name = "分类文件夹"
+
+    def run(self, progress_callback=None) -> dict:
+        from classifier.folder_classifier import classify_folders
+        return classify_folders(progress_callback=progress_callback)
+
+    def apply_user_results(self, results: list):
+        """在用户完成交互后调用"""
+        from classifier.folder_classifier import propagate_branch_category
+        for branch_path, category in results:
+            propagate_branch_category(branch_path, category)
+
+# Pipeline.run() 改为
+if isinstance(stage, ClassifyStage):
+    result = stage.run(progress_callback=self._on_progress)
+    needs_user = result.get("needs_user", [])
+    if needs_user:
+        self.interactive_classify_needed.emit(needs_user)
+        self._classify_event.wait()
+        self._classify_event.clear()
+        stage.apply_user_results(self._pending_classify_results)  # ← 事后传播
+```
+
+---
+
+### 1.3 `img.draft()` 导致原图尺寸被污染
+
+`indexer/photo_indexer.py`：
+
+```python
+with Image.open(filepath) as img:
+    img.draft("RGB", THUMBNAIL_SIZE)   # ← draft 之后 img.size 已经被缩小
+    img = _auto_rotate(img)
+    w, h = img.size                    # ❌ 这里拿到的是 draft 之后的尺寸
+    img.thumbnail(THUMBNAIL_SIZE, Image.LANCZOS)
+```
+
+`draft()` 会让 JPEG 解码器按 1/2、1/4、1/8 预降采样，此时 `img.size` 已不是原始尺寸。这导致 `photo_metadata.width / height` 存的是降采样后的尺寸（可能是 200×150 而不是 4000×3000）。
+
+修复：
+
+```python
+with Image.open(filepath) as img:
+    orig_w, orig_h = img.size       # ← 先读原始尺寸（header only, 不解码）
+    img.draft("RGB", THUMBNAIL_SIZE)
+    img = _auto_rotate(img)
+    img.thumbnail(THUMBNAIL_SIZE, Image.LANCZOS)
+    if img.mode in ("RGBA", "P"):
+        img = img.convert("RGB")
+    img.save(thumb_path, "JPEG", quality=80)
+return thumb_path, orig_w, orig_h
+```
+
+注意：旋转前读的 orig_w/h 对竖拍照片可能需要 swap，但原来的代码也是这样处理的，保持一致即可。
+
+---
+
+## 🟡 二、重要问题（架构或性能）
+
+### 2.1 虚拟瀑布流目前会"一次性加载全部缩略图"
+
+`ui/components/virtual_waterfall.py` 的 `_compute_layout`：
+
+```python
+def _compute_layout(self):
+    for photo in self._photos:
+        thumb = photo.get("thumbnail_path", "")
+        height = self._card_width
+        if thumb:
+            pixmap = QPixmap(thumb)         # ❌ 每张都 load pixmap
+            if not pixmap.isNull():
+                pw, ph = pixmap.width(), pixmap.height()
+```
+
+6 万张图每次 `set_photos` 就要 QPixmap 加载 6 万次 —— 完全违背虚拟滚动的本意（原本就是为了避免这个）。
+
+修复思路：
+1. `photo_metadata` 表里已经存了 `width` 和 `height`，`load_category_photos_batch()` 多查这两列返回给 UI。
+2. `_compute_layout` 只用 dict 里的 width/height 计算布局，不触碰文件。
+3. `VirtualPhotoCard` 只在真正渲染进视口时才调用 `QPixmap(thumb)`，并用 `QPixmapCache` 做二级缓存。
+
+```python
+# ui/components/virtual_waterfall.py
+def _compute_layout(self):
+    for photo in self._photos:
+        pw = photo.get("width") or 1
+        ph = photo.get("height") or 1
+        height = max(60, min(int(self._card_width * ph / pw), 800)) + GAP
+        ...
+```
+
+另外 `resizeEvent` 会触发全量重算，6 万条就再来一轮。要加 debounce：
+
+```python
+def __init__(self, ...):
+    self._resize_timer = QTimer(self)
+    self._resize_timer.setSingleShot(True)
+    self._resize_timer.setInterval(150)
+    self._resize_timer.timeout.connect(self._do_relayout)
+
+def resizeEvent(self, event):
+    super().resizeEvent(event)
+    self._resize_timer.start()
+```
+
+### 2.2 `VirtualCategoryPage` 写完了但没接入 `MainWindow`
+
+`ui/app.py` 还在用老的 `CategoryPage`：
+
+```python
+from ui.components.memory_cards import CategoryPage   # ← 旧的
+```
+
+虚拟瀑布流等于白写。等 2.1 修完性能问题后，需要：
+
+```python
+from ui.components.virtual_waterfall import VirtualCategoryPage as CategoryPage
+```
+
+并适配接口差异（`set_memory_summary`、`load_photos` → `set_photos` 等）。
+
+### 2.3 Repository 层写了但一个都没用
+
+`core/models.py`、`infra/db/repositories/*.py` 已齐备，也有测试（`test_repositories.py`），但生产代码全部还在用原始 SQL：
+
+```python
+# classifier/folder_classifier.py
+with _db.connect() as conn:
+    rows = conn.execute("SELECT ...").fetchall()   # ← 原始 SQL
+
+# 而 _db.folder_categories.get_unclassified_folders() 其实早就写好了
+```
+
+这是"代码写了一半"的典型状态。建议阶段 B 集中把以下文件的 SQL 全部迁到 repo：
+
+| 文件 | 调用 | 改为 |
+|------|------|------|
+| `classifier/folder_classifier.py` | 5 处 `conn.execute` | `db.folder_categories.*` / `db.files.*` |
+| `memory/memory_generator.py` | 6 处 | `db.memories.*` / `db.photo_metadata.*` |
+| `indexer/photo_indexer.py` | 2 处 | `db.photo_metadata.*` |
+| `scanner/fast_scan.py` | 6 处 | `db.files.*` |
+| `ui/recommendation.py` | 5 处 | 新建 `query_service.py` 或 repo 方法 |
+| `ui/app.py` | 4 处 | 同上 |
+
+做完之后删掉老 SQL，schema 变更只需改 repo 一处。
+
+### 2.4 `LLMClient` 单例无法感知配置变更
+
+```python
+class LLMClient:
+    _instance = None
+    def __init__(self):
+        from config import get_openai_client
+        self._client = get_openai_client()   # ← 只在首次创建时读
+```
+
+当 `save_config()` 修改了 API Key 后：
+- `config._OPENAI_CLIENT = None` ✓（会重建 OpenAI 底层 client）
+- 但 `LLMClient._instance._client` 仍指向老的 OpenAI client
+
+意味着用户改 API Key 后必须重启应用才能生效。修复：
+
+```python
+class LLMClient:
+    _instance = None
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    @classmethod
+    def reset(cls):
+        cls._instance = None
+
+# config.save_config() 末尾加一行
+from infra.llm.client import LLMClient
+LLMClient.reset()
+```
+
+### 2.5 `_bg_threads` 和 `BackgroundTaskManager` 双写
+
+`ui/app.py` 同时往两个容器里塞线程：
+
+```python
+bg.start()
+BackgroundTaskManager.get_instance().register(bg)
+_bg_threads.append(bg)   # ← 模块级全局，还在
+```
+
+删掉 `_bg_threads` 以及所有对它的引用（`closeEvent` 里的 for 循环），统一用 `BackgroundTaskManager`。否则下一次重构新手还是得看两套代码。
+
+---
+
+## 🟢 三、小问题 / 代码卫生
+
+1. `services/pipeline.py` cancel() 竞态：`self._classify_event` 在 `run()` 里才创建。虽然有 `if self._classify_event` 保护，但在极快的用户点击下（`start()` → 立刻 cancel）理论上 run 还没执行到赋值。建议改成 `__init__` 里就创建：
+   ```python
+   def __init__(self):
+       super().__init__()
+       self._classify_event = threading.Event()
+       ...
+   ```
+
+2. `export_project.py` 和 `merge_to_txt.py` 功能重复，选一个留下。
+
+3. `everything/es.exe.old`（1270 行二进制！）：为什么还在仓库里？加到 `.gitignore` 并删除。
+
+4. `ui/app.py` MainWindow 还是 600 行：阶段 C 的 "拆分 controllers/widgets" 还没动。现在改动成本还小，越往后越难拆。
+
+5. `config.py` save_config 末尾：
+   ```python
+   os.makedirs(DATA_DIR, exist_ok=True)
+   os.makedirs(THUMBNAIL_DIR, exist_ok=True)
+   ```
+   `DATA_DIR` 是模块级变量，靠 `_sync_module_vars_from_settings()` 更新。建议直接用 `s = get_settings(); os.makedirs(s.photo_data_dir, ...)`，少一层间接。
+
+6. 测试缺失：
+   - `services/pipeline.py` 没有测试（ClassifyStage 这个 bug 如果有测试就逮到了）
+   - `infra/llm/client.py` 没有测试
+   - `VirtualWaterfallLayout` 已有测试但太浅，没测性能
+
+---
+
+## 📊 四、当前重构进度评估
+
+```echarts
+{
+  "tooltip": { "trigger": "axis" },
+  "legend": { "data": ["baseline", "stage-A1(当前)", "重构目标"], "textStyle": { "color": "#333" } },
+  "radar": {
+    "indicator": [
+      { "name": "可测试性", "max": 10 },
+      { "name": "可维护性", "max": 10 },
+      { "name": "架构清晰度", "max": 10 },
+      { "name": "运行稳定性", "max": 10 },
+      { "name": "大库性能", "max": 10 },
+      { "name": "错误恢复", "max": 10 }
+    ]
+  },
+  "series": [{
+    "type": "radar",
+    "data": [
+      { "name": "baseline", "value": [2, 4, 5, 6, 4, 3], "areaStyle": { "opacity": 0.2 } },
+      { "name": "stage-A1(当前)", "value": [6, 6, 7, 5, 4, 6], "areaStyle": { "opacity": 0.3 } },
+      { "name": "重构目标", "value": [9, 8, 9, 8, 8, 8], "areaStyle": { "opacity": 0.2 } }
+    ]
+  }]
+}
+```
+
+注意"运行稳定性"从 6 掉到 5：原因就是 1.1 / 1.2 / 1.3 这三个新引入的 bug。重构引入回归 bug 是常态，关键是下阶段开工前先把红色全部清掉。
+
+---
+
+## 🎯 五、下一步建议顺序
+
+按优先级做，别跳步：
+
+1. 今天就修（30 分钟）：
+   - [ ] `CLASSASSIFICATION_HISTORY_FILE` typo
+   - [ ] `classify_branches_with_llm` 里的 `get_openai_client()` 死代码
+   - [ ] 手动跑一遍全流程，确认 LLM 分类能完整走通
+
+2. 本周修（2-3 小时）：
+   - [ ] ClassifyStage 交互逻辑修复（§1.2）
+   - [ ] `img.draft` 尺寸 bug（§1.3）
+   - [ ] LLMClient reset（§2.4）
+   - [ ] 给 ClassifyStage + Pipeline 写一个集成测试，覆盖交互分支
+
+3. 阶段 B 正式启动前（1 天）：
+   - [ ] VirtualWaterfall 改用 DB 里的 width/height，不再 load pixmap（§2.1）
+   - [ ] VirtualCategoryPage 接入 MainWindow（§2.2）
+   - [ ] 删除 `_bg_threads` 全局（§2.5）
+
+4. 阶段 B（按你的原计划，3-5 天）：
+   - 把 Repository 层实际用起来，迁移 30+ 处原始 SQL
+
+---
+
+简单总结：架构方向正确，地基也打好了，但集成时引入了几个致命 bug，而且新写的组件（Repository、VirtualWaterfall）还没真正接入生产代码。先把 🔴 的三处修掉，跑一遍完整流程确认没有 regression，再推进下阶段。
+
+要我直接给你1.1 / 1.2 / 1.3 三处的完整修复 patch 吗？

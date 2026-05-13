@@ -34,13 +34,13 @@ def test_extensions_sets():
 
 
 def test_is_configured_without_api_key():
-    import config
-    orig = config.DEEPSEEK_API_KEY
+    import config, os
+    orig_env = config.ENV_FILE
     try:
-        config.DEEPSEEK_API_KEY = ""
+        config.ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_nonexistent_.env")
         assert config.is_configured() is False
     finally:
-        config.DEEPSEEK_API_KEY = orig
+        config.ENV_FILE = orig_env
 
 
 def test_is_configured_with_all():

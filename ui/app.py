@@ -15,7 +15,7 @@ from config import (
     CATEGORY_NAMES, is_configured,
 )
 from db_manager import Database
-from ui.components.memory_cards import CategoryPage
+from ui.components.virtual_waterfall import VirtualCategoryPage as CategoryPage
 from ui.components.startup_window import StartupWindow
 from ui.components.image_viewer import ImageViewer
 from ui.recommendation import rank_category_photos, load_category_photos_batch, load_starred_photos
@@ -23,8 +23,6 @@ from ui.recommendation import CATEGORY_COLORS, PAGE_SIZE
 
 
 from services.background_task_manager import BackgroundTaskManager
-
-_bg_threads = []
 
 CATEGORIES = [
     (CATEGORY_LIFE, CATEGORY_NAMES[CATEGORY_LIFE]),
@@ -83,11 +81,6 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         logger.info("MainWindow 正在关闭，等待后台线程...")
         BackgroundTaskManager.get_instance().wait_all(5000)
-        for t in _bg_threads[:]:
-            t.wait(5000)
-            if t.isRunning():
-                logger.warning(f"后台线程 {t} 未能在5秒内结束，继续关闭")
-        _bg_threads.clear()
         super().closeEvent(event)
 
     def setup_ui(self):
@@ -133,6 +126,16 @@ class MainWindow(QMainWindow):
         self.star_btn.setCheckable(True)
         self.star_btn.clicked.connect(self.toggle_starred)
         top_layout.addWidget(self.star_btn)
+
+        settings_btn = QPushButton("⚙ 设置")
+        settings_btn.setStyleSheet("""
+            QPushButton { background: #34495e; color: white; border: none;
+                padding: 6px 16px; border-radius: 4px; font-size: 13px; }
+            QPushButton:hover { background: #4a6a8a; }
+        """)
+        settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        settings_btn.clicked.connect(self._open_settings)
+        top_layout.addWidget(settings_btn)
 
         close_btn = QPushButton("✕")
         close_btn.setFixedSize(36, 36)
@@ -209,6 +212,18 @@ class MainWindow(QMainWindow):
 
     def toggle_starred(self):
         self.starred_only = self.star_btn.isChecked()
+        self.load_memories()
+
+    def _open_settings(self):
+        from ui.components.setup_window import SetupWindow
+        self._settings_window = SetupWindow(edit_mode=True)
+        self._settings_window.config_saved.connect(self._on_settings_saved)
+        self._settings_window.show()
+
+    def _on_settings_saved(self):
+        logger.info("配置已更新，重新加载")
+        self._settings_window.close()
+        self._settings_window = None
         self.load_memories()
 
     def load_memories(self):
@@ -526,7 +541,6 @@ def main():
             bg.finished.connect(lambda: logger.info("后台扫描线程结束"))
             bg.start()
             BackgroundTaskManager.get_instance().register(bg)
-            _bg_threads.append(bg)
             logger.info("后台扫描线程已启动")
 
         def start_background_index():
@@ -560,7 +574,6 @@ def main():
             bg.finished.connect(lambda: logger.info("后台索引线程结束"))
             bg.start()
             BackgroundTaskManager.get_instance().register(bg)
-            _bg_threads.append(bg)
             logger.info("后台索引线程已启动")
 
         def launch_startup():

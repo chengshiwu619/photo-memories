@@ -12,3 +12,6 @@ error.log
 *.egg-info/
 dist/
 build/
+*.exe.old
+_test_*.py
+classification_history.txt

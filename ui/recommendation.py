@@ -7,6 +7,54 @@ CATEGORY_COLORS = {
 }
 
 PAGE_SIZE = 30
+MAX_SAME_FOLDER_STREAK = 12
+SMALL_FOLDER_THRESHOLD = 100
+
+
+def _interleave_small_folders(photos):
+    if not photos:
+        return photos
+
+    folder_counts = {}
+    for p in photos:
+        fp = p.get("folder_path", "")
+        folder_counts[fp] = folder_counts.get(fp, 0) + 1
+
+    small_folders = {fp for fp, cnt in folder_counts.items() if cnt < SMALL_FOLDER_THRESHOLD}
+
+    if not small_folders:
+        return photos
+
+    result = []
+    streak_folder = None
+    streak_count = 0
+    pending = list(photos)
+
+    while pending:
+        placed = False
+        for i, p in enumerate(pending):
+            fp = p.get("folder_path", "")
+            is_small = fp in small_folders
+
+            if is_small and fp == streak_folder and streak_count >= MAX_SAME_FOLDER_STREAK:
+                continue
+
+            result.append(p)
+            pending.pop(i)
+            if fp == streak_folder:
+                streak_count += 1
+            else:
+                streak_folder = fp
+                streak_count = 1
+            placed = True
+            break
+
+        if not placed:
+            streak_folder = None
+            streak_count = 0
+            result.append(pending.pop(0))
+
+    return result
 
 
 def _make_photo_dict(r):
@@ -15,6 +63,8 @@ def _make_photo_dict(r):
         "folder_path": r["folder_path"],
         "folder_name": r["folder_display"] if "folder_display" in r.keys() else os.path.basename(r["folder_path"]),
         "thumbnail_path": r["thumbnail_path"],
+        "width": r["width"] if "width" in r.keys() else None,
+        "height": r["height"] if "height" in r.keys() else None,
     }
 
 
@@ -24,19 +74,21 @@ def load_photos_from_ids(db, all_ids):
     placeholders = ",".join("?" * len(all_ids))
     rows = db.execute(
         f"""SELECT f.id, f.file_path, f.file_name, f.folder_path,
-                   f.folder_name as folder_display, pm.thumbnail_path
+                   f.folder_name as folder_display, pm.thumbnail_path,
+                   pm.width, pm.height
             FROM files f
             LEFT JOIN photo_metadata pm ON f.id = pm.file_id
             WHERE f.id IN ({placeholders})""",
         all_ids,
     ).fetchall()
-    return [_make_photo_dict(r) for r in rows]
+    return _interleave_small_folders([_make_photo_dict(r) for r in rows])
 
 
 def load_category_photos_batch(db, cat_id, offset, limit=PAGE_SIZE):
     rows = db.execute("""
         SELECT f.id, f.file_path, f.file_name, f.folder_path,
-               f.folder_name as folder_display, pm.thumbnail_path
+               f.folder_name as folder_display, pm.thumbnail_path,
+               pm.width, pm.height
         FROM files f
         JOIN folder_categories fc ON f.folder_path = fc.folder_path
         LEFT JOIN photo_metadata pm ON f.id = pm.file_id
@@ -49,27 +101,29 @@ def load_category_photos_batch(db, cat_id, offset, limit=PAGE_SIZE):
         if total_cats == 0:
             rows = db.execute("""
                 SELECT f.id, f.file_path, f.file_name, f.folder_path,
-                       f.folder_name as folder_display, pm.thumbnail_path
+                       f.folder_name as folder_display, pm.thumbnail_path,
+                       pm.width, pm.height
                 FROM files f
                 LEFT JOIN photo_metadata pm ON f.id = pm.file_id
                 WHERE f.is_image = 1 AND pm.thumbnail_path IS NOT NULL
                 ORDER BY pm.date_taken DESC
                 LIMIT ?
             """, (limit,)).fetchall()
-    return [_make_photo_dict(r) for r in rows]
+    return _interleave_small_folders([_make_photo_dict(r) for r in rows])
 
 
 def load_starred_photos(db, cat_id):
     rows = db.execute("""
         SELECT f.id, f.file_path, f.file_name, f.folder_path,
-               f.folder_name as folder_display, pm.thumbnail_path
+               f.folder_name as folder_display, pm.thumbnail_path,
+               pm.width, pm.height
         FROM files f
         JOIN photo_metadata pm ON f.id = pm.file_id
         JOIN folder_categories fc ON f.folder_path = fc.folder_path
         WHERE pm.is_starred = 1 AND f.is_image = 1 AND fc.category = ? AND pm.thumbnail_path IS NOT NULL
         ORDER BY pm.date_taken DESC
     """, (cat_id,)).fetchall()
-    return [_make_photo_dict(r) for r in rows]
+    return _interleave_small_folders([_make_photo_dict(r) for r in rows])
 
 
 def rank_category_photos(db, cat_id):
@@ -87,38 +141,39 @@ def rank_category_photos(db, cat_id):
     if all_ids:
         photos = load_photos_from_ids(db, all_ids)
         photos = [p for p in photos if p.get("thumbnail_path")]
-        if photos:
-            starred_ids = set()
-            for row in db.execute("SELECT file_id FROM photo_metadata WHERE is_starred = 1").fetchall():
-                starred_ids.add(row["file_id"])
+        if not photos:
+            return load_category_photos_batch(db, cat_id, 0)
+        starred_ids = set()
+        for row in db.execute("SELECT file_id FROM photo_metadata WHERE is_starred = 1").fetchall():
+            starred_ids.add(row["file_id"])
 
-            starred_photos = [p for p in photos if p["id"] in starred_ids]
-            normal_photos = [p for p in photos if p["id"] not in starred_ids]
+        starred_photos = [p for p in photos if p["id"] in starred_ids]
+        normal_photos = [p for p in photos if p["id"] not in starred_ids]
 
-            random.shuffle(normal_photos)
+        random.shuffle(normal_photos)
 
-            max_starred = min(len(starred_photos), 3)
-            selected_starred = starred_photos[:max_starred] if starred_photos else []
+        max_starred = min(len(starred_photos), 3)
+        selected_starred = starred_photos[:max_starred] if starred_photos else []
 
-            clicked = {}
-            for row in db.execute(
-                "SELECT folder_path, COUNT(*) as cnt FROM click_history WHERE category = ? GROUP BY folder_path",
-                (cat_id,),
-            ).fetchall():
-                clicked[row["folder_path"]] = row["cnt"]
+        clicked = {}
+        for row in db.execute(
+            "SELECT folder_path, COUNT(*) as cnt FROM click_history WHERE category = ? GROUP BY folder_path",
+            (cat_id,),
+        ).fetchall():
+            clicked[row["folder_path"]] = row["cnt"]
 
-            weights = {}
-            for p in normal_photos:
-                w = min(clicked.get(os.path.dirname(p["file_path"]), 0) * 0.05, 0.35)
-                weights[p["id"]] = w
+        weights = {}
+        for p in normal_photos:
+            w = min(clicked.get(os.path.dirname(p["file_path"]), 0) * 0.05, 0.35)
+            weights[p["id"]] = w
 
-            if weights:
-                normal_photos.sort(key=lambda p: weights.get(p["id"], 0), reverse=True)
+        if weights:
+            normal_photos.sort(key=lambda p: weights.get(p["id"], 0), reverse=True)
 
-            result = []
-            result.extend(selected_starred)
-            result.extend(normal_photos)
-            return result
+        result = []
+        result.extend(selected_starred)
+        result.extend(normal_photos)
+        return _interleave_small_folders(result)
 
     return load_category_photos_batch(db, cat_id, 0)
 
@@ -126,4 +181,4 @@ def rank_category_photos(db, cat_id):
 def rank_search_photos(db, matched_ids):
     photos = load_photos_from_ids(db, matched_ids)
     random.shuffle(photos)
-    return photos
+    return _interleave_small_folders(photos)

@@ -34,20 +34,14 @@ class ScanStage(Stage):
 class ClassifyStage(Stage):
     name = "分类文件夹"
 
-    def __init__(self):
-        super().__init__()
-        self._interactive_results: list = []
-
-    def set_interactive_results(self, results: list):
-        self._interactive_results = results
-
     def run(self, progress_callback=None) -> dict:
-        from classifier.folder_classifier import classify_folders, propagate_branch_category
-        result = classify_folders(progress_callback=progress_callback)
-        needs_user = result.get("needs_user", [])
-        for branch_path, category in self._interactive_results:
+        from classifier.folder_classifier import classify_folders
+        return classify_folders(progress_callback=progress_callback)
+
+    def apply_user_results(self, results: list):
+        from classifier.folder_classifier import propagate_branch_category
+        for branch_path, category in results:
             propagate_branch_category(branch_path, category)
-        return {"classified": result.get("classified", 0), "needs_user": needs_user}
 
 
 class IndexStage(Stage):
@@ -98,7 +92,8 @@ class Pipeline(QThread):
         self._stages: list[Stage] = []
         self._classify_stage: Optional[ClassifyStage] = None
         self._pending_classify_results: list = []
-        self._classify_event = None
+        import threading
+        self._classify_event = threading.Event()
 
     def add_stage(self, stage: Stage):
         self._stages.append(stage)
@@ -120,9 +115,6 @@ class Pipeline(QThread):
             self._classify_event.set()
 
     def run(self):
-        import threading
-        self._classify_event = threading.Event()
-
         try:
             total_stages = len(self._stages)
             bg_scan_needed = False
@@ -144,7 +136,7 @@ class Pipeline(QThread):
                         self.interactive_classify_needed.emit(needs_user)
                         self._classify_event.wait()
                         self._classify_event.clear()
-                        stage.set_interactive_results(self._pending_classify_results)
+                        stage.apply_user_results(self._pending_classify_results)
                 else:
                     result = stage.run(progress_callback=self._on_progress)
 
@@ -172,5 +164,5 @@ class Pipeline(QThread):
             logger.exception("Pipeline 执行异常")
             self.error_occurred.emit(str(e))
 
-    def _on_progress(self, current, total):
+    def _on_progress(self, current, total, *args):
         self.progress.emit(current, total)

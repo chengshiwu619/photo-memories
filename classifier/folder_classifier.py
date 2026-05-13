@@ -43,13 +43,17 @@ def _get_branch_folders():
     if not all_folders:
         return []
 
-    source = SOURCE_DRIVE.rstrip("\\") + "\\"
+    source = os.path.normpath(SOURCE_DRIVE)
     branches = set()
     for fp in all_folders:
-        rel = fp[len(source):].lstrip("\\")
-        if not rel:
+        norm_fp = os.path.normpath(fp)
+        try:
+            rel = os.path.relpath(norm_fp, source)
+        except ValueError:
             continue
-        parts = rel.split("\\")
+        if rel == '.':
+            continue
+        parts = rel.split(os.sep)
         branch = parts[0]
         branches.add(os.path.join(source, branch))
 
@@ -103,7 +107,7 @@ def build_classification_history():
     with open(CLASSIFICATION_HISTORY_FILE, "w", encoding="utf-8") as f:
         f.write(text)
 
-    logger.info(f"分类历史已写入 {CLASSASSIFICATION_HISTORY_FILE}: {len(rows)} 条")
+    logger.info(f"分类历史已写入 {CLASSIFICATION_HISTORY_FILE}: {len(rows)} 条")
     return text
 
 
@@ -121,8 +125,6 @@ def _load_history_context():
 
 
 def classify_branches_with_llm(branch_names):
-    client = get_openai_client()
-
     names_text = "\n".join(f"- {name}" for name in branch_names)
     history = _load_history_context()
 
@@ -184,9 +186,14 @@ def classify_folders(progress_callback=None):
 
     result = classify_branches_with_llm(branch_names)
     if not result:
-        logger.warning("LLM 分类返回空结果，所有分支标记为不确定")
-        needs_user = branches[:MAX_USER_CLASSIFY]
-        return {"classified": 0, "unknown": len(unclassified), "skipped": 0, "needs_user": needs_user}
+        logger.warning("LLM 分类返回空结果，所有分支默认归为生活照片")
+        for branch_path in branches:
+            sub_folders = [f for f in unclassified if f.startswith(branch_path + os.sep) or f == branch_path]
+            for sf in sub_folders:
+                set_folder_category(sf, CATEGORY_LIFE, "fallback")
+                classified_count += 1
+        build_classification_history()
+        return {"classified": classified_count, "unknown": 0, "skipped": 0, "needs_user": []}
 
     classified_count = 0
     unknown_branches = []
@@ -198,7 +205,7 @@ def classify_folders(progress_callback=None):
         except (ValueError, TypeError):
             category = 0
 
-        sub_folders = [f for f in unclassified if f.startswith(branch_path + "\\") or f == branch_path]
+        sub_folders = [f for f in unclassified if f.startswith(branch_path + os.sep) or f == branch_path]
 
         if category in (1, 2, 3, 4):
             for sf in sub_folders:
@@ -214,7 +221,7 @@ def classify_folders(progress_callback=None):
     needs_user = unknown_branches[:MAX_USER_CLASSIFY]
 
     for branch_path in unknown_branches:
-        sub_folders = [f for f in unclassified if f.startswith(branch_path + "\\") or f == branch_path]
+        sub_folders = [f for f in unclassified if f.startswith(branch_path + os.sep) or f == branch_path]
         for sf in sub_folders:
             set_folder_category(sf, CATEGORY_LIFE, "default")
             classified_count += 1
@@ -232,7 +239,7 @@ def classify_folders(progress_callback=None):
 
 def propagate_branch_category(branch_path, category):
     all_folders = get_all_folders()
-    sub_folders = [f for f in all_folders if f.startswith(branch_path + "\\") or f == branch_path]
+    sub_folders = [f for f in all_folders if f.startswith(branch_path + os.sep) or f == branch_path]
     for sf in sub_folders:
         set_folder_category(sf, category, "manual-branch")
     build_classification_history()

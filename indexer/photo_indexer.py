@@ -142,14 +142,14 @@ def generate_thumbnail(filepath, thumbnail_name):
 
     try:
         with Image.open(filepath) as img:
+            orig_w, orig_h = img.size
             img.draft("RGB", THUMBNAIL_SIZE)
             img = _auto_rotate(img)
-            w, h = img.size
             img.thumbnail(THUMBNAIL_SIZE, Image.LANCZOS)
             if img.mode in ("RGBA", "P"):
                 img = img.convert("RGB")
             img.save(thumb_path, "JPEG", quality=80)
-        return thumb_path, w, h
+        return thumb_path, orig_w, orig_h
     except Exception as e:
         logger.error(f"缩略图生成失败 {filepath}: {e}")
         return None, None, None

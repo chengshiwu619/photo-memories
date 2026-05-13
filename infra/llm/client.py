@@ -16,6 +16,10 @@ class LLMClient:
             cls._instance = cls()
         return cls._instance
 
+    @classmethod
+    def reset(cls):
+        cls._instance = None
+
     @retry(
         retry=retry_if_exception_type(Exception),
         stop=stop_after_attempt(3),
