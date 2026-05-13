@@ -1,5 +1,4 @@
 import os
-import sqlite3
 from dotenv import load_dotenv, set_key, find_dotenv
 
 ENV_FILE = find_dotenv() or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -102,82 +101,5 @@ os.makedirs(THUMBNAIL_DIR, exist_ok=True)
 
 
 def init_all_tables():
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_path TEXT UNIQUE NOT NULL,
-            file_name TEXT NOT NULL,
-            folder_path TEXT NOT NULL,
-            folder_name TEXT NOT NULL,
-            file_size INTEGER,
-            file_mtime TEXT,
-            file_hash TEXT,
-            is_image INTEGER DEFAULT 1,
-            scanned_at TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_files_folder ON files(folder_path);
-        CREATE INDEX IF NOT EXISTS idx_files_hash ON files(file_hash);
-
-        CREATE TABLE IF NOT EXISTS folder_categories (
-            folder_path TEXT PRIMARY KEY,
-            category INTEGER NOT NULL,
-            confidence TEXT,
-            classified_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS photo_metadata (
-            file_id INTEGER PRIMARY KEY,
-            date_taken TEXT,
-            camera_model TEXT,
-            gps_lat REAL,
-            gps_lon REAL,
-            width INTEGER,
-            height INTEGER,
-            thumbnail_path TEXT,
-            exif_json TEXT,
-            indexed_at TEXT,
-            is_starred INTEGER DEFAULT 0,
-            FOREIGN KEY (file_id) REFERENCES files(id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_meta_date ON photo_metadata(date_taken);
-
-        CREATE TABLE IF NOT EXISTS memories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category INTEGER NOT NULL,
-            memory_type TEXT NOT NULL,
-            title TEXT NOT NULL,
-            description TEXT,
-            photo_ids TEXT NOT NULL,
-            cover_file_id INTEGER,
-            created_at TEXT,
-            is_starred INTEGER DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
-        CREATE INDEX IF NOT EXISTS idx_memories_starred ON memories(is_starred);
-
-        CREATE TABLE IF NOT EXISTS click_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_id INTEGER NOT NULL,
-            folder_path TEXT NOT NULL,
-            category INTEGER,
-            clicked_at TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY (file_id) REFERENCES files(id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_click_folder ON click_history(folder_path);
-        CREATE INDEX IF NOT EXISTS idx_click_category ON click_history(category);
-
-        CREATE TABLE IF NOT EXISTS photo_tags (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_id INTEGER NOT NULL,
-            tag TEXT NOT NULL,
-            created_at TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY (file_id) REFERENCES files(id),
-            UNIQUE(file_id, tag)
-        );
-        CREATE INDEX IF NOT EXISTS idx_tags_file ON photo_tags(file_id);
-    """)
-    conn.commit()
-    conn.close()
+    from db_manager import Database
+    Database().init_tables()

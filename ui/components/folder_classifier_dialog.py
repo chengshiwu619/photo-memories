@@ -1,5 +1,4 @@
 import os
-import sqlite3
 import random
 
 from PyQt6.QtWidgets import (
@@ -9,21 +8,21 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QPixmap
 
 from logger_setup import logger
-from config import DB_PATH
+from db_manager import Database
 from ui.recommendation import CATEGORY_COLORS
 
 
 def _get_sample_photos(folder_path, count=2):
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute(
-        """SELECT f.file_path, pm.thumbnail_path
-           FROM files f
-           LEFT JOIN photo_metadata pm ON f.id = pm.file_id
-           WHERE f.folder_path LIKE ? AND f.is_image = 1
-           LIMIT 50""",
-        (folder_path + "%",),
-    ).fetchall()
-    conn.close()
+    db = Database()
+    with db.connect() as conn:
+        rows = conn.execute(
+            """SELECT f.file_path, pm.thumbnail_path
+               FROM files f
+               LEFT JOIN photo_metadata pm ON f.id = pm.file_id
+               WHERE f.folder_path LIKE ? AND f.is_image = 1
+               LIMIT 50""",
+            (folder_path + "%",),
+        ).fetchall()
 
     if not rows:
         return []

@@ -408,23 +408,21 @@ def _skip_scan():
 
 
 def _skip_index():
-    import sqlite3
-    from config import DB_PATH
+    from db_manager import Database
     try:
-        conn = sqlite3.connect(DB_PATH)
-        n = conn.execute(
-            "SELECT COUNT(*) FROM photo_metadata WHERE thumbnail_path IS NOT NULL"
-        ).fetchone()[0]
-        conn.close()
+        db = Database()
+        with db.connect() as conn:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM photo_metadata WHERE thumbnail_path IS NOT NULL"
+            ).fetchone()[0]
         return n >= 100
     except Exception:
         return False
 
 
 def _db_file_count():
-    import sqlite3
-    from config import DB_PATH
-    c = sqlite3.connect(DB_PATH)
-    n = c.execute("SELECT COUNT(1) FROM files").fetchone()[0]
-    c.close()
+    from db_manager import Database
+    db = Database()
+    with db.connect() as conn:
+        n = conn.execute("SELECT COUNT(1) FROM files").fetchone()[0]
     return n

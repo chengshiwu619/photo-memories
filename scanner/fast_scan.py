@@ -1,11 +1,11 @@
 import os
-import json
 import subprocess
-import sqlite3
 from datetime import datetime
 
 from logger_setup import logger
-from config import SOURCE_DRIVE, DB_PATH, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, DATA_DIR, init_all_tables
+from config import SOURCE_DRIVE, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, DATA_DIR
+from db_manager import Database
+from checkpoint_manager import CheckpointManager, CheckpointState
 
 ALL_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 ES_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "everything", "es.exe")
@@ -15,71 +15,36 @@ _ES_INSTANCE = None
 
 CHECKPOINT_FILE = os.path.join(DATA_DIR, "scan_checkpoint.json")
 
+_cp = CheckpointManager(CHECKPOINT_FILE)
+_db = Database()
 
-class ScanState:
-    RUNNING = "running"
-    PAUSED = "paused"
-    STOPPED = "stopped"
-
-
-def _load_checkpoint():
-    try:
-        if os.path.exists(CHECKPOINT_FILE):
-            with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception as e:
-        logger.warning(f"加载扫描断点失败: {e}")
-    return None
-
-
-def _save_checkpoint(state, current_index, total, new_added):
-    try:
-        tmp = CHECKPOINT_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({
-                "state": state,
-                "current_index": current_index,
-                "total": total,
-                "new_added": new_added,
-            }, f)
-        os.replace(tmp, CHECKPOINT_FILE)
-    except Exception as e:
-        logger.warning(f"保存扫描断点失败: {e}")
+ScanState = CheckpointState
 
 
 def clear_checkpoint():
-    try:
-        if os.path.exists(CHECKPOINT_FILE):
-            os.remove(CHECKPOINT_FILE)
-    except Exception as e:
-        logger.warning(f"清除扫描断点失败: {e}")
+    _cp.clear()
 
 
 def get_checkpoint_status():
-    cp = _load_checkpoint()
-    if cp is None:
+    status = _cp.get_status()
+    if not status["has_checkpoint"]:
         return {"has_checkpoint": False}
+    data = status.get("data", {})
     return {
         "has_checkpoint": True,
-        "state": cp["state"],
-        "current_index": cp.get("current_index", 0),
-        "total": cp.get("total", 0),
-        "new_added": cp.get("new_added", 0),
+        "state": data.get("state"),
+        "current_index": data.get("current_index", 0),
+        "total": data.get("total", 0),
+        "new_added": data.get("new_added", 0),
     }
 
 
 def set_paused():
-    cp = _load_checkpoint()
-    if cp and cp["state"] == ScanState.RUNNING:
-        cp["state"] = ScanState.PAUSED
-        _save_checkpoint(ScanState.PAUSED, cp.get("current_index", 0), cp.get("total", 0), cp.get("new_added", 0))
+    _cp.request_pause()
 
 
 def set_stopped():
-    cp = _load_checkpoint()
-    if cp and cp["state"] in (ScanState.RUNNING, ScanState.PAUSED):
-        _save_checkpoint(ScanState.STOPPED, cp.get("current_index", 0), cp.get("total", 0), cp.get("new_added", 0))
-        logger.info("扫描已标记为停止")
+    _cp.request_stop()
 
 
 def _get_es_path():
@@ -240,14 +205,14 @@ def full_scan(progress_callback=None, batch_limit=None):
 
     logger.info(f"磁盘发现 {len(file_list)} 个媒体文件")
 
-    init_all_tables()
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    _db.init_tables()
+    conn = _db.get_persistent_connection()
     conn.execute("PRAGMA busy_timeout=60000")
 
-    cp = _load_checkpoint()
+    cp = _cp.load()
     if cp and "current_index" not in cp:
         logger.info("旧格式扫描断点, 清理")
-        clear_checkpoint()
+        _cp.clear()
         cp = None
     start_idx = cp["current_index"] if cp else 0
     new_added = cp["new_added"] if cp else 0
@@ -259,7 +224,7 @@ def full_scan(progress_callback=None, batch_limit=None):
 
     is_new = not cp
     if is_new and total > 0:
-        _save_checkpoint(ScanState.RUNNING, 0, total, 0)
+        _cp.save(CheckpointState.RUNNING, current_index=0, total=total, new_added=0)
         logger.info("新扫描任务已创建检查点")
     elif cp:
         logger.info(f"从断点恢复: idx={start_idx}, total={total}, new_added={new_added}")
@@ -313,16 +278,15 @@ def full_scan(progress_callback=None, batch_limit=None):
             progress_callback(i + 1, total)
 
         if batch_limit and batch_count >= batch_limit:
-            _save_checkpoint(ScanState.PAUSED, i + 1, total, new_added)
+            _cp.save(CheckpointState.PAUSED, current_index=i + 1, total=total, new_added=new_added)
             logger.info(f"扫描热身: {new_added} 条, 剩余 {total - i - 1} 条后台继续")
             conn.commit()
             conn.close()
             return {"paused": True, "batch_limit_reached": True, "total": total, "new": new_added, "removed": 0}
 
         if (i + 1) % 100 == 0:
-            cp_check = _load_checkpoint()
-            if cp_check and cp_check["state"] in (ScanState.PAUSED, ScanState.STOPPED):
-                _save_checkpoint(ScanState.PAUSED, i + 1, total, new_added)
+            if _cp.is_pause_or_stop_requested():
+                _cp.save(CheckpointState.PAUSED, current_index=i + 1, total=total, new_added=new_added)
                 logger.info(f"扫描暂停: idx={i + 1}, 新增 {new_added}")
                 conn.commit()
 
@@ -335,7 +299,7 @@ def full_scan(progress_callback=None, batch_limit=None):
                 conn.close()
                 return {"paused": True, "total": total, "new": new_added, "removed": len(remove_set)}
 
-            _save_checkpoint(ScanState.RUNNING, i + 1, total, new_added)
+            _cp.save(CheckpointState.RUNNING, current_index=i + 1, total=total, new_added=new_added)
 
     if remove_set:
         logger.info(f"清理 {len(remove_set)} 个已移除文件...")
@@ -346,14 +310,14 @@ def full_scan(progress_callback=None, batch_limit=None):
     final = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
     conn.commit()
     conn.close()
-    clear_checkpoint()
+    _cp.clear()
 
     logger.info(f"扫描完成: 总计 {final} 文件, 新增 {new_added}, 移除 {len(remove_set)}")
     return {"total": final, "new": new_added, "removed": len(remove_set)}
 
 
 def fast_scan(num_files=1000, progress_callback=None):
-    init_all_tables()
+    _db.init_tables()
 
     ext_queries = []
     for ext in ALL_EXTENSIONS:
@@ -393,53 +357,52 @@ def fast_scan(num_files=1000, progress_callback=None):
     if num_files and len(files) > num_files:
         files = random.sample(files, num_files)
 
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    existing = set(r[0] for r in conn.execute("SELECT file_path FROM files"))
+    with _db.connect() as conn:
+        existing = set(r[0] for r in conn.execute("SELECT file_path FROM files"))
 
-    new_added = 0
-    total = len(files)
+        new_added = 0
+        total = len(files)
 
-    for i, filepath in enumerate(files):
-        if filepath in existing:
-            if progress_callback and i % 200 == 0:
+        for i, filepath in enumerate(files):
+            if filepath in existing:
+                if progress_callback and i % 200 == 0:
+                    progress_callback(i + 1, total)
+                continue
+
+            try:
+                stat = os.stat(filepath)
+                is_image = os.path.splitext(filepath)[1].lower() in IMAGE_EXTENSIONS
+                file_hash = None
+
+                folder = os.path.dirname(filepath)
+                conn.execute(
+                    """INSERT OR IGNORE INTO files
+                       (file_path, file_name, folder_path, folder_name, file_size, file_mtime, file_hash, is_image, scanned_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        filepath,
+                        os.path.basename(filepath),
+                        folder,
+                        os.path.basename(folder),
+                        stat.st_size,
+                        datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                        file_hash,
+                        1 if is_image else 0,
+                        datetime.now().isoformat(),
+                    ),
+                )
+                new_added += 1
+
+                if new_added % 50 == 0:
+                    conn.commit()
+            except Exception as e:
+                logger.error(f"扫描文件失败 {filepath}: {e}")
+
+            if progress_callback and (i + 1) % 100 == 0:
                 progress_callback(i + 1, total)
-            continue
 
-        try:
-            stat = os.stat(filepath)
-            is_image = os.path.splitext(filepath)[1].lower() in IMAGE_EXTENSIONS
-            file_hash = None
-
-            folder = os.path.dirname(filepath)
-            conn.execute(
-                """INSERT OR IGNORE INTO files
-                   (file_path, file_name, folder_path, folder_name, file_size, file_mtime, file_hash, is_image, scanned_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    filepath,
-                    os.path.basename(filepath),
-                    folder,
-                    os.path.basename(folder),
-                    stat.st_size,
-                    datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                    file_hash,
-                    1 if is_image else 0,
-                    datetime.now().isoformat(),
-                ),
-            )
-            new_added += 1
-
-            if new_added % 50 == 0:
-                conn.commit()
-        except Exception as e:
-            logger.error(f"扫描文件失败 {filepath}: {e}")
-
-        if progress_callback and (i + 1) % 100 == 0:
-            progress_callback(i + 1, total)
-
-    conn.commit()
-    final = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-    conn.close()
+        conn.commit()
+        final = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
 
     logger.info(f"Everything 扫描完成: 总计 {final} 文件, 新增 {new_added}")
     return {"total": final, "new": new_added, "removed": 0}

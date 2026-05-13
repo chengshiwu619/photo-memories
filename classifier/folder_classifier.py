@@ -7,7 +7,6 @@ from config import (
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
     DEEPSEEK_MODEL,
-    DB_PATH,
     CLASSIFICATION_HISTORY_FILE,
     CATEGORY_LIFE,
     CATEGORY_SAMPLE,
@@ -16,27 +15,27 @@ from config import (
     CATEGORY_NAMES,
     SOURCE_DRIVE,
     get_openai_client,
-    init_all_tables,
 )
+from db_manager import Database
+
+_db = Database()
 
 MAX_USER_CLASSIFY = 10
 
 
 def get_unclassified_folders():
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("""
-        SELECT DISTINCT f.folder_path FROM files f
-        LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
-        WHERE fc.folder_path IS NULL
-    """).fetchall()
-    conn.close()
+    with _db.connect() as conn:
+        rows = conn.execute("""
+            SELECT DISTINCT f.folder_path FROM files f
+            LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
+            WHERE fc.folder_path IS NULL
+        """).fetchall()
     return [row[0] for row in rows]
 
 
 def get_all_folders():
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("SELECT DISTINCT folder_path FROM files").fetchall()
-    conn.close()
+    with _db.connect() as conn:
+        rows = conn.execute("SELECT DISTINCT folder_path FROM files").fetchall()
     return [row[0] for row in rows]
 
 
@@ -61,33 +60,29 @@ def _get_branch_folders():
 
 
 def set_folder_category(folder_path, category, confidence=None):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """INSERT OR REPLACE INTO folder_categories (folder_path, category, confidence, classified_at)
-           VALUES (?, ?, ?, datetime('now'))""",
-        (folder_path, category, confidence),
-    )
-    conn.commit()
-    conn.close()
+    with _db.connect() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO folder_categories (folder_path, category, confidence, classified_at)
+               VALUES (?, ?, ?, datetime('now'))""",
+            (folder_path, category, confidence),
+        )
 
 
 def get_folder_category(folder_path):
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute(
-        "SELECT category FROM folder_categories WHERE folder_path = ?", (folder_path,)
-    ).fetchone()
-    conn.close()
+    with _db.connect() as conn:
+        row = conn.execute(
+            "SELECT category FROM folder_categories WHERE folder_path = ?", (folder_path,)
+        ).fetchone()
     return row[0] if row else None
 
 
 def build_classification_history():
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("""
-        SELECT folder_path, category, confidence
-        FROM folder_categories
-        ORDER BY category, folder_path
-    """).fetchall()
-    conn.close()
+    with _db.connect() as conn:
+        rows = conn.execute("""
+            SELECT folder_path, category, confidence
+            FROM folder_categories
+            ORDER BY category, folder_path
+        """).fetchall()
 
     if not rows:
         return ""
@@ -109,7 +104,7 @@ def build_classification_history():
     with open(CLASSIFICATION_HISTORY_FILE, "w", encoding="utf-8") as f:
         f.write(text)
 
-    logger.info(f"分类历史已写入 {CLASSIFICATION_HISTORY_FILE}: {len(rows)} 条")
+    logger.info(f"分类历史已写入 {CLASSASSIFICATION_HISTORY_FILE}: {len(rows)} 条")
     return text
 
 
@@ -166,7 +161,9 @@ def classify_branches_with_llm(branch_names):
 
 
 def classify_folders(progress_callback=None):
-    init_all_tables()
+    from db_manager import Database
+    db = Database()
+    db.init_tables()
 
     unclassified = get_unclassified_folders()
     if not unclassified:
@@ -245,26 +242,24 @@ def propagate_branch_category(branch_path, category):
 def find_similar_photos_in_folder(target_file_id, folder_path):
     import random as _random
 
-    conn = sqlite3.connect(DB_PATH)
-    target = conn.execute(
-        "SELECT f.id, f.file_name, f.folder_name, pm.date_taken "
-        "FROM files f LEFT JOIN photo_metadata pm ON f.id = pm.file_id WHERE f.id = ?",
-        (target_file_id,)
-    ).fetchone()
-    if not target:
-        conn.close()
-        return []
+    with _db.connect() as conn:
+        target = conn.execute(
+            "SELECT f.id, f.file_name, f.folder_name, pm.date_taken "
+            "FROM files f LEFT JOIN photo_metadata pm ON f.id = pm.file_id WHERE f.id = ?",
+            (target_file_id,)
+        ).fetchone()
+        if not target:
+            return []
 
-    siblings = conn.execute(
-        "SELECT f.id, f.file_name, f.folder_name, pm.date_taken "
-        "FROM files f "
-        "JOIN folder_categories fc ON f.folder_path = fc.folder_path "
-        "LEFT JOIN photo_metadata pm ON f.id = pm.file_id "
-        "WHERE f.folder_path = ? AND f.is_image = 1 AND fc.category = ? AND f.id != ? "
-        "ORDER BY pm.date_taken, f.file_name",
-        (folder_path, CATEGORY_LIFE, target_file_id)
-    ).fetchall()
-    conn.close()
+        siblings = conn.execute(
+            "SELECT f.id, f.file_name, f.folder_name, pm.date_taken "
+            "FROM files f "
+            "JOIN folder_categories fc ON f.folder_path = fc.folder_path "
+            "LEFT JOIN photo_metadata pm ON f.id = pm.file_id "
+            "WHERE f.folder_path = ? AND f.is_image = 1 AND fc.category = ? AND f.id != ? "
+            "ORDER BY pm.date_taken, f.file_name",
+            (folder_path, CATEGORY_LIFE, target_file_id)
+        ).fetchall()
 
     if len(siblings) < 3:
         return []

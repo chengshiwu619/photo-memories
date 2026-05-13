@@ -1,79 +1,46 @@
 import os
-import json
 import hashlib
 import sqlite3
 from datetime import datetime
 
 from logger_setup import logger
-from config import SOURCE_DRIVE, DB_PATH, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, DATA_DIR, init_all_tables
+from config import SOURCE_DRIVE, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, DATA_DIR
+from db_manager import Database
+from checkpoint_manager import CheckpointManager, CheckpointState
 
 ALL_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 CHECKPOINT_FILE = os.path.join(DATA_DIR, "scan_checkpoint.json")
 
-class ScanState:
-    RUNNING = "running"
-    PAUSED = "paused"
-    STOPPED = "stopped"
+_cp = CheckpointManager(CHECKPOINT_FILE)
+_db = Database()
 
-
-def _load_checkpoint():
-    try:
-        if os.path.exists(CHECKPOINT_FILE):
-            with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception as e:
-        logger.warning(f"加载扫描断点失败: {e}")
-    return None
-
-
-def _save_checkpoint(state, current_dir, current_file_index, total_scanned, total_found):
-    try:
-        tmp = CHECKPOINT_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({
-                "state": state,
-                "current_dir": current_dir,
-                "current_file_index": current_file_index,
-                "total_scanned": total_scanned,
-                "total_found": total_found,
-            }, f)
-        os.replace(tmp, CHECKPOINT_FILE)
-    except Exception as e:
-        logger.warning(f"保存扫描断点失败: {e}")
+ScanState = CheckpointState
 
 
 def clear_checkpoint():
-    try:
-        if os.path.exists(CHECKPOINT_FILE):
-            os.remove(CHECKPOINT_FILE)
-    except Exception as e:
-        logger.warning(f"清除扫描断点失败: {e}")
+    _cp.clear()
 
 
 def get_checkpoint_status():
-    cp = _load_checkpoint()
-    if cp is None:
+    status = _cp.get_status()
+    if not status["has_checkpoint"]:
         return {"has_checkpoint": False}
+    data = status.get("data", {})
     return {
         "has_checkpoint": True,
-        "state": cp["state"],
-        "current_dir": cp.get("current_dir", ""),
-        "total_scanned": cp.get("total_scanned", 0),
-        "total_found": cp.get("total_found", 0),
+        "state": data.get("state"),
+        "current_dir": data.get("current_dir", ""),
+        "total_scanned": data.get("total_scanned", 0),
+        "total_found": data.get("total_found", 0),
     }
 
 
 def set_paused():
-    cp = _load_checkpoint()
-    if cp and cp["state"] == ScanState.RUNNING:
-        _save_checkpoint(ScanState.PAUSED, cp.get("current_dir", ""), cp.get("current_file_index", 0), cp.get("total_scanned", 0), cp.get("total_found", 0))
+    _cp.request_pause()
 
 
 def set_stopped():
-    cp = _load_checkpoint()
-    if cp and cp["state"] in (ScanState.RUNNING, ScanState.PAUSED):
-        _save_checkpoint(ScanState.STOPPED, cp.get("current_dir", ""), cp.get("current_file_index", 0), cp.get("total_scanned", 0), cp.get("total_found", 0))
-        logger.info("扫描已标记为停止")
+    _cp.request_stop()
 
 
 def compute_hash(filepath, block_size=65536):
@@ -87,9 +54,9 @@ def compute_hash(filepath, block_size=65536):
 def scan_drive(progress_callback=None):
     logger.info(f"开始扫描驱动器: {SOURCE_DRIVE}")
     logger.info("正式模式: 全量扫描")
-    init_all_tables()
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    cp = _load_checkpoint()
+    _db.init_tables()
+    conn = _db.get_persistent_connection()
+    cp = _cp.load()
 
     existing = set()
     for row in conn.execute("SELECT file_path FROM files"):
@@ -110,7 +77,7 @@ def scan_drive(progress_callback=None):
 
     is_new_scan = not cp
     if is_new_scan:
-        _save_checkpoint(ScanState.RUNNING, SOURCE_DRIVE, 0, 0, 0)
+        _cp.save(CheckpointState.RUNNING, current_dir=SOURCE_DRIVE, current_file_index=0, total_scanned=0, total_found=0)
         logger.info("新扫描任务已创建检查点")
     else:
         logger.info(f"从断点恢复: dir={resume_dir}, idx={resume_file_idx}, scanned={total_scanned}, found={total_found}")
@@ -139,8 +106,7 @@ def scan_drive(progress_callback=None):
                 total_scanned += 1
                 folder_counts[root] = folder_counts.get(root, 0) + 1
                 if progress_callback and total_scanned % 200 == 0:
-                    cp_check = _load_checkpoint()
-                    if cp_check and cp_check["state"] in (ScanState.PAUSED, ScanState.STOPPED):
+                    if _cp.is_pause_or_stop_requested():
                         logger.info(f"扫描暂停于 {root}, 已扫描 {total_scanned}, 已发现 {total_found}")
                         conn.commit()
                         conn.close()
@@ -183,19 +149,14 @@ def scan_drive(progress_callback=None):
             if progress_callback:
                 progress_callback(total_scanned, total_found)
 
-                cp_check = _load_checkpoint()
-                if cp_check and cp_check["state"] in (ScanState.PAUSED, ScanState.STOPPED):
-                    _save_checkpoint(
-                        ScanState.PAUSED, root,
-                        idx + 1,
-                        total_scanned, total_found
-                    )
+                if _cp.is_pause_or_stop_requested():
+                    _cp.save(CheckpointState.PAUSED, current_dir=root, current_file_index=idx + 1, total_scanned=total_scanned, total_found=total_found)
                     logger.info(f"扫描暂停, 检查点已保存: dir={root}")
                     conn.commit()
                     conn.close()
                     return {"paused": True, "total_found": total_found, "total_scanned": total_scanned}
 
-        _save_checkpoint(ScanState.RUNNING, root, 0, total_scanned, total_found)
+        _cp.save(CheckpointState.RUNNING, current_dir=root, current_file_index=0, total_scanned=total_scanned, total_found=total_found)
 
     removed = existing - found
     if removed:
@@ -207,7 +168,7 @@ def scan_drive(progress_callback=None):
 
     total = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
     conn.close()
-    clear_checkpoint()
+    _cp.clear()
 
     logger.info(f"扫描完成: 总计 {total} 文件, 新增 {new_added}, 移除 {len(removed)}")
     return {"total": total, "new": new_added, "removed": len(removed)}

@@ -1,6 +1,5 @@
 import os
 import json
-import sqlite3
 import random
 from datetime import datetime, timedelta
 
@@ -9,28 +8,28 @@ from config import (
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
     DEEPSEEK_MODEL,
-    DB_PATH,
     CATEGORY_LIFE,
     CATEGORY_SAMPLE,
     CATEGORY_PHOTOGRAPHY,
     CATEGORY_ADULT,
     CATEGORY_NAMES,
     get_openai_client,
-    init_all_tables,
 )
+from db_manager import Database
+
+_db = Database()
 
 
 def get_photos_by_category(category, limit=500):
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("""
-        SELECT f.id, f.file_path, f.file_name, f.folder_name,
-               pm.date_taken, pm.camera_model, pm.thumbnail_path
-        FROM files f
-        JOIN folder_categories fc ON f.folder_path = fc.folder_path
-        LEFT JOIN photo_metadata pm ON f.id = pm.file_id
-        WHERE fc.category = ? AND f.is_image = 1
-    """, (category,)).fetchall()
-    conn.close()
+    with _db.connect() as conn:
+        rows = conn.execute("""
+            SELECT f.id, f.file_path, f.file_name, f.folder_name,
+                   pm.date_taken, pm.camera_model, pm.thumbnail_path
+            FROM files f
+            JOIN folder_categories fc ON f.folder_path = fc.folder_path
+            LEFT JOIN photo_metadata pm ON f.id = pm.file_id
+            WHERE fc.category = ? AND f.is_image = 1
+        """, (category,)).fetchall()
     return rows
 
 
@@ -102,7 +101,7 @@ def build_photo_context(photos):
 
 
 def generate_memories_for_category(category):
-    init_all_tables()
+    _db.init_tables()
 
     photos = get_photos_by_category(category)
     category_name = CATEGORY_NAMES[category]
@@ -157,22 +156,20 @@ def generate_memories_for_category(category):
     photo_ids = [str(p[0]) for p in focused]
     cover_id = focused[0][0] if focused else None
 
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """INSERT INTO memories (category, memory_type, title, description, photo_ids, cover_file_id, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (
-            category,
-            "auto",
-            title,
-            description,
-            json.dumps(photo_ids),
-            cover_id,
-            datetime.now().isoformat(),
-        ),
-    )
-    conn.commit()
-    conn.close()
+    with _db.connect() as conn:
+        conn.execute(
+            """INSERT INTO memories (category, memory_type, title, description, photo_ids, cover_file_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                category,
+                "auto",
+                title,
+                description,
+                json.dumps(photo_ids),
+                cover_id,
+                datetime.now().isoformat(),
+            ),
+        )
 
     logger.info(f"回忆已生成 [{category_name}]: {title}")
 
@@ -195,31 +192,26 @@ def generate_all_memories(progress_callback=None):
 
 
 def star_memory(memory_id):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE memories SET is_starred = 1 WHERE id = ?", (memory_id,))
-    conn.commit()
-    conn.close()
+    with _db.connect() as conn:
+        conn.execute("UPDATE memories SET is_starred = 1 WHERE id = ?", (memory_id,))
 
 
 def unstar_memory(memory_id):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE memories SET is_starred = 0 WHERE id = ?", (memory_id,))
-    conn.commit()
-    conn.close()
+    with _db.connect() as conn:
+        conn.execute("UPDATE memories SET is_starred = 0 WHERE id = ?", (memory_id,))
 
 
 def get_memories(category=None, starred_only=False):
-    conn = sqlite3.connect(DB_PATH)
-    query = "SELECT id, category, memory_type, title, description, photo_ids, cover_file_id, is_starred, created_at FROM memories WHERE 1=1"
-    params = []
-    if category:
-        query += " AND category = ?"
-        params.append(category)
-    if starred_only:
-        query += " AND is_starred = 1"
-    query += " ORDER BY created_at DESC"
-    rows = conn.execute(query, params).fetchall()
-    conn.close()
+    with _db.connect() as conn:
+        query = "SELECT id, category, memory_type, title, description, photo_ids, cover_file_id, is_starred, created_at FROM memories WHERE 1=1"
+        params = []
+        if category:
+            query += " AND category = ?"
+            params.append(category)
+        if starred_only:
+            query += " AND is_starred = 1"
+        query += " ORDER BY created_at DESC"
+        rows = conn.execute(query, params).fetchall()
 
     return [
         {
@@ -242,13 +234,12 @@ def get_photo_thumbnails(photo_ids):
     if not photo_ids:
         return []
 
-    conn = sqlite3.connect(DB_PATH)
-    placeholders = ",".join("?" * len(photo_ids))
-    rows = conn.execute(
-        f"SELECT f.id, f.file_path, f.file_name, f.folder_path, pm.thumbnail_path FROM files f LEFT JOIN photo_metadata pm ON f.id = pm.file_id WHERE f.id IN ({placeholders})",
-        photo_ids,
-    ).fetchall()
-    conn.close()
+    with _db.connect() as conn:
+        placeholders = ",".join("?" * len(photo_ids))
+        rows = conn.execute(
+            f"SELECT f.id, f.file_path, f.file_name, f.folder_path, pm.thumbnail_path FROM files f LEFT JOIN photo_metadata pm ON f.id = pm.file_id WHERE f.id IN ({placeholders})",
+            photo_ids,
+        ).fetchall()
 
     return [
         {

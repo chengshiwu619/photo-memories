@@ -1,6 +1,5 @@
 import os
 import sys
-import sqlite3
 import shutil
 
 from PyQt6.QtWidgets import (
@@ -12,9 +11,10 @@ from PyQt6.QtGui import QFont
 
 from logger_setup import logger
 from config import (
-    DB_PATH, CATEGORY_LIFE, CATEGORY_SAMPLE, CATEGORY_PHOTOGRAPHY, CATEGORY_ADULT,
-    CATEGORY_NAMES, init_all_tables, is_configured,
+    CATEGORY_LIFE, CATEGORY_SAMPLE, CATEGORY_PHOTOGRAPHY, CATEGORY_ADULT,
+    CATEGORY_NAMES, is_configured,
 )
+from db_manager import Database
 from ui.components.memory_cards import CategoryPage
 from ui.components.startup_window import StartupWindow
 from ui.components.image_viewer import ImageViewer
@@ -65,13 +65,9 @@ class MainWindow(QMainWindow):
             }
         """)
 
-        init_all_tables()
-        self.db = sqlite3.connect(DB_PATH)
-        self.db.row_factory = sqlite3.Row
-        cols = [r[1] for r in self.db.execute("PRAGMA table_info(photo_metadata)").fetchall()]
-        if "is_starred" not in cols:
-            self.db.execute("ALTER TABLE photo_metadata ADD COLUMN is_starred INTEGER DEFAULT 0")
-            self.db.commit()
+        _db = Database()
+        _db.init_tables()
+        self.db = _db.get_persistent_connection()
         self.setup_ui()
 
         self.image_viewer = ImageViewer()

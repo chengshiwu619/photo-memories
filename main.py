@@ -2,7 +2,7 @@ import sys
 import argparse
 
 from logger_setup import logger
-from config import init_all_tables
+from db_manager import Database
 from scanner.fast_scan import full_scan as scan_drive
 from classifier.folder_classifier import classify_folders
 from indexer.photo_indexer import index_photos
@@ -92,7 +92,7 @@ def main():
         print(f"  DEEPSEEK_API_KEY=sk-...")
         sys.exit(1)
 
-    init_all_tables()
+    Database().init_tables()
 
     if args.command == "scan":
         run_scan()

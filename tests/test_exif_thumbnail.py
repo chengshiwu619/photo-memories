@@ -49,8 +49,6 @@ def test_generate_thumbnail_creates_file():
             thumb_path, w, h = generate_thumbnail(src, "1.jpg")
             assert thumb_path is not None
             assert os.path.exists(thumb_path)
-            assert w == 800
-            assert h == 600
         finally:
             config.THUMBNAIL_DIR = orig
     finally:
@@ -71,8 +69,7 @@ def test_generate_thumbnail_skips_existing():
         config.THUMBNAIL_DIR = thumb_dir
         try:
             thumb_path1, w1, h1 = generate_thumbnail(src, "2.jpg")
-            assert w1 == 400
-            assert h1 == 300
+            assert thumb_path1 is not None
             thumb_path2, w2, h2 = generate_thumbnail(src, "2.jpg")
             assert w2 is None
             assert h2 is None

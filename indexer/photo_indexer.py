@@ -11,84 +11,51 @@ register_heif_opener()
 Image.MAX_IMAGE_PIXELS = 500_000_000
 
 from logger_setup import logger
-from config import DB_PATH, THUMBNAIL_DIR, THUMBNAIL_SIZE, DATA_DIR, init_all_tables
+from config import THUMBNAIL_DIR, THUMBNAIL_SIZE, DATA_DIR
+from db_manager import Database
+from checkpoint_manager import CheckpointManager, CheckpointState
 
 CHECKPOINT_FILE = os.path.join(DATA_DIR, "index_checkpoint.json")
 
+_cp = CheckpointManager(CHECKPOINT_FILE)
+_db = Database()
 
-class IndexState:
-    RUNNING = "running"
-    PAUSED = "paused"
-    STOPPED = "stopped"
-
-
-def _load_checkpoint():
-    try:
-        if os.path.exists(CHECKPOINT_FILE):
-            with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception as e:
-        logger.warning(f"加载索引断点失败: {e}")
-    return None
-
-
-def _save_checkpoint(state, current_index, total, indexed):
-    try:
-        tmp = CHECKPOINT_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({
-                "state": state,
-                "current_index": current_index,
-                "total": total,
-                "indexed": indexed,
-            }, f)
-        os.replace(tmp, CHECKPOINT_FILE)
-    except Exception as e:
-        logger.warning(f"保存索引断点失败: {e}")
+IndexState = CheckpointState
 
 
 def clear_checkpoint():
-    try:
-        if os.path.exists(CHECKPOINT_FILE):
-            os.remove(CHECKPOINT_FILE)
-    except Exception as e:
-        logger.warning(f"清除索引断点失败: {e}")
+    _cp.clear()
 
 
 def get_checkpoint_status():
-    cp = _load_checkpoint()
-    if cp is None:
+    status = _cp.get_status()
+    if not status["has_checkpoint"]:
         return {"has_checkpoint": False}
+    data = status.get("data", {})
     return {
         "has_checkpoint": True,
-        "state": cp["state"],
-        "current_index": cp.get("current_index", 0),
-        "total": cp.get("total", 0),
-        "indexed": cp.get("indexed", 0),
+        "state": data.get("state"),
+        "current_index": data.get("current_index", 0),
+        "total": data.get("total", 0),
+        "indexed": data.get("indexed", 0),
     }
 
 
 def set_paused():
-    cp = _load_checkpoint()
-    if cp and cp["state"] == IndexState.RUNNING:
-        _save_checkpoint(IndexState.PAUSED, cp.get("current_index", 0), cp.get("total", 0), cp.get("indexed", 0))
+    _cp.request_pause()
 
 
 def set_stopped():
-    cp = _load_checkpoint()
-    if cp and cp["state"] in (IndexState.RUNNING, IndexState.PAUSED):
-        _save_checkpoint(IndexState.STOPPED, cp.get("current_index", 0), cp.get("total", 0), cp.get("indexed", 0))
-        logger.info("索引已标记为停止")
+    _cp.request_stop()
 
 
 def get_unindexed_photos():
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("""
-        SELECT f.id, f.file_path FROM files f
-        LEFT JOIN photo_metadata pm ON f.id = pm.file_id
-        WHERE f.is_image = 1 AND pm.file_id IS NULL
-    """).fetchall()
-    conn.close()
+    with _db.connect() as conn:
+        rows = conn.execute("""
+            SELECT f.id, f.file_path FROM files f
+            LEFT JOIN photo_metadata pm ON f.id = pm.file_id
+            WHERE f.is_image = 1 AND pm.file_id IS NULL
+        """).fetchall()
     return rows
 
 
@@ -192,25 +159,24 @@ INDEX_COMMIT_EVERY = 20
 
 
 def index_photos(progress_callback=None, batch_limit=None):
-    init_all_tables()
+    _db.init_tables()
 
     photos = get_unindexed_photos()
     total = len(photos)
     display_total = min(total, batch_limit) if batch_limit else total
     logger.info(f"开始索引照片: 共 {total} 张待索引")
-    cp = _load_checkpoint()
+    cp = _cp.load()
     start_idx = cp["current_index"] if cp else 0
     indexed = cp.get("indexed", 0) if cp else 0
 
     is_new = not cp
     if is_new and total > 0:
-        _save_checkpoint(IndexState.RUNNING, 0, total, 0)
+        _cp.save(CheckpointState.RUNNING, current_index=0, total=total, indexed=0)
         logger.info("新索引任务已创建检查点")
     elif cp:
         logger.info(f"从断点恢复: idx={start_idx}, total={total}, indexed={indexed}")
 
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.execute("PRAGMA busy_timeout=30000")
+    conn = _db.get_persistent_connection()
 
     batch_count = 0
 
@@ -264,26 +230,25 @@ def index_photos(progress_callback=None, batch_limit=None):
             progress_callback(i + 1, display_total)
 
         if batch_limit and batch_count >= batch_limit:
-            _save_checkpoint(IndexState.PAUSED, i + 1, total, indexed)
+            _cp.save(CheckpointState.PAUSED, current_index=i + 1, total=total, indexed=indexed)
             logger.info(f"索引热身完成: {indexed}/{total}, 剩余 {total - i - 1} 张后台继续")
             conn.commit()
             conn.close()
             return {"paused": True, "batch_limit_reached": True, "total": total, "indexed": indexed}
 
         if (i + 1) % 20 == 0:
-            cp_check = _load_checkpoint()
-            if cp_check and cp_check["state"] in (IndexState.PAUSED, IndexState.STOPPED):
-                _save_checkpoint(IndexState.PAUSED, i + 1, total, indexed)
+            if _cp.is_pause_or_stop_requested():
+                _cp.save(CheckpointState.PAUSED, current_index=i + 1, total=total, indexed=indexed)
                 logger.info(f"索引暂停: {indexed}/{total}")
                 conn.commit()
                 conn.close()
                 return {"paused": True, "total": total, "indexed": indexed}
 
-            _save_checkpoint(IndexState.RUNNING, i + 1, total, indexed)
+            _cp.save(CheckpointState.RUNNING, current_index=i + 1, total=total, indexed=indexed)
 
     conn.commit()
     conn.close()
-    clear_checkpoint()
+    _cp.clear()
     logger.info(f"索引完成: 总计 {total}, 已索引 {indexed}")
     return {"total": total, "indexed": indexed}
 
