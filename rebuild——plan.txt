@@ -1,0 +1,614 @@
+下面我基于你当前版本，给出一份可直接指导重构的架构 + 代码建议文档。建议你把它保存为 `REBUILD_PLAN.md`，作为下一版的开发指南。
+
+---
+
+## 一、对当前项目的整体评价
+
+先说结论：功能完整、架构方向正确，但实现层"糙"。核心问题不是功能，而是耦合度高、重复代码多、副作用难控制。
+
+优点：
+- 模块边界清晰（scanner / classifier / indexer / memory / ui）
+- 断点续扫/续传思路正确（JSON checkpoint + WAL）
+- LLM 使用 `response_format=json_object` 严格约束输出
+- 瀑布流淡入、后台线程、分支分类传播等交互细节到位
+
+主要问题（12 个，按严重度排序）：
+
+| # | 类别 | 问题 | 影响 |
+|---|------|------|------|
+| 1 | 架构 | `config.py` 是"上帝模块"：env 加载 + 全局常量 + DB 建表 + OpenAI 客户端 + 运行时修改全局变量 | 测试困难、循环依赖风险、`reload_config` 用 `global` 魔改模块状态 |
+| 2 | 架构 | 无数据访问层，SQL 散落在 10+ 个文件里 | schema 变更要改多处；难以 mock |
+| 3 | 架构 | `scanner/fast_scan.py` 与 `scanner/file_scanner.py` 70% 重复（checkpoint、walk、insert 逻辑） | 改 bug 要改两次 |
+| 4 | 架构 | `StartupWorker.run()` 一个方法塞了 4 个阶段 + 用户交互 + 后台触发 + 取消检测 | 140+ 行，不可测试、不可重用 |
+| 5 | 健壮性 | LLM 调用无重试、无超时、无速率限制，一次 429/网络抖动整个阶段失败 | 用户体验差 |
+| 6 | 健壮性 | Everything `es.exe` 用系统 ANSI (GBK) 编码读取，日文/特殊 Unicode 路径丢失 | 已知 3600+ 文件入不了库 |
+| 7 | 健壮性 | `PIL.Image.MAX_IMAGE_PIXELS = 500_000_000` 后仍直接 `Image.open` 大 RAW，OOM 风险 | 扫描大图时崩溃 |
+| 8 | UI | `ui/app.py` MainWindow 承担了 10+ 个职责（分类导航、滚动手势、全屏、拖拽窗口、重分类对话框、后台线程管理、点击记录） | 500 行；修改一处易出 bug |
+| 9 | UI | 瀑布流全量渲染，6 万张时 `QWidget` 数量会把 Qt 压垮 | 需要虚拟滚动 |
+| 10 | 并发 | `_bg_threads = []` 模块级可变全局，多次启动累积，关闭竞态 | 关窗偶发 crash |
+| 11 | 并发 | 每个模块各自 `sqlite3.connect(DB_PATH)`，没有连接池/上下文管理 | 事务边界混乱，偶发 `database is locked` |
+| 12 | 工程 | 零单元测试、零类型注解、日志关键词不统一 | 无法做回归 |
+
+---
+
+## 二、建议的新架构（分层 + 事件驱动）
+
+```
+photo-memories/
+├── pyproject.toml              # 用 pyproject 替代 requirements.txt + setup.py
+├── README.md
+├── .env.example
+│
+├── src/photo_memories/         # ← 真正的包，支持 pip install -e .
+│   │
+│   ├── __init__.py
+│   ├── __main__.py             # python -m photo_memories
+│   ├── cli.py                  # argparse 命令分发（scan/index/ui/...）
+│   │
+│   ├── core/                   # ★ 领域层：纯 Python，无框架依赖
+│   │   ├── models.py           # @dataclass: PhotoFile, PhotoMetadata, Memory, FolderCategory
+│   │   ├── categories.py       # 分类枚举 + 名称映射（enum.IntEnum）
+│   │   ├── constants.py        # 扩展名、缩略图尺寸等纯常量
+│   │   └── exceptions.py       # 领域异常（ScanError, LLMError, ...)
+│   │
+│   ├── config/                 # ★ 配置层
+│   │   ├── settings.py         # Pydantic BaseSettings 单一数据类
+│   │   ├── paths.py            # 路径计算（DB、缩略图、日志、checkpoint）
+│   │   └── env_io.py           # .env 读写（替换 set_key 魔法）
+│   │
+│   ├── infra/                  # ★ 基础设施层（可替换的外部依赖）
+│   │   ├── db/
+│   │   │   ├── connection.py   # ConnectionPool + @contextmanager get_conn()
+│   │   │   ├── migrations.py   # 版本化 schema（v1/v2/...）替换 init_all_tables
+│   │   │   └── repositories/   # 每表一个 Repository
+│   │   │       ├── files_repo.py
+│   │   │       ├── metadata_repo.py
+│   │   │       ├── folder_category_repo.py
+│   │   │       ├── memory_repo.py
+│   │   │       ├── click_repo.py
+│   │   │       └── tag_repo.py
+│   │   │
+│   │   ├── llm/
+│   │   │   ├── client.py       # LLMClient 抽象基类
+│   │   │   ├── deepseek.py     # DeepSeek 实现（带 tenacity 重试）
+│   │   │   └── rate_limiter.py # 令牌桶
+│   │   │
+│   │   ├── fs/
+│   │   │   ├── everything.py   # Everything/es.exe 封装（utf-8 编码修复）
+│   │   │   ├── walker.py       # os.walk 回退
+│   │   │   └── file_lister.py  # 统一入口：优先 Everything，失败回退 walker
+│   │   │
+│   │   └── image/
+│   │       ├── exif_reader.py  # 纯 exifread 封装
+│   │       └── thumb_maker.py  # Pillow 缩略图 + 流式读取大图
+│   │
+│   ├── services/               # ★ 应用服务层：编排领域逻辑
+│   │   ├── scan_service.py     # 扫描：依赖 FileLister + FilesRepo
+│   │   ├── classify_service.py # 分类：依赖 LLMClient + FolderCategoryRepo
+│   │   ├── index_service.py    # 索引：依赖 ExifReader + ThumbMaker + MetadataRepo
+│   │   ├── memory_service.py   # 回忆：依赖 LLMClient + MemoryRepo
+│   │   ├── recommend_service.py# 推荐排序
+│   │   └── pipeline.py         # ★ 启动流水线：4 阶段组合
+│   │
+│   ├── checkpoint/             # ★ 统一断点管理（消除 scanner/indexer 重复）
+│   │   ├── state.py            # enum State { RUNNING, PAUSED, STOPPED }
+│   │   └── manager.py          # CheckpointManager[T]（泛型）
+│   │
+│   └── ui/                     # ★ 表现层：只做 UI，不做业务
+│       ├── app.py              # QApplication 入口 + main()
+│       ├── controllers/        # 连接 UI 和 services
+│       │   ├── main_controller.py
+│       │   ├── pipeline_controller.py
+│       │   └── viewer_controller.py
+│       ├── widgets/            # 纯展示组件
+│       │   ├── photo_card.py
+│       │   ├── waterfall.py    # ★ 支持虚拟滚动
+│       │   ├── category_page.py
+│       │   ├── image_viewer.py
+│       │   ├── top_bar.py
+│       │   └── nav_bar.py
+│       ├── windows/
+│       │   ├── main_window.py  # 只负责布局，不做业务
+│       │   ├── startup_window.py
+│       │   └── setup_window.py
+│       ├── dialogs/
+│       │   └── classify_dialog.py
+│       └── workers/            # QThread 封装
+│           ├── scan_worker.py
+│           ├── index_worker.py
+│           └── pipeline_worker.py
+│
+├── tests/                      # ★ 新增
+│   ├── unit/
+│   │   ├── test_exif_reader.py
+│   │   ├── test_thumb_maker.py
+│   │   ├── test_checkpoint.py
+│   │   └── test_repositories.py
+│   ├── integration/
+│   │   └── test_pipeline.py
+│   └── fixtures/               # 测试样例图片/DB
+│
+└── storage/                    # 运行时数据（git ignore）
+    ├── logs/
+    ├── thumbnails/
+    └── photos.db
+```
+
+关键分层原则：
+
+```
+UI层 ──┐
+       ▼
+   services ──┐
+              ▼
+           infra ──┐
+                   ▼
+                 core（无依赖）
+```
+
+core 不依赖任何东西；infra 只依赖 core；services 只依赖 core + infra；UI 只依赖 services。任何反向 import 都是架构违规。
+
+---
+
+## 三、关键代码改造建议
+
+### 3.1 配置层：用 Pydantic 替代 `global` 魔法
+
+当前问题：`config.py` 用 `global` 在运行时重新赋值模块级变量，导致 `reload_config()` 之后已经 `from config import DB_PATH` 的模块看到的是旧值。
+
+```python
+# src/photo_memories/config/settings.py
+from pathlib import Path
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+
+    # LLM
+    deepseek_api_key: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_model: str = "deepseek-chat"
+
+    # Paths
+    source_drive: Path = Path("D:/测试")
+    photo_data_dir: Path = Path("./storage")
+
+    # Tunables（原来硬编码的值搬出来）
+    thumbnail_size: tuple[int, int] = (400, 400)
+    scan_warmup_limit: int = 500
+    index_warmup_limit: int = 100
+    index_commit_every: int = 20
+    llm_max_retries: int = 3
+    llm_timeout_seconds: int = 30
+
+    @property
+    def db_path(self) -> Path:
+        return self.photo_data_dir / "photos.db"
+
+    @property
+    def thumbnail_dir(self) -> Path:
+        return self.photo_data_dir / "thumbnails"
+
+    def is_configured(self) -> bool:
+        return bool(self.deepseek_api_key and self.source_drive and self.photo_data_dir)
+
+# 单例通过依赖注入传递，而不是模块级变量
+_settings: Settings | None = None
+
+def get_settings() -> Settings:
+    global _settings
+    if _settings is None:
+        _settings = Settings()
+    return _settings
+
+def reload_settings() -> Settings:
+    global _settings
+    _settings = Settings()
+    return _settings
+```
+
+所有模块通过函数参数接收 settings，不再 `from config import DB_PATH`。
+
+---
+
+### 3.2 数据访问层：Repository 模式 + 连接池
+
+当前问题：每个模块自己 `sqlite3.connect`，事务边界混乱。
+
+```python
+# src/photo_memories/infra/db/connection.py
+import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
+
+class Database:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self._init_pragmas()
+
+    def _init_pragmas(self):
+        with self.connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("PRAGMA foreign_keys=ON")
+
+    @contextmanager
+    def connect(self):
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+# src/photo_memories/infra/db/repositories/files_repo.py
+from dataclasses import dataclass
+from photo_memories.core.models import PhotoFile
+
+class FilesRepository:
+    def __init__(self, db: Database):
+        self.db = db
+
+    def get_existing_paths(self) -> set[str]:
+        with self.db.connect() as conn:
+            return {r[0] for r in conn.execute("SELECT file_path FROM files")}
+
+    def bulk_insert(self, files: list[PhotoFile]) -> int:
+        with self.db.connect() as conn:
+            conn.executemany(
+                """INSERT OR IGNORE INTO files
+                   (file_path, file_name, folder_path, folder_name,
+                    file_size, file_mtime, is_image, scanned_at)
+                   VALUES (?,?,?,?,?,?,?,datetime('now'))""",
+                [f.as_row() for f in files]
+            )
+            return conn.total_changes
+
+    def delete_missing(self, missing_paths: set[str]) -> int:
+        if not missing_paths: return 0
+        with self.db.connect() as conn:
+            conn.executemany(
+                "DELETE FROM files WHERE file_path = ?",
+                [(p,) for p in missing_paths]
+            )
+            return conn.total_changes
+
+    def count(self) -> int:
+        with self.db.connect() as conn:
+            return conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+```
+
+建表改成版本化迁移：
+
+```python
+# src/photo_memories/infra/db/migrations.py
+MIGRATIONS = [
+    ("001_init", """
+        CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+        CREATE TABLE files (...);
+        CREATE TABLE folder_categories (...);
+        ...
+        INSERT INTO schema_version VALUES (1);
+    """),
+    ("002_add_tags", """
+        CREATE TABLE photo_tags (...);
+        UPDATE schema_version SET version = 2;
+    """),
+]
+
+def migrate(db: Database):
+    with db.connect() as conn:
+        current = _get_current_version(conn)
+        for i, (name, sql) in enumerate(MIGRATIONS, 1):
+            if i > current:
+                conn.executescript(sql)
+```
+
+---
+
+### 3.3 统一断点管理（消除 scanner/indexer 重复）
+
+当前问题：`scanner/fast_scan.py`、`scanner/file_scanner.py`、`indexer/photo_indexer.py` 都重复实现了 `_load_checkpoint` / `_save_checkpoint` / `set_paused` / `set_stopped` / `clear_checkpoint`。
+
+```python
+# src/photo_memories/checkpoint/manager.py
+from dataclasses import dataclass, asdict
+from enum import Enum
+from pathlib import Path
+import json
+
+class CheckpointState(str, Enum):
+    RUNNING = "running"
+    PAUSED = "paused"
+    STOPPED = "stopped"
+
+@dataclass
+class Checkpoint:
+    state: CheckpointState
+    current_index: int
+    total: int
+    processed: int
+    extra: dict = None  # 子类自由扩展
+
+class CheckpointManager:
+    """泛型断点管理器：scan/index 共用"""
+    def __init__(self, checkpoint_file: Path):
+        self.file = checkpoint_file
+
+    def load(self) -> Checkpoint | None: ...
+    def save(self, cp: Checkpoint) -> None: ...
+    def clear(self) -> None: ...
+    def request_pause(self) -> None: ...
+    def request_stop(self) -> None: ...
+    def is_pause_requested(self) -> bool: ...
+```
+
+扫描/索引服务都注入这个 Manager，不再各写一份。
+
+---
+
+### 3.4 LLM 客户端带重试 + 超时
+
+当前问题：网络抖动一次就整个阶段崩溃。
+
+```python
+# src/photo_memories/infra/llm/deepseek.py
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from openai import OpenAI, APITimeoutError, APIConnectionError, RateLimitError
+
+class DeepSeekClient:
+    def __init__(self, settings: Settings):
+        self._client = OpenAI(
+            api_key=settings.deepseek_api_key,
+            base_url=settings.deepseek_base_url,
+            timeout=settings.llm_timeout_seconds,
+        )
+        self._model = settings.deepseek_model
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=2, max=30),
+        retry=retry_if_exception_type((APITimeoutError, APIConnectionError, RateLimitError)),
+        reraise=True,
+    )
+    def chat_json(self, prompt: str, temperature: float = 0.3) -> dict:
+        resp = self._client.chat.completions.create(
+            model=self._model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            response_format={"type": "json_object"},
+        )
+        return json.loads(resp.choices[0].message.content)
+```
+
+---
+
+### 3.5 启动流水线：拆成独立 Stage
+
+当前问题：`StartupWorker.run()` 一个方法 140 行、4 阶段 + 用户交互 + 后台触发全塞在一起。
+
+```python
+# src/photo_memories/services/pipeline.py
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+@dataclass
+class StageResult:
+    name: str
+    success: bool
+    needs_background_continue: bool = False
+    details: dict = None
+
+class Stage(ABC):
+    name: str
+    @abstractmethod
+    def run(self, ctx: "PipelineContext") -> StageResult: ...
+
+class ScanStage(Stage):
+    name = "扫描文件"
+    def __init__(self, scan_service: ScanService):
+        self.scan = scan_service
+    def run(self, ctx):
+        result = self.scan.warmup_scan(limit=ctx.settings.scan_warmup_limit,
+                                        progress=ctx.progress_cb,
+                                        cancel_token=ctx.cancel_token)
+        return StageResult("scan", True,
+                          needs_background_continue=result.warmup_reached)
+
+class ClassifyStage(Stage): ...
+class IndexStage(Stage): ...
+class MemoryStage(Stage): ...
+
+class Pipeline:
+    def __init__(self, stages: list[Stage]):
+        self.stages = stages
+
+    def run(self, ctx: PipelineContext) -> list[StageResult]:
+        results = []
+        for stage in self.stages:
+            if ctx.cancel_token.is_cancelled:
+                break
+            ctx.on_stage_start(stage.name)
+            r = stage.run(ctx)
+            ctx.on_stage_end(r)
+            results.append(r)
+        return results
+```
+
+这样每个 Stage 都可独立测试、可独立调试、可重用（比如"只重跑回忆生成"就只实例化 `MemoryStage`）。
+
+---
+
+### 3.6 UI 虚拟瀑布流（6 万张不卡顿）
+
+当前问题：`WaterfallLayout.add_card` 会为每张照片创建真实 `QWidget`，6 万张 = 6 万 widget = Qt 崩溃。
+
+方案：基于 `QAbstractItemModel + QListView` 或自绘 `QGraphicsView`，只渲染可视区域 + 缓冲区的卡片。
+
+```python
+# 伪代码示意
+class VirtualWaterfallView(QAbstractScrollArea):
+    def __init__(self, model):
+        self.model = model  # 全量数据只存数据，不存 widget
+        self._visible_cards: dict[int, PhotoCard] = {}
+        self._column_heights = [0] * COL_COUNT
+
+    def paintEvent(self, event):
+        viewport_rect = self.viewport().rect()
+        scroll_y = self.verticalScrollBar().value()
+
+        # 1. 计算可视区域覆盖的 index 范围
+        first_idx, last_idx = self._compute_visible_range(scroll_y, viewport_rect.height())
+
+        # 2. 回收超出范围的 widget
+        for idx in list(self._visible_cards):
+            if idx < first_idx - 20 or idx > last_idx + 20:
+                self._visible_cards.pop(idx).deleteLater()
+
+        # 3. 创建新进入视口的 widget
+        for idx in range(first_idx, last_idx + 1):
+            if idx not in self._visible_cards:
+                self._visible_cards[idx] = self._create_card(idx)
+```
+
+同时缩略图用 `QPixmapCache` + 弱引用，避免同一张图加载两次。
+
+---
+
+### 3.7 Everything 编码修复
+
+当前问题：`subprocess.run(...capture_output=True, text=True)` 在 Windows 下 `text=True` 用的是 `locale.getpreferredencoding()` = GBK，日文/韩文假名变 `?`。
+
+```python
+# src/photo_memories/infra/fs/everything.py
+def list_files(self, query: str) -> list[str]:
+    result = subprocess.run(
+        [self.es_path, "-csv", "-no-header", "-utf8", query],  # ← 加 -utf8
+        capture_output=True,
+        encoding="utf-8",    # ← 显式 utf-8
+        errors="replace",
+        timeout=120,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    # 或者用 bytes + manual decode
+    # result = subprocess.run(..., capture_output=True)
+    # text = result.stdout.decode("utf-8", errors="replace")
+```
+
+注：Everything `es.exe` 从 1.1.0.19 版本起支持 `-utf8` 标志，必须加。
+
+---
+
+### 3.8 缩略图生成流式读取
+
+当前问题：`Image.open(超大raw).thumbnail()` 仍会把整张原图读进内存。
+
+```python
+# src/photo_memories/infra/image/thumb_maker.py
+from PIL import Image, ImageOps
+
+class ThumbnailMaker:
+    def __init__(self, output_dir: Path, size: tuple[int, int]):
+        self.output_dir = output_dir
+        self.size = size
+
+    def generate(self, src: Path, dst_name: str) -> ThumbResult:
+        dst = self.output_dir / dst_name
+        if dst.exists():
+            return ThumbResult.cached(dst)
+
+        try:
+            with Image.open(src) as img:
+                # draft 用于 JPEG 快速降采样读取，内存占用 1/n²
+                img.draft("RGB", self.size)
+                img = ImageOps.exif_transpose(img)
+                img.thumbnail(self.size, Image.Resampling.LANCZOS)
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                img.save(dst, "JPEG", quality=80, optimize=True)
+            return ThumbResult.ok(dst)
+        except (OSError, Image.DecompressionBombError) as e:
+            logger.warning(f"缩略图生成失败 {src}: {e}")
+            return ThumbResult.failed(str(e))
+```
+
+关键：`img.draft()` 能让 JPEG 解码器直接按目标尺寸的 1/2、1/4、1/8 做降采样，内存占用骤降。
+
+---
+
+## 四、重构的代码收益对比（估算）
+
+```echarts
+{
+  "tooltip": { "trigger": "axis" },
+  "legend": { "data": ["当前版本", "重构后"], "textStyle": { "color": "#333" } },
+  "radar": {
+    "indicator": [
+      { "name": "可测试性", "max": 10 },
+      { "name": "可维护性", "max": 10 },
+      { "name": "扩展性", "max": 10 },
+      { "name": "启动性能", "max": 10 },
+      { "name": "大库稳定性", "max": 10 },
+      { "name": "错误恢复", "max": 10 }
+    ]
+  },
+  "series": [{
+    "type": "radar",
+    "data": [
+      { "name": "当前版本", "value": [2, 4, 5, 6, 4, 3], "areaStyle": { "opacity": 0.3 } },
+      { "name": "重构后", "value": [9, 8, 9, 8, 8, 8], "areaStyle": { "opacity": 0.3 } }
+    ]
+  }]
+}
+```
+
+---
+
+## 五、建议的迁移路径（4 个阶段）
+
+我强烈建议不要 big bang 重写，而是按下面顺序分阶段迁移：
+
+阶段 A：地基（2-3 天）
+1. 建 `src/photo_memories/` 新包结构
+2. 把 `config.py` → `config/settings.py`（Pydantic）
+3. 建 `infra/db/`：Database + Migrations + Repositories
+4. 建 `checkpoint/manager.py` 统一断点
+5. 验收：旧 `main.py scan` 跑通，数据库兼容
+
+阶段 B：服务层（2-3 天）
+1. 把 `scanner/` → `services/scan_service.py` + `infra/fs/`
+2. 把 `classifier/` → `services/classify_service.py` + `infra/llm/`
+3. 把 `indexer/` → `services/index_service.py` + `infra/image/`
+4. 把 `memory/` → `services/memory_service.py`
+5. 删除 `scanner/file_scanner.py`（与 fast_scan 合并）
+6. 验收：CLI 四个命令全部通过，行为与旧版一致
+
+阶段 C：Pipeline + UI 分离（3-4 天）
+1. 建 `services/pipeline.py`
+2. 拆 `ui/app.py`：MainWindow 只留布局；业务逻辑进 `controllers/`
+3. 重写 `StartupWorker` → `PipelineWorker`（薄壳，只调度 Pipeline）
+4. 把后台 `_bg_threads` 改为 `BackgroundTaskManager` 单例
+5. 验收：UI 所有交互功能正常（翻页、收藏、重分类、分类对话框）
+
+阶段 D：性能与健壮性（2-3 天）
+1. 实现虚拟瀑布流
+2. LLM 客户端加 tenacity 重试
+3. Everything 加 `-utf8` + `encoding="utf-8"`
+4. 缩略图用 `img.draft()`
+5. 写 20 个最关键的单元测试（checkpoint、exif、repo、pipeline 各一组）
+6. 验收：6 万张真实库跑完整流程不崩，内存峰值 < 1GB
+
+---
+
+## 六、最后的建议
+
+1. 用 `pyproject.toml` + `pip install -e .`，别再靠 `sys.path` 相对导入。
+2. 全量加类型注解（`from __future__ import annotations` + `dataclass`），配合 `mypy --strict`。
+3. 日志加 correlation_id：每个 pipeline run 一个 uuid，排查问题一抓一个准。
+4. 用 `ruff` + `black` + `pre-commit`，风格统一。
+5. 把 `PROJECT_ARCHIVE.md` 保留下来，它写得非常好，是这次重构的重要参考。
+

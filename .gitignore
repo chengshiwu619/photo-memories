@@ -1,0 +1,10 @@
+.env
+storage/
+unknown_folders.txt
+__pycache__/
+*.pyc
+.DS_Store
+venv/
+*.code-workspace
+PROJECT_FULL_DUMP.txt
+error.log
