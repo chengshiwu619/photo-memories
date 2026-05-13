@@ -1,42 +1,34 @@
 # NAS 照片回忆
 
-## 环境依赖
+> 本地化搭建的照片回忆，用它来唤醒 NAS 沉睡的照片。
 
-- Python 3.13+
-- pip 安装依赖：`pip install -r requirements.txt`
+你的 NAS 里躺着几万张照片，却很少翻看。这个项目用 LLM 自动分类文件夹、生成回忆标题，以瀑布流的方式把照片重新呈现给你——一切都在本地运行，数据不离开你的硬盘。
 
-## Everything 集成（可选但强烈推荐）
+## 功能特点
 
-项目内置了 Everything 命令行集成，用于极速文件扫描。需要以下文件放入 `everything/` 目录：
+- 🔍 **极速扫描** — 集成 Everything 搜索引擎，6 万+文件秒级发现
+- 🤖 **LLM 智能分类** — 调用 DeepSeek API 自动将文件夹归为生活照片 / 拍摄样片 / 摄影照片 / 色情照片
+- 💭 **回忆生成** — AI 为每组照片生成有温度的标题和描述
+- 🖼️ **瀑布流浏览** — 虚拟滚动 + 懒加载缩略图，万级照片流畅展示
+- 🔒 **完全本地** — 照片、缩略图、数据库全部存储在本地，仅 LLM 调用需要联网
 
-### 必需文件
+## 快速开始
 
-| 文件 | 用途 | 来源 |
-|------|------|------|
-| `es.exe` | Everything CLI | 项目自带（ES-1.1.0.30.x64） |
-| `Everything64.exe` | Everything 搜索服务 | [voidtools.com](https://www.voidtools.com/downloads/) Everything 1.5+ 便携版 |
+### 环境依赖
 
-### 配置步骤
+- Python 3.10+
+- [DeepSeek API Key](https://platform.deepseek.com/)（用于分类和回忆生成）
+- Windows（Everything 集成需要）
 
-1. 下载 [Everything 1.5a 便携版 64位](https://www.voidtools.com/forum/viewtopic.php?t=9787)（`Everything-1.5a.x64.zip`）
-2. 将 `Everything64.exe` 放入 `everything/` 目录
-3. **以管理员身份运行** `Everything64.exe`（仅在首次安装时需管理员权限以创建 NTFS 索引）
-4. 前往 **工具 → 选项 → NTFS**，对 `Y:` 盘勾选「包含在数据库中」（如果 Y 盘是 NTFS）
-5. 如果 Y 盘是网络盘（NAS/SMB），前往 **工具 → 选项 → 文件夹**，添加 `Y:\` 为强制索引
-6. 等待索引完成（状态栏显示文件数量停止增长即可）
-7. 后续启动时 `launch.bat` 会自动以后台服务模式启动 Everything
+### 安装
 
-### 工作原理
+```bash
+git clone https://github.com/waxzml/photo-memories.git
+cd photo-memories
+pip install -r requirements.txt
+```
 
-- 程序启动时自动探测 Everything 实例名（默认、1.5a、1.5）—— 本项目已内建自动探测
-- 若 Everything 能直接索引文件（NTFS 卷），使用 `es.exe -csv` 导出全部媒体文件路径，几乎瞬间完成
-- 若 Everything 只有文件夹索引（NAS/网络盘 Folder Index），则先通过 Everything 获取全量文件夹列表，再遍历文件夹扫描媒体文件，速度接近 Everything 直接索引
-- `es.exe` 已内置在 `everything/` 目录（ES-1.1.0.30.x64），无需额外下载
-- 无 Everything 时自动回退到 `os.walk` 遍历 + 文件列表缓存（首次慢，之后秒取）
-
-## 首次使用
-
-### GUI 模式
+### 启动
 
 ```bash
 python main.py ui
@@ -44,9 +36,9 @@ python main.py ui
 ```
 
 首次启动会弹出配置窗口，填写：
-- **照片库文件夹**：照片存放路径（如 `Y:\`）
-- **缓存数据文件夹**：数据库/缩略图存储路径（如 `D:\测试\pipecache`）
-- **DeepSeek API Key**：`sk-...`
+- **照片库路径** — NAS 照片存放路径（如 `Y:\`）
+- **缓存数据路径** — 数据库和缩略图存储路径
+- **DeepSeek API Key** — `sk-...`
 
 ### CLI 模式
 
@@ -60,12 +52,50 @@ python main.py all      # 一键全流程
 python main.py ui       # 启动界面
 ```
 
-## 数据库
+## Everything 集成（可选但强烈推荐）
 
-位置由 `.env` 中的 `PHOTO_DATA_DIR` 指定，默认自动创建。包含的表：
+项目内置 Everything 命令行集成，用于极速文件扫描。
 
-- `files` — 文件清单
-- `folder_categories` — 文件夹分类
-- `photo_metadata` — 照片元数据和缩略图
-- `memories` — LLM 生成的回忆
-- `click_history` — 浏览记录
+### 配置步骤
+
+1. 下载 [Everything 1.5a 便携版 64位](https://www.voidtools.com/forum/viewtopic.php?t=9787)
+2. 将 `Everything64.exe` 放入 `everything/` 目录
+3. **以管理员身份运行** `Everything64.exe`（首次需管理员权限创建 NTFS 索引）
+4. 前往 **工具 → 选项 → NTFS**，对目标盘勾选「包含在数据库中」
+5. 如果是网络盘（NAS/SMB），前往 **工具 → 选项 → 文件夹**，添加为强制索引
+6. 等待索引完成，后续启动时 `launch.bat` 会自动启动 Everything
+
+无 Everything 时自动回退到 `os.walk` 遍历 + 文件列表缓存。
+
+## 项目结构
+
+```
+├── classifier/          # LLM 文件夹分类
+├── indexer/             # 照片索引 & 缩略图生成
+├── memory/              # 回忆生成
+├── scanner/             # 文件扫描（Everything / os.walk）
+├── services/            # Pipeline 流程编排
+├── ui/                  # PyQt6 界面
+│   ├── components/      # 瀑布流、设置窗口、图片查看器
+│   └── recommendation.py # 照片排序 & 间隔算法
+├── infra/               # 基础设施
+│   ├── db/              # 数据库 & Repository
+│   ├── fs/              # Everything 集成
+│   └── llm/             # LLM 客户端（DeepSeek）
+├── config.py            # 配置管理
+├── db_manager.py        # 数据库管理
+└── main.py              # 入口
+```
+
+## 技术栈
+
+- **UI**: PyQt6 + 虚拟瀑布流（QScrollArea + 动态卡片）
+- **LLM**: DeepSeek API（文件夹分类 + 回忆生成）
+- **扫描**: Everything CLI / os.walk
+- **数据库**: SQLite + WAL 模式
+- **缩略图**: Pillow + EXIF 自动旋转
+- **配置**: Pydantic Settings + .env
+
+## License
+
+[MIT](LICENSE)
