@@ -119,10 +119,13 @@ def _list_all_image_files():
     list_file = os.path.join(DATA_DIR, "filelist.txt")
     if os.path.exists(list_file):
         with open(list_file, "r", encoding="utf-8") as f:
-            lines = [os.path.normpath(l.rstrip("\n")) for l in f if l.strip()]
-        if lines:
-            logger.info("使用缓存文件列表: %s 个文件" % len(lines))
-            return lines
+            lines = f.readlines()
+        if lines and lines[0].strip() == f"# SOURCE_DRIVE={os.path.normpath(SOURCE_DRIVE)}":
+            paths = [os.path.normpath(l.rstrip("\n")) for l in lines[1:] if l.strip()]
+            if paths:
+                logger.info("使用缓存文件列表: %s 个文件" % len(paths))
+                return paths
+        logger.info("缓存文件列表来源不匹配当前 SOURCE_DRIVE, 重新扫描")
 
     inst = _detect_instance()
     if inst == "__FAIL__":
@@ -135,7 +138,7 @@ def _list_all_image_files():
     ext_query = "ext:%s" % ";".join(ext_list)
     logger.info("查询: %s (全局扩展名搜索, Python侧过滤路径)" % ext_query)
 
-    out, code = _run_es(["-utf8", "-csv", "-no-header", ext_query], timeout=120)
+    out, code = _run_es(["-csv", "-no-header", ext_query], timeout=120)
 
     if code == 0 and out:
         files = _parse_es_csv(out)
@@ -144,6 +147,7 @@ def _list_all_image_files():
             os.makedirs(DATA_DIR, exist_ok=True)
             tmp = list_file + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
+                f.write(f"# SOURCE_DRIVE={os.path.normpath(SOURCE_DRIVE)}\n")
                 for fp in files:
                     f.write(fp + "\n")
             os.replace(tmp, list_file)
@@ -172,16 +176,20 @@ def _walk_files():
     list_file = os.path.join(DATA_DIR, "filelist.txt")
     if os.path.exists(list_file):
         with open(list_file, "r", encoding="utf-8") as f:
-            lines = [os.path.normpath(line.rstrip("\n")) for line in f if line.strip()]
-        if lines:
-            logger.info(f"使用缓存文件列表: {len(lines)} 个文件")
-            return lines
+            lines = f.readlines()
+        if lines and lines[0].strip() == f"# SOURCE_DRIVE={os.path.normpath(SOURCE_DRIVE)}":
+            paths = [os.path.normpath(line.rstrip("\n")) for line in lines[1:] if line.strip()]
+            if paths:
+                logger.info(f"使用缓存文件列表: {len(paths)} 个文件")
+                return paths
+        logger.info("缓存文件列表来源不匹配当前 SOURCE_DRIVE, 重新扫描")
 
     logger.info("os.walk 遍历中, 请耐心等待...")
     os.makedirs(DATA_DIR, exist_ok=True)
     tmp_file = list_file + ".tmp"
     file_list = []
     with open(tmp_file, "w", encoding="utf-8") as fout:
+        fout.write(f"# SOURCE_DRIVE={os.path.normpath(SOURCE_DRIVE)}\n")
         for root, dirs, files in os.walk(SOURCE_DRIVE):
             for fname in files:
                 if os.path.splitext(fname)[1].lower() in ALL_EXTENSIONS:
