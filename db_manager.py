@@ -3,41 +3,11 @@ from contextlib import contextmanager
 
 from logger_setup import logger
 from config import DB_PATH
-from infra.db.repositories.files_repo import FilesRepository
-from infra.db.repositories.folder_categories_repo import FolderCategoriesRepository
-from infra.db.repositories.photo_metadata_repo import PhotoMetadataRepository
-from infra.db.repositories.memories_repo import MemoriesRepository
-from infra.db.repositories.click_history_repo import ClickHistoryRepository
-from infra.db.repositories.photo_tags_repo import PhotoTagsRepository
 
 
 class Database:
     def __init__(self, db_path=None):
         self.db_path = db_path or DB_PATH
-
-    @property
-    def files(self):
-        return FilesRepository(self)
-
-    @property
-    def folder_categories(self):
-        return FolderCategoriesRepository(self)
-
-    @property
-    def photo_metadata(self):
-        return PhotoMetadataRepository(self)
-
-    @property
-    def memories(self):
-        return MemoriesRepository(self)
-
-    @property
-    def click_history(self):
-        return ClickHistoryRepository(self)
-
-    @property
-    def photo_tags(self):
-        return PhotoTagsRepository(self)
 
     @contextmanager
     def connect(self):
@@ -135,6 +105,28 @@ class Database:
                 UNIQUE(file_id, tag)
             );
             CREATE INDEX IF NOT EXISTS idx_tags_file ON photo_tags(file_id);
+
+            CREATE TABLE IF NOT EXISTS sample_keywords (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                keyword TEXT UNIQUE NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS life_keywords (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                keyword TEXT UNIQUE NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS photo_shown_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id INTEGER NOT NULL,
+                category INTEGER,
+                shown_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (file_id) REFERENCES files(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_shown_file ON photo_shown_history(file_id);
+            CREATE INDEX IF NOT EXISTS idx_shown_at ON photo_shown_history(shown_at);
         """)
         conn.commit()
         conn.close()

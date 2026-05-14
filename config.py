@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-chat"
+    deepseek_classify_model: str = "deepseek-v4-flash"
 
     source_drive: str = "D:\\测试"
     photo_data_dir: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage")
@@ -49,12 +50,13 @@ def get_settings() -> Settings:
 
 
 def _sync_module_vars_from_settings():
-    global DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL
+    global DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, DEEPSEEK_CLASSIFY_MODEL
     global SOURCE_DRIVE, DATA_DIR, DB_PATH, THUMBNAIL_DIR, CLASSIFICATION_HISTORY_FILE
     s = get_settings()
     DEEPSEEK_API_KEY = s.deepseek_api_key
     DEEPSEEK_BASE_URL = s.deepseek_base_url
     DEEPSEEK_MODEL = s.deepseek_model
+    DEEPSEEK_CLASSIFY_MODEL = s.deepseek_classify_model
     SOURCE_DRIVE = s.source_drive
     DATA_DIR = s.photo_data_dir
     DB_PATH = s.db_path
@@ -68,14 +70,10 @@ THUMBNAIL_SIZE = (400, 400)
 
 CATEGORY_LIFE = 1
 CATEGORY_SAMPLE = 2
-CATEGORY_PHOTOGRAPHY = 3
-CATEGORY_ADULT = 4
 
 CATEGORY_NAMES = {
     CATEGORY_LIFE: "生活照片",
     CATEGORY_SAMPLE: "拍摄样片",
-    CATEGORY_PHOTOGRAPHY: "摄影照片",
-    CATEGORY_ADULT: "色情照片",
 }
 
 _OPENAI_CLIENT = None
