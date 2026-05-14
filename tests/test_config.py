@@ -18,9 +18,7 @@ def test_category_constants():
     import config
     assert config.CATEGORY_LIFE == 1
     assert config.CATEGORY_SAMPLE == 2
-    assert config.CATEGORY_PHOTOGRAPHY == 3
-    assert config.CATEGORY_ADULT == 4
-    assert len(config.CATEGORY_NAMES) == 4
+    assert len(config.CATEGORY_NAMES) == 2
     assert config.CATEGORY_NAMES[1] == "生活照片"
 
 

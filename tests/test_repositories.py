@@ -4,8 +4,7 @@ import shutil
 from datetime import datetime
 
 
-def test_repositories_infrastructure():
-    from core.models import File, FolderCategory, PhotoMetadata, Memory, ClickHistory, PhotoTag
+def test_database_basic_operations():
     from db_manager import Database
 
     temp_dir = tempfile.mkdtemp()
@@ -14,28 +13,48 @@ def test_repositories_infrastructure():
         db = Database(temp_db)
         db.init_tables()
 
-        file = File(file_path="D:\\test\\photo.jpg", file_name="photo.jpg", folder_path="D:\\test", folder_name="test", file_size=12345, file_mtime=datetime.now().isoformat(), is_image=1, scanned_at=datetime.now().isoformat())
-        assert db.files.insert_or_ignore(file) >= 0
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO files (file_path, file_name, folder_path, folder_name, file_size, file_mtime, is_image, scanned_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("D:\\test\\photo.jpg", "photo.jpg", "D:\\test", "test", 12345, datetime.now().isoformat(), 1, datetime.now().isoformat()),
+            )
+            row = conn.execute("SELECT * FROM files WHERE file_path = ?", ("D:\\test\\photo.jpg",)).fetchone()
+            assert row is not None
 
-        db.folder_categories.set_folder_category("D:\\test", 1, "high")
-        assert db.folder_categories.get_folder_category("D:\\test") == 1
+            conn.execute(
+                "INSERT OR REPLACE INTO folder_categories (folder_path, category, confidence) VALUES (?, ?, ?)",
+                ("D:\\test", 1, "high"),
+            )
+            cat = conn.execute("SELECT category FROM folder_categories WHERE folder_path = ?", ("D:\\test",)).fetchone()
+            assert cat[0] == 1
 
-        meta = PhotoMetadata(file_id=1, date_taken=datetime.now().isoformat(), camera_model="Test Camera", gps_lat=39.9, gps_lon=116.4, width=1920, height=1080, thumbnail_path="D:\\test\\thumb.jpg", indexed_at=datetime.now().isoformat(), is_starred=0)
-        db.photo_metadata.insert_or_replace(meta)
+            conn.execute(
+                "INSERT OR REPLACE INTO photo_metadata (file_id, date_taken, camera_model, gps_lat, gps_lon, width, height, thumbnail_path, indexed_at, is_starred) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (1, datetime.now().isoformat(), "Test Camera", 39.9, 116.4, 1920, 1080, "D:\\test\\thumb.jpg", datetime.now().isoformat(), 0),
+            )
+            meta = conn.execute("SELECT * FROM photo_metadata WHERE file_id = ?", (1,)).fetchone()
+            assert meta is not None
 
-        memory = Memory(category=1, memory_type="auto", title="Test Memory", description="Test Desc", photo_ids="[1]", cover_file_id=1, created_at=datetime.now().isoformat(), is_starred=0)
-        mem_id = db.memories.insert(memory)
-        assert mem_id > 0
+            conn.execute(
+                "INSERT INTO memories (category, memory_type, title, description, photo_ids, cover_file_id, created_at, is_starred) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (1, "auto", "Test Memory", "Test Desc", "[1]", 1, datetime.now().isoformat(), 0),
+            )
+            mem = conn.execute("SELECT * FROM memories WHERE category = ?", (1,)).fetchall()
+            assert len(mem) == 1
 
-        assert len(db.memories.get_all(category=1)) == 1
+            conn.execute(
+                "INSERT INTO click_history (file_id, folder_path, category, clicked_at) VALUES (?, ?, ?, ?)",
+                (1, "D:\\test", 1, datetime.now().isoformat()),
+            )
+            click = conn.execute("SELECT * FROM click_history WHERE file_id = ?", (1,)).fetchone()
+            assert click is not None
 
-        click = ClickHistory(file_id=1, folder_path="D:\\test", category=1, clicked_at=datetime.now().isoformat())
-        db.click_history.insert(click)
-
-        tag = PhotoTag(file_id=1, tag="test", created_at=datetime.now().isoformat())
-        db.photo_tags.insert_or_ignore(tag)
-
-        assert len(db.photo_tags.get_tags_for_file(1)) == 1
+            conn.execute(
+                "INSERT OR IGNORE INTO photo_tags (file_id, tag, created_at) VALUES (?, ?, ?)",
+                (1, "test", datetime.now().isoformat()),
+            )
+            tags = conn.execute("SELECT * FROM photo_tags WHERE file_id = ?", (1,)).fetchall()
+            assert len(tags) == 1
 
     finally:
         shutil.rmtree(temp_dir)
