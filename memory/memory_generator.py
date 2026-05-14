@@ -10,8 +10,6 @@ from config import (
     DEEPSEEK_MODEL,
     CATEGORY_LIFE,
     CATEGORY_SAMPLE,
-    CATEGORY_PHOTOGRAPHY,
-    CATEGORY_ADULT,
     CATEGORY_NAMES,
     get_openai_client,
 )
@@ -22,6 +20,17 @@ _db = Database()
 
 def get_photos_by_category(category, limit=500):
     with _db.connect() as conn:
+        used_ids_rows = conn.execute(
+            "SELECT DISTINCT photo_ids FROM memories WHERE category = ?",
+            (category,),
+        ).fetchall()
+        used_ids = set()
+        for row in used_ids_rows:
+            try:
+                used_ids.update(json.loads(row[0]))
+            except Exception:
+                pass
+
         rows = conn.execute("""
             SELECT f.id, f.file_path, f.file_name, f.folder_name,
                    pm.date_taken, pm.camera_model, pm.thumbnail_path
@@ -30,6 +39,11 @@ def get_photos_by_category(category, limit=500):
             LEFT JOIN photo_metadata pm ON f.id = pm.file_id
             WHERE fc.category = ? AND f.is_image = 1
         """, (category,)).fetchall()
+
+    if used_ids:
+        rows = [r for r in rows if str(r[0]) not in used_ids]
+        logger.info(f"分类 {category}: 排除 {len(used_ids)} 个已用照片, 剩余 {len(rows)} 张")
+
     return rows
 
 
@@ -177,7 +191,7 @@ def generate_memories_for_category(category):
     return {"category": category_name, "generated": 1, "title": title}
 
 
-MEMORY_CATEGORIES = [CATEGORY_LIFE, CATEGORY_SAMPLE, CATEGORY_PHOTOGRAPHY, CATEGORY_ADULT]
+MEMORY_CATEGORIES = [CATEGORY_LIFE, CATEGORY_SAMPLE]
 
 
 def generate_all_memories(progress_callback=None):
