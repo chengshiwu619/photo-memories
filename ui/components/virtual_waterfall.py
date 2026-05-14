@@ -187,13 +187,12 @@ class VirtualCategoryPage(QScrollArea):
             self._empty_label.show()
 
     def append_photos(self, new_photos):
-        if not new_photos:
-            self._all_loaded = True
-            return
-        self._photos.extend(new_photos)
-        self._destroy_visible_cards()
-        self._recompute_layout()
-        self._render_visible()
+        if new_photos:
+            self._photos.extend(new_photos)
+            self._destroy_visible_cards()
+            self._recompute_layout()
+            self._render_visible()
+        self._loading_more = False
 
     def _destroy_visible_cards(self):
         for card in self._card_widgets.values():

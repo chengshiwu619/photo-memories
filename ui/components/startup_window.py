@@ -9,7 +9,7 @@ from PyQt6.QtGui import QFont
 from logger_setup import logger
 
 
-from services.pipeline import Pipeline, ScanStage, ClassifyStage, IndexStage, MemoryStage
+from services.pipeline import Pipeline, ScanStage, ClassifyStage, IndexStage
 
 
 class StartupWindow(QWidget):
@@ -117,7 +117,6 @@ class StartupWindow(QWidget):
         pipeline.add_stage(ScanStage())
         pipeline.add_stage(ClassifyStage())
         pipeline.add_stage(IndexStage())
-        pipeline.add_stage(MemoryStage())
         self.worker = pipeline
         pipeline.stage_changed.connect(self.stage_label.setText)
         pipeline.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)

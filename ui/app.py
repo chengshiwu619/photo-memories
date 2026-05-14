@@ -1,6 +1,5 @@
 import os
 import sys
-import shutil
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -11,15 +10,15 @@ from PyQt6.QtGui import QFont
 
 from logger_setup import logger
 from config import (
-    CATEGORY_LIFE, CATEGORY_SAMPLE, CATEGORY_PHOTOGRAPHY, CATEGORY_ADULT,
+    CATEGORY_LIFE, CATEGORY_SAMPLE,
     CATEGORY_NAMES, is_configured,
 )
 from db_manager import Database
 from ui.components.virtual_waterfall import VirtualCategoryPage as CategoryPage
 from ui.components.startup_window import StartupWindow
 from ui.components.image_viewer import ImageViewer
-from ui.recommendation import rank_category_photos, load_category_photos_batch, load_starred_photos
-from ui.recommendation import CATEGORY_COLORS, PAGE_SIZE
+from ui.recommendation import rank_category_photos, load_starred_photos
+from ui.recommendation import CATEGORY_COLORS, PAGE_SIZE, record_shown_photos
 
 
 from services.background_task_manager import BackgroundTaskManager
@@ -27,8 +26,6 @@ from services.background_task_manager import BackgroundTaskManager
 CATEGORIES = [
     (CATEGORY_LIFE, CATEGORY_NAMES[CATEGORY_LIFE]),
     (CATEGORY_SAMPLE, CATEGORY_NAMES[CATEGORY_SAMPLE]),
-    (CATEGORY_PHOTOGRAPHY, CATEGORY_NAMES[CATEGORY_PHOTOGRAPHY]),
-    (CATEGORY_ADULT, CATEGORY_NAMES[CATEGORY_ADULT]),
 ]
 
 
@@ -253,32 +250,42 @@ class MainWindow(QMainWindow):
         self._cat_all_loaded[cat_id] = False
 
         if self.starred_only:
-            photos = load_starred_photos(self.db, cat_id)
+            all_photos = load_starred_photos(self.db, cat_id)
         else:
-            photos = rank_category_photos(self.db, cat_id)
+            all_photos = rank_category_photos(self.db, cat_id)
 
-        self._cat_photos[cat_id] = list(photos)
-        self._cat_offsets[cat_id] = len(photos)
+        self._cat_photos[cat_id] = list(all_photos)
+
+        first_page = all_photos[:PAGE_SIZE]
+        self._cat_offsets[cat_id] = len(first_page)
+        self._cat_all_loaded[cat_id] = len(first_page) >= len(all_photos)
+
+        record_shown_photos(self.db, first_page, cat_id)
+
         if not self._first_load_done:
             self._first_load_done = True
-            QTimer.singleShot(30, lambda p=self.pages[index], ph=photos: p.load_photos(ph))
+            QTimer.singleShot(30, lambda p=self.pages[index], ph=first_page: p.load_photos(ph))
         else:
-            self.pages[index].load_photos(photos)
+            self.pages[index].load_photos(first_page)
 
     def _on_load_more(self, cat_id):
         if self._cat_all_loaded.get(cat_id, False):
             return
         page_index = next(i for i, (c, _) in enumerate(CATEGORIES) if c == cat_id)
         offset = self._cat_offsets.get(cat_id, 0)
-        new_photos = load_category_photos_batch(self.db, cat_id, offset)
-        if not new_photos or len(new_photos) < PAGE_SIZE:
+        all_photos = self._cat_photos.get(cat_id, [])
+
+        next_page = all_photos[offset:offset + PAGE_SIZE]
+        if not next_page:
             self._cat_all_loaded[cat_id] = True
-        self._cat_offsets[cat_id] = offset + len(new_photos)
-        if new_photos:
-            self._cat_photos[cat_id].extend(new_photos)
-            self.pages[page_index].append_photos(new_photos)
-        else:
-            self.pages[page_index].append_photos([])
+            return
+
+        self._cat_offsets[cat_id] = offset + len(next_page)
+        if self._cat_offsets[cat_id] >= len(all_photos):
+            self._cat_all_loaded[cat_id] = True
+
+        record_shown_photos(self.db, next_page, cat_id)
+        self.pages[page_index].append_photos(next_page)
 
     def _on_page_scroll(self, page, value):
         if value > 10:
@@ -371,7 +378,7 @@ class MainWindow(QMainWindow):
 
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(6)
-        for cat_id, cat_name in {1: "生活", 2: "样片", 3: "摄影", 4: "色情"}.items():
+        for cat_id, cat_name in {1: "生活", 2: "样片"}.items():
             btn = QPushButton(cat_name)
             btn.setFont(QFont("Microsoft YaHei", 11))
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -387,26 +394,9 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _apply_recategorize(self, dialog, folder_path, new_category):
-        from classifier.folder_classifier import set_folder_category, find_similar_photos_in_folder
-
-        target_file_id = getattr(self, "_recategorize_target_id", None)
-        self._recategorize_target_id = None
+        from classifier.folder_classifier import set_folder_category
 
         set_folder_category(folder_path, new_category, "manual")
-
-        if target_file_id and len(self._folder_viewer_photos) > 1:
-            similar_ids = find_similar_photos_in_folder(target_file_id, folder_path)
-            if similar_ids:
-                placeholders = ",".join("?" * len(similar_ids))
-                rows = self.db.execute(
-                    f"SELECT DISTINCT folder_path FROM files WHERE id IN ({placeholders})",
-                    similar_ids
-                ).fetchall()
-                for row in rows:
-                    sf = row[0]
-                    if sf != folder_path:
-                        set_folder_category(sf, new_category, "manual-similar")
-                logger.info(f"LLM 相似移动: {len(similar_ids)} 张照片 -> 分类 {new_category}")
 
         from classifier.folder_classifier import build_classification_history
         build_classification_history()
@@ -429,9 +419,9 @@ class MainWindow(QMainWindow):
             return
 
         if event.key() == Qt.Key.Key_Left:
-            self.switch_page((self.current_page - 1) % 4)
+            self.switch_page((self.current_page - 1) % 2)
         elif event.key() == Qt.Key.Key_Right:
-            self.switch_page((self.current_page + 1) % 4)
+            self.switch_page((self.current_page + 1) % 2)
         else:
             super().keyPressEvent(event)
 
@@ -461,27 +451,15 @@ class MainWindow(QMainWindow):
             delta = event.position().toPoint() - self.drag_start
             if abs(delta.x()) > 80:
                 if delta.x() > 0:
-                    self.switch_page((self.current_page - 1) % 4)
+                    self.switch_page((self.current_page - 1) % 2)
                 else:
-                    self.switch_page((self.current_page + 1) % 4)
+                    self.switch_page((self.current_page + 1) % 2)
         self.drag_start = None
         self._window_drag_pos = None
         super().mouseReleaseEvent(event)
 
 
-def _cleanup_pycache():
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    for root, dirs, _ in os.walk(project_root):
-        if "__pycache__" in dirs:
-            cache_path = os.path.join(root, "__pycache__")
-            try:
-                shutil.rmtree(cache_path)
-            except Exception:
-                pass
-
-
 def main():
-    _cleanup_pycache()
     logger.info("=" * 50)
     logger.info("NAS 照片回忆 启动")
     try:
@@ -492,6 +470,7 @@ def main():
         startup_ref = [None]
         _bg_scan_started = [False]
         _bg_index_started = [False]
+        _bg_refine_started = [False]
 
         def show_main_window():
             logger.info("show_main_window 开始, 优先构建主界面...")
@@ -512,6 +491,26 @@ def main():
             if st:
                 st.hide()
                 st.close()
+            start_background_keyword_refine()
+
+        def start_background_keyword_refine():
+            if _bg_refine_started[0]:
+                logger.info("后台关键词精分类已在运行，跳过重复启动")
+                return
+            _bg_refine_started[0] = True
+            from PyQt6.QtCore import QThread
+
+            class BgRefineWorker(QThread):
+                def run(self):
+                    from classifier.folder_classifier import refine_sample_keywords
+                    refined = refine_sample_keywords()
+                    logger.info(f"后台关键词精分类完成: {refined} 个文件夹重新分类")
+
+            bg = BgRefineWorker()
+            bg.finished.connect(lambda: logger.info("后台关键词精分类线程结束"))
+            bg.start()
+            BackgroundTaskManager.get_instance().register(bg)
+            logger.info("后台关键词精分类线程已启动")
 
         def start_background_scan():
             if _bg_scan_started[0]:

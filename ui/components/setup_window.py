@@ -2,7 +2,8 @@ import os
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QLineEdit, QFileDialog, QApplication
+    QLineEdit, QFileDialog, QApplication, QListWidget, QListWidgetItem,
+    QScrollArea,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont
@@ -17,7 +18,7 @@ _INPUT_STYLE = """
     QLineEdit {
         background: #2a2a3e; color: #e0e0e0;
         border: 1px solid #3a3a5e; border-radius: 4px;
-        padding: 8px 10px; font-size: 13px;
+        padding: 6px 10px; font-size: 13px; min-height: 22px;
     }
     QLineEdit:focus { border-color: #667eea; }
 """
@@ -28,6 +29,37 @@ _BROWSE_STYLE = """
         border-radius: 4px; font-size: 11px;
     }
     QPushButton:hover { background: #4a6a8a; }
+"""
+
+_SMALL_BTN_STYLE = """
+    QPushButton {
+        background: #34495e; color: #ccc; border: none;
+        border-radius: 4px; font-size: 11px; padding: 4px 10px;
+    }
+    QPushButton:hover { background: #4a6a8a; }
+"""
+
+_REMOVE_BTN_STYLE = """
+    QPushButton {
+        background: #c0392b; color: white; border: none;
+        border-radius: 4px; font-size: 11px; padding: 4px 10px;
+    }
+    QPushButton:hover { background: #e74c3c; }
+"""
+
+_SCROLL_STYLE = """
+    QScrollArea {
+        border: none; background: transparent;
+    }
+    QScrollBar:vertical {
+        background: #1a1a2e; width: 8px; border-radius: 4px;
+    }
+    QScrollBar::handle:vertical {
+        background: #3a3a5e; border-radius: 4px; min-height: 30px;
+    }
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+        height: 0;
+    }
 """
 
 
@@ -44,7 +76,7 @@ class SetupWindow(QWidget):
     def setup_ui(self):
         self.setWindowTitle("配置 - NAS 照片回忆" if self._edit_mode else "初次配置 - NAS 照片回忆")
         self.setMinimumSize(520, 400)
-        self.setMaximumSize(520, 560)
+        self.setMaximumSize(580, 800)
         self.setStyleSheet("background: #1a1a2e;")
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -61,12 +93,14 @@ class SetupWindow(QWidget):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
 
-        form = QVBoxLayout()
-        form.setSpacing(10)
-
-        form.addLayout(self._make_row("照片库文件夹", "src_edit", self._browse_src))
-        form.addLayout(self._make_row("缓存数据文件夹", "data_edit", self._browse_data))
-        form.addLayout(self._make_text_row("DeepSeek API Key", "api_edit", "sk-..."))
+        self._basic_widget = QWidget()
+        basic_layout = QVBoxLayout(self._basic_widget)
+        basic_layout.setContentsMargins(0, 0, 0, 0)
+        basic_layout.setSpacing(10)
+        basic_layout.addLayout(self._make_row("照片库文件夹", "src_edit", self._browse_src))
+        basic_layout.addLayout(self._make_row("缓存数据文件夹", "data_edit", self._browse_data))
+        basic_layout.addLayout(self._make_text_row("DeepSeek API Key", "api_edit", "sk-..."))
+        layout.addWidget(self._basic_widget)
 
         self._advanced_toggle = QPushButton("▶ 高级选项")
         self._advanced_toggle.setFont(QFont("Microsoft YaHei", 9))
@@ -77,18 +111,32 @@ class SetupWindow(QWidget):
         """)
         self._advanced_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
         self._advanced_toggle.clicked.connect(self._toggle_advanced)
-        form.addWidget(self._advanced_toggle)
+        layout.addWidget(self._advanced_toggle)
 
-        self._advanced_widget = QWidget()
-        adv_layout = QVBoxLayout(self._advanced_widget)
+        self._scroll_area = QScrollArea()
+        self._scroll_area.setStyleSheet(_SCROLL_STYLE)
+        self._scroll_area.setWidgetResizable(True)
+        self._scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        self._advanced_content = QWidget()
+        adv_layout = QVBoxLayout(self._advanced_content)
         adv_layout.setContentsMargins(0, 0, 0, 0)
         adv_layout.setSpacing(10)
         adv_layout.addLayout(self._make_text_row("Base URL", "base_url_edit", "https://api.deepseek.com"))
         adv_layout.addLayout(self._make_text_row("Model", "model_edit", "deepseek-chat"))
-        self._advanced_widget.hide()
-        form.addWidget(self._advanced_widget)
+        adv_layout.addLayout(self._make_keyword_section(
+            "样片关键词（匹配文件夹名/文件名自动归为样片）",
+            "sample",
+        ))
+        adv_layout.addLayout(self._make_keyword_section(
+            "生活关键词（匹配文件夹名/文件名自动归为生活照片）",
+            "life",
+        ))
+        adv_layout.addStretch()
 
-        layout.addLayout(form)
+        self._scroll_area.setWidget(self._advanced_content)
+        self._scroll_area.hide()
+        layout.addWidget(self._scroll_area, 1)
 
         self.error_label = QLabel("")
         self.error_label.setFont(QFont("Microsoft YaHei", 9))
@@ -96,8 +144,6 @@ class SetupWindow(QWidget):
         self.error_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.error_label.setWordWrap(True)
         layout.addWidget(self.error_label)
-
-        layout.addStretch()
 
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
@@ -140,6 +186,141 @@ class SetupWindow(QWidget):
         layout.addLayout(btn_layout)
 
         self._drag_pos = None
+
+    def _make_keyword_section(self, label_text, kw_type):
+        section = QVBoxLayout()
+        section.setSpacing(4)
+
+        label = QLabel(label_text)
+        label.setFont(QFont("Microsoft YaHei", 10))
+        label.setStyleSheet("color: #a0a0b0;")
+        section.addWidget(label)
+
+        kw_list = QListWidget()
+        kw_list.setStyleSheet("""
+            QListWidget {
+                background: #2a2a3e; color: #e0e0e0;
+                border: 1px solid #3a3a5e; border-radius: 4px;
+                font-size: 12px; padding: 4px;
+            }
+            QListWidget::item { padding: 3px 6px; }
+            QListWidget::item:selected { background: #3a3a5e; }
+        """)
+        kw_list.setMaximumHeight(120)
+        section.addWidget(kw_list)
+
+        input_row = QHBoxLayout()
+        input_row.setSpacing(6)
+
+        kw_input = QLineEdit()
+        kw_input.setPlaceholderText("输入新关键词")
+        kw_input.setFont(QFont("Microsoft YaHei", 10))
+        kw_input.setFixedHeight(30)
+        kw_input.setStyleSheet(_INPUT_STYLE)
+        input_row.addWidget(kw_input, 1)
+
+        add_btn = QPushButton("添加")
+        add_btn.setFixedSize(60, 30)
+        add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_btn.setStyleSheet(_SMALL_BTN_STYLE)
+        input_row.addWidget(add_btn)
+
+        remove_btn = QPushButton("删除")
+        remove_btn.setFixedSize(60, 30)
+        remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        remove_btn.setStyleSheet(_REMOVE_BTN_STYLE)
+        input_row.addWidget(remove_btn)
+
+        section.addLayout(input_row)
+
+        if kw_type == "sample":
+            self._sample_kw_list = kw_list
+            self._sample_kw_input = kw_input
+            add_btn.clicked.connect(self._add_sample_keyword)
+            remove_btn.clicked.connect(self._remove_sample_keyword)
+            self._load_sample_keywords()
+        else:
+            self._life_kw_list = kw_list
+            self._life_kw_input = kw_input
+            add_btn.clicked.connect(self._add_life_keyword)
+            remove_btn.clicked.connect(self._remove_life_keyword)
+            self._load_life_keywords()
+
+        return section
+
+    def _load_sample_keywords(self):
+        self._sample_kw_list.clear()
+        try:
+            from classifier.folder_classifier import get_sample_keywords
+            builtin, custom = get_sample_keywords()
+            for kw in builtin:
+                item = QListWidgetItem(f"[内置] {kw}")
+                item.setData(Qt.ItemDataRole.UserRole, ("builtin", kw))
+                item.setForeground(Qt.GlobalColor.gray)
+                self._sample_kw_list.addItem(item)
+            for kw in custom:
+                item = QListWidgetItem(kw)
+                item.setData(Qt.ItemDataRole.UserRole, ("custom", kw))
+                self._sample_kw_list.addItem(item)
+        except Exception as e:
+            logger.warning(f"加载样片关键词失败: {e}")
+
+    def _add_sample_keyword(self):
+        kw = self._sample_kw_input.text().strip()
+        if not kw:
+            return
+        from classifier.folder_classifier import add_sample_keyword
+        if add_sample_keyword(kw):
+            self._sample_kw_input.clear()
+            self._load_sample_keywords()
+
+    def _remove_sample_keyword(self):
+        current = self._sample_kw_list.currentItem()
+        if not current:
+            return
+        data = current.data(Qt.ItemDataRole.UserRole)
+        if not data or data[0] == "builtin":
+            return
+        from classifier.folder_classifier import remove_sample_keyword
+        if remove_sample_keyword(data[1]):
+            self._load_sample_keywords()
+
+    def _load_life_keywords(self):
+        self._life_kw_list.clear()
+        try:
+            from classifier.folder_classifier import get_life_keywords
+            builtin, custom = get_life_keywords()
+            for kw in builtin:
+                item = QListWidgetItem(f"[内置] {kw}")
+                item.setData(Qt.ItemDataRole.UserRole, ("builtin", kw))
+                item.setForeground(Qt.GlobalColor.gray)
+                self._life_kw_list.addItem(item)
+            for kw in custom:
+                item = QListWidgetItem(kw)
+                item.setData(Qt.ItemDataRole.UserRole, ("custom", kw))
+                self._life_kw_list.addItem(item)
+        except Exception as e:
+            logger.warning(f"加载生活关键词失败: {e}")
+
+    def _add_life_keyword(self):
+        kw = self._life_kw_input.text().strip()
+        if not kw:
+            return
+        from classifier.folder_classifier import add_life_keyword
+        if add_life_keyword(kw):
+            self._life_kw_input.clear()
+            self._load_life_keywords()
+
+    def _remove_life_keyword(self):
+        current = self._life_kw_list.currentItem()
+        if not current:
+            return
+        data = current.data(Qt.ItemDataRole.UserRole)
+        if not data or data[0] == "builtin":
+            return
+        from classifier.folder_classifier import remove_life_keyword
+        if remove_life_keyword(data[1]):
+            self._load_life_keywords()
 
     def _make_row(self, label_text, attr_name, browse_fn):
         row = QVBoxLayout()
@@ -185,13 +366,15 @@ class SetupWindow(QWidget):
         return row
 
     def _toggle_advanced(self):
-        visible = self._advanced_widget.isVisible()
+        visible = self._scroll_area.isVisible()
         if visible:
-            self._advanced_widget.hide()
+            self._scroll_area.hide()
+            self._basic_widget.show()
             self._advanced_toggle.setText("▶ 高级选项")
         else:
-            self._advanced_widget.show()
-            self._advanced_toggle.setText("▼ 高级选项")
+            self._basic_widget.hide()
+            self._scroll_area.show()
+            self._advanced_toggle.setText("◀ 返回基本配置")
 
     def _browse_src(self):
         path = QFileDialog.getExistingDirectory(self, "选择照片库文件夹", self.src_edit.text() or "D:\\")

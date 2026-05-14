@@ -98,9 +98,9 @@ class BranchClassifierDialog(QDialog):
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(8)
 
-        labels = {1: "生活", 2: "样片", 3: "摄影", 4: "色情"}
+        labels = {1: "生活", 2: "样片"}
         self.cat_btns = {}
-        for cat_id in (1, 2, 3, 4):
+        for cat_id in (1, 2):
             btn = QPushButton(labels[cat_id])
             btn.setFont(QFont("Microsoft YaHei", 11))
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
