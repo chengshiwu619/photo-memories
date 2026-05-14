@@ -8,6 +8,10 @@ venv/
 *.code-workspace
 PROJECT_FULL_DUMP.txt
 error.log
+*.log
+*.tmp
+*.bak
+*.old
 .pytest_cache/
 *.egg-info/
 dist/
@@ -15,3 +19,5 @@ build/
 *.exe.old
 _test_*.py
 classification_history.txt
+debug_*.py
+photos_before_*.db
