@@ -163,7 +163,6 @@ def index_photos(progress_callback=None, batch_limit=None):
 
     photos = get_unindexed_photos()
     total = len(photos)
-    display_total = min(total, batch_limit) if batch_limit else total
     logger.info(f"开始索引照片: 共 {total} 张待索引")
     cp = _cp.load()
     start_idx = cp["current_index"] if cp else 0
@@ -227,7 +226,7 @@ def index_photos(progress_callback=None, batch_limit=None):
             logger.error(f"索引照片失败 {file_path}: {e}")
 
         if progress_callback:
-            progress_callback(i + 1, display_total)
+            progress_callback(i + 1, total)
 
         if batch_limit and batch_count >= batch_limit:
             _cp.save(CheckpointState.PAUSED, current_index=i + 1, total=total, indexed=indexed)
