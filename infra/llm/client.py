@@ -7,8 +7,10 @@ class LLMClient:
     _instance = None
 
     def __init__(self):
-        from config import get_openai_client
-        self._client = get_openai_client()
+        from openai import OpenAI
+        from config import get_settings
+        s = get_settings()
+        self._client = OpenAI(api_key=s.deepseek_api_key, base_url=s.deepseek_base_url)
 
     @classmethod
     def get_instance(cls):

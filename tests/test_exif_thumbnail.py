@@ -10,7 +10,7 @@ def _create_test_jpeg(path, width=200, height=150):
 
 
 def test_extract_exif_no_exif():
-    from indexer.photo_indexer import extract_exif
+    from business.indexer.photo_indexer import extract_exif
     tmp = tempfile.mkdtemp()
     try:
         jpg = os.path.join(tmp, "test.jpg")
@@ -28,13 +28,13 @@ def test_extract_exif_no_exif():
 
 
 def test_extract_exif_file_not_found():
-    from indexer.photo_indexer import extract_exif
+    from business.indexer.photo_indexer import extract_exif
     result = extract_exif("/nonexistent/path.jpg")
     assert result["date_taken"] is None
 
 
 def test_generate_thumbnail_creates_file():
-    from indexer.photo_indexer import generate_thumbnail
+    from business.indexer.photo_indexer import generate_thumbnail
     tmp = tempfile.mkdtemp()
     try:
         src = os.path.join(tmp, "src.jpg")
@@ -56,7 +56,7 @@ def test_generate_thumbnail_creates_file():
 
 
 def test_generate_thumbnail_skips_existing():
-    from indexer.photo_indexer import generate_thumbnail
+    from business.indexer.photo_indexer import generate_thumbnail
     tmp = tempfile.mkdtemp()
     try:
         src = os.path.join(tmp, "src.jpg")
@@ -80,7 +80,7 @@ def test_generate_thumbnail_skips_existing():
 
 
 def test_generate_thumbnail_respects_max_size():
-    from indexer.photo_indexer import generate_thumbnail
+    from business.indexer.photo_indexer import generate_thumbnail
     tmp = tempfile.mkdtemp()
     try:
         src = os.path.join(tmp, "big.jpg")
@@ -103,7 +103,7 @@ def test_generate_thumbnail_respects_max_size():
 
 
 def test_auto_rotate():
-    from indexer.photo_indexer import _auto_rotate
+    from business.indexer.photo_indexer import _auto_rotate
     img = Image.new("RGB", (100, 50))
     result = _auto_rotate(img)
     assert result is not None

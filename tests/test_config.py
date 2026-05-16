@@ -7,11 +7,14 @@ def test_config_imports():
     import config
     assert hasattr(config, "DEEPSEEK_API_KEY")
     assert hasattr(config, "SOURCE_DRIVE")
+    assert hasattr(config, "SOURCE_DIRS")
     assert hasattr(config, "DATA_DIR")
     assert hasattr(config, "DB_PATH")
     assert hasattr(config, "THUMBNAIL_DIR")
     assert hasattr(config, "IMAGE_EXTENSIONS")
     assert hasattr(config, "VIDEO_EXTENSIONS")
+    assert hasattr(config, "PHASH_THRESHOLD")
+    assert hasattr(config, "MEMORY_HIGH_FREQ_DAYS")
 
 
 def test_category_constants():
@@ -70,26 +73,6 @@ def test_is_configured_with_all():
         config.reload_config()
 
 
-def test_get_openai_client_returns_same_instance():
-    import config, os
-    config._OPENAI_CLIENT = None
-    orig_key = os.environ.get("DEEPSEEK_API_KEY", "")
-    try:
-        os.environ["DEEPSEEK_API_KEY"] = "sk-test-dummy"
-        config._settings = None
-        config.reload_config()
-        c1 = config.get_openai_client()
-        c2 = config.get_openai_client()
-        assert c1 is c2
-    finally:
-        if orig_key:
-            os.environ["DEEPSEEK_API_KEY"] = orig_key
-        else:
-            os.environ.pop("DEEPSEEK_API_KEY", None)
-        config._OPENAI_CLIENT = None
-        config._settings = None
-
-
 def test_settings_class_exists():
     import config
     assert hasattr(config, "Settings")
@@ -109,6 +92,48 @@ def test_settings_computed_properties():
     assert s.db_path.endswith("photos.db")
     assert s.thumbnail_dir.endswith("thumbnails")
     assert s.classification_history_file.endswith("classification_history.txt")
+
+
+def test_source_dirs_single_path():
+    import config, os
+    orig = os.environ.get("SOURCE_DRIVE", "")
+    try:
+        os.environ["SOURCE_DRIVE"] = "D:\\照片"
+        config._settings = None
+        config._sync_module_vars_from_settings()
+        s = config.get_settings()
+        assert s.source_dirs == ["D:\\照片"]
+    finally:
+        if orig:
+            os.environ["SOURCE_DRIVE"] = orig
+        else:
+            os.environ.pop("SOURCE_DRIVE", None)
+        config._settings = None
+        config._sync_module_vars_from_settings()
+
+
+def test_source_dirs_multiple_paths():
+    import config, os
+    orig = os.environ.get("SOURCE_DRIVE", "")
+    try:
+        os.environ["SOURCE_DRIVE"] = "D:\\照片;E:\\旅行"
+        config._settings = None
+        config._sync_module_vars_from_settings()
+        s = config.get_settings()
+        assert s.source_dirs == ["D:\\照片", "E:\\旅行"]
+    finally:
+        if orig:
+            os.environ["SOURCE_DRIVE"] = orig
+        else:
+            os.environ.pop("SOURCE_DRIVE", None)
+        config._settings = None
+        config._sync_module_vars_from_settings()
+
+
+def test_phash_and_memory_constants():
+    import config
+    assert config.PHASH_THRESHOLD == 8
+    assert config.MEMORY_HIGH_FREQ_DAYS == 3
 
 
 def test_get_settings_returns_same_instance():

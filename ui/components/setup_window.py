@@ -97,7 +97,7 @@ class SetupWindow(QWidget):
         basic_layout = QVBoxLayout(self._basic_widget)
         basic_layout.setContentsMargins(0, 0, 0, 0)
         basic_layout.setSpacing(10)
-        basic_layout.addLayout(self._make_row("照片库文件夹", "src_edit", self._browse_src))
+        basic_layout.addLayout(self._make_row("照片库文件夹（多个用分号分隔）", "src_edit", self._browse_src))
         basic_layout.addLayout(self._make_row("缓存数据文件夹", "data_edit", self._browse_data))
         basic_layout.addLayout(self._make_text_row("DeepSeek API Key", "api_edit", "sk-..."))
         layout.addWidget(self._basic_widget)
@@ -251,7 +251,7 @@ class SetupWindow(QWidget):
     def _load_sample_keywords(self):
         self._sample_kw_list.clear()
         try:
-            from classifier.folder_classifier import get_sample_keywords
+            from business.classifier.folder_classifier import get_sample_keywords
             builtin, custom = get_sample_keywords()
             for kw in builtin:
                 item = QListWidgetItem(f"[内置] {kw}")
@@ -269,7 +269,7 @@ class SetupWindow(QWidget):
         kw = self._sample_kw_input.text().strip()
         if not kw:
             return
-        from classifier.folder_classifier import add_sample_keyword
+        from business.classifier.folder_classifier import add_sample_keyword
         if add_sample_keyword(kw):
             self._sample_kw_input.clear()
             self._load_sample_keywords()
@@ -281,14 +281,14 @@ class SetupWindow(QWidget):
         data = current.data(Qt.ItemDataRole.UserRole)
         if not data or data[0] == "builtin":
             return
-        from classifier.folder_classifier import remove_sample_keyword
+        from business.classifier.folder_classifier import remove_sample_keyword
         if remove_sample_keyword(data[1]):
             self._load_sample_keywords()
 
     def _load_life_keywords(self):
         self._life_kw_list.clear()
         try:
-            from classifier.folder_classifier import get_life_keywords
+            from business.classifier.folder_classifier import get_life_keywords
             builtin, custom = get_life_keywords()
             for kw in builtin:
                 item = QListWidgetItem(f"[内置] {kw}")
@@ -306,7 +306,7 @@ class SetupWindow(QWidget):
         kw = self._life_kw_input.text().strip()
         if not kw:
             return
-        from classifier.folder_classifier import add_life_keyword
+        from business.classifier.folder_classifier import add_life_keyword
         if add_life_keyword(kw):
             self._life_kw_input.clear()
             self._load_life_keywords()
@@ -318,7 +318,7 @@ class SetupWindow(QWidget):
         data = current.data(Qt.ItemDataRole.UserRole)
         if not data or data[0] == "builtin":
             return
-        from classifier.folder_classifier import remove_life_keyword
+        from business.classifier.folder_classifier import remove_life_keyword
         if remove_life_keyword(data[1]):
             self._load_life_keywords()
 
@@ -413,6 +413,11 @@ class SetupWindow(QWidget):
         errors = []
         if not src:
             errors.append("请指定照片库文件夹")
+        else:
+            for p in src.split(";"):
+                p = p.strip()
+                if p and not os.path.exists(p):
+                    errors.append(f"照片库路径不存在: {p}")
         if not data:
             errors.append("请指定缓存数据文件夹")
         if not api_key:
@@ -421,13 +426,6 @@ class SetupWindow(QWidget):
         if errors:
             self.error_label.setText("\n".join(errors))
             return
-
-        if not os.path.exists(src):
-            try:
-                os.makedirs(src, exist_ok=True)
-            except Exception as e:
-                self.error_label.setText(f"无法创建照片库文件夹: {e}")
-                return
 
         logger.info(f"保存配置: src={src}, data={data}, api_key={api_key[:8]}...")
 

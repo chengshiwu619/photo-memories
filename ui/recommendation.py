@@ -181,6 +181,7 @@ def load_category_photos_batch(db, cat_id, offset, limit=PAGE_SIZE):
         JOIN folder_categories fc ON f.folder_path = fc.folder_path
         LEFT JOIN photo_metadata pm ON f.id = pm.file_id
         WHERE fc.category = ? AND f.is_image = 1 AND pm.thumbnail_path IS NOT NULL
+              AND pm.is_duplicate_of IS NULL
         ORDER BY pm.date_taken DESC
         LIMIT ? OFFSET ?
     """, (cat_id, limit, offset)).fetchall()
@@ -194,6 +195,7 @@ def load_category_photos_batch(db, cat_id, offset, limit=PAGE_SIZE):
                 FROM files f
                 LEFT JOIN photo_metadata pm ON f.id = pm.file_id
                 WHERE f.is_image = 1 AND pm.thumbnail_path IS NOT NULL
+                      AND pm.is_duplicate_of IS NULL
                 ORDER BY pm.date_taken DESC
                 LIMIT ?
             """, (limit,)).fetchall()

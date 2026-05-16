@@ -14,6 +14,7 @@ class File:
     file_hash: Optional[str] = None
     is_image: int = 1
     scanned_at: Optional[str] = None
+    source_dir: Optional[str] = None
 
     def as_row(self) -> tuple:
         return (
@@ -25,7 +26,8 @@ class File:
             self.file_mtime,
             self.file_hash,
             self.is_image,
-            self.scanned_at
+            self.scanned_at,
+            self.source_dir
         )
 
 
@@ -53,6 +55,8 @@ class PhotoMetadata:
     exif_json: Optional[str] = None
     indexed_at: Optional[str] = None
     is_starred: int = 0
+    phash: Optional[str] = None
+    is_duplicate_of: Optional[int] = None
 
     def as_row(self) -> tuple:
         return (
@@ -66,7 +70,9 @@ class PhotoMetadata:
             self.thumbnail_path,
             self.exif_json,
             self.indexed_at,
-            self.is_starred
+            self.is_starred,
+            self.phash,
+            self.is_duplicate_of
         )
 
 
@@ -81,6 +87,10 @@ class Memory:
     cover_file_id: Optional[int] = None
     created_at: Optional[str] = None
     is_starred: int = 0
+    last_shown_at: Optional[str] = None
+    click_count: int = 0
+    dismissed_at: Optional[str] = None
+    payload: Optional[str] = None
 
     def as_row(self) -> tuple:
         return (
@@ -91,7 +101,11 @@ class Memory:
             self.photo_ids,
             self.cover_file_id,
             self.created_at,
-            self.is_starred
+            self.is_starred,
+            self.last_shown_at,
+            self.click_count,
+            self.dismissed_at,
+            self.payload
         )
 
     def get_photo_id_list(self) -> List[int]:
@@ -119,7 +133,60 @@ class PhotoTag:
     id: Optional[int] = None
     file_id: int = 0
     tag: str = ""
+    source: str = "manual"
     created_at: Optional[str] = None
 
     def as_row(self) -> tuple:
-        return (self.file_id, self.tag, self.created_at)
+        return (self.file_id, self.tag, self.source, self.created_at)
+
+
+@dataclass
+class FaceEmbedding:
+    id: Optional[int] = None
+    file_id: int = 0
+    embedding: bytes = b""
+    cluster_id: Optional[int] = None
+
+
+@dataclass
+class FaceCluster:
+    cluster_id: Optional[int] = None
+    person_name: str = ""
+    user_corrected: int = 0
+    representative_face: Optional[int] = None
+    created_at: Optional[str] = None
+
+
+@dataclass
+class Event:
+    event_id: Optional[int] = None
+    start_date: str = ""
+    end_date: str = ""
+    gps_cluster: Optional[str] = None
+    location_name: Optional[str] = None
+    photo_ids: str = ""
+    event_type: str = "event"
+
+    def get_photo_id_list(self) -> List[int]:
+        import json
+        try:
+            return [int(x) for x in json.loads(self.photo_ids)]
+        except Exception:
+            return []
+
+
+@dataclass
+class MemoryReasoning:
+    id: Optional[int] = None
+    memory_id: int = 0
+    reasoning: Optional[str] = None
+    feedback_type: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+@dataclass
+class TaskCheckpoint:
+    task_type: str = ""
+    task_key: str = ""
+    status_json: Optional[str] = None
+    updated_at: Optional[str] = None

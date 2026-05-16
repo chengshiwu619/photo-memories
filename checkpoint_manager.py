@@ -1,4 +1,3 @@
-import os
 import json
 from enum import Enum
 
@@ -12,14 +11,20 @@ class CheckpointState(str, Enum):
 
 
 class CheckpointManager:
-    def __init__(self, checkpoint_file):
-        self.file = checkpoint_file
+    def __init__(self, db, task_type, task_key="default"):
+        self.db = db
+        self.task_type = task_type
+        self.task_key = task_key
 
     def load(self):
         try:
-            if os.path.exists(self.file):
-                with open(self.file, "r", encoding="utf-8") as f:
-                    return json.load(f)
+            with self.db.connect() as conn:
+                row = conn.execute(
+                    "SELECT status_json FROM task_checkpoints WHERE task_type = ? AND task_key = ?",
+                    (self.task_type, self.task_key)
+                ).fetchone()
+            if row and row[0]:
+                return json.loads(row[0])
         except Exception as e:
             logger.warning(f"加载断点失败: {e}")
         return None
@@ -28,17 +33,23 @@ class CheckpointManager:
         try:
             data = {"state": state}
             data.update(kwargs)
-            tmp = self.file + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-            os.replace(tmp, self.file)
+            status_json = json.dumps(data, ensure_ascii=False)
+            with self.db.connect() as conn:
+                conn.execute(
+                    """INSERT OR REPLACE INTO task_checkpoints (task_type, task_key, status_json, updated_at)
+                       VALUES (?, ?, ?, datetime('now'))""",
+                    (self.task_type, self.task_key, status_json)
+                )
         except Exception as e:
             logger.warning(f"保存断点失败: {e}")
 
     def clear(self):
         try:
-            if os.path.exists(self.file):
-                os.remove(self.file)
+            with self.db.connect() as conn:
+                conn.execute(
+                    "DELETE FROM task_checkpoints WHERE task_type = ? AND task_key = ?",
+                    (self.task_type, self.task_key)
+                )
         except Exception as e:
             logger.warning(f"清除断点失败: {e}")
 

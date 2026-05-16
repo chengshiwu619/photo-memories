@@ -9,8 +9,8 @@ class ClickHistoryRepository:
     def insert(self, click: ClickHistory):
         with self.db.connect() as conn:
             conn.execute(
-                "INSERT INTO click_history (file_id, folder_path, category, clicked_at) VALUES (?, ?, ?, ?)",
-                click.as_row()
+                "INSERT INTO click_history (file_id, folder_path, category) VALUES (?, ?, ?)",
+                (click.file_id, click.folder_path, click.category)
             )
 
     def get_folder_click_counts(self, category: int) -> Dict[str, int]:

@@ -14,8 +14,8 @@ class FilesRepository:
         with self.db.connect() as conn:
             result = conn.execute(
                 """INSERT OR IGNORE INTO files
-                (file_path, file_name, folder_path, folder_name, file_size, file_mtime, file_hash, is_image, scanned_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (file_path, file_name, folder_path, folder_name, file_size, file_mtime, file_hash, is_image, scanned_at, source_dir)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 file.as_row()
             )
             return result.rowcount
@@ -37,3 +37,9 @@ class FilesRepository:
     def get_all_file_ids(self) -> List[int]:
         with self.db.connect() as conn:
             return [r[0] for r in conn.execute("SELECT id FROM files WHERE is_image = 1")]
+
+    def get_paths_by_source_dir(self, source_dir: str) -> Set[str]:
+        with self.db.connect() as conn:
+            return {r[0] for r in conn.execute(
+                "SELECT file_path FROM files WHERE source_dir = ?", (source_dir,)
+            )}

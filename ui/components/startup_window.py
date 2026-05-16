@@ -9,7 +9,7 @@ from PyQt6.QtGui import QFont
 from logger_setup import logger
 
 
-from services.pipeline import Pipeline, ScanStage, ClassifyStage, IndexStage
+from services.background_task_manager import Pipeline, ScanStage, ClassifyStage, IndexStage
 
 
 class StartupWindow(QWidget):

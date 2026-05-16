@@ -11,7 +11,6 @@ from config import (
     CATEGORY_LIFE,
     CATEGORY_SAMPLE,
     CATEGORY_NAMES,
-    get_openai_client,
 )
 from db_manager import Database
 

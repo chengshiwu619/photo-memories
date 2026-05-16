@@ -6,3 +6,7 @@ pydantic-settings>=2.0.0
 tenacity>=8.0.0
 PyQt6>=6.5.0
 exifread>=3.0.0
+imagehash>=4.3.0
+open-clip-torch>=2.24.0
+deepface>=0.0.90
+onnxruntime>=1.16.0

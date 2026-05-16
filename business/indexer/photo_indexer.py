@@ -4,6 +4,7 @@ import sqlite3
 from datetime import datetime
 from PIL import Image, ImageOps
 import exifread
+import imagehash
 
 from pillow_heif import register_heif_opener
 register_heif_opener()
@@ -11,14 +12,12 @@ register_heif_opener()
 Image.MAX_IMAGE_PIXELS = 500_000_000
 
 from logger_setup import logger
-from config import THUMBNAIL_DIR, THUMBNAIL_SIZE, DATA_DIR
+from config import THUMBNAIL_DIR, THUMBNAIL_SIZE, DATA_DIR, PHASH_THRESHOLD
 from db_manager import Database
 from checkpoint_manager import CheckpointManager, CheckpointState
 
-CHECKPOINT_FILE = os.path.join(DATA_DIR, "index_checkpoint.json")
-
-_cp = CheckpointManager(CHECKPOINT_FILE)
 _db = Database()
+_cp = CheckpointManager(_db, "index")
 
 IndexState = CheckpointState
 
@@ -158,6 +157,54 @@ def generate_thumbnail(filepath, thumbnail_name):
 INDEX_COMMIT_EVERY = 20
 
 
+def compute_phash(filepath):
+    try:
+        with Image.open(filepath) as img:
+            img = _auto_rotate(img)
+            img.thumbnail((256, 256), Image.LANCZOS)
+            if img.mode in ("RGBA", "P"):
+                img = img.convert("RGB")
+            return str(imagehash.phash(img))
+    except Exception as e:
+        logger.warning(f"pHash计算失败 {filepath}: {e}")
+        return None
+
+
+def dedup_by_phash(progress_callback=None):
+    with _db.connect() as conn:
+        rows = conn.execute(
+            "SELECT file_id, phash FROM photo_metadata WHERE phash IS NOT NULL ORDER BY file_id"
+        ).fetchall()
+
+    if not rows:
+        return {"checked": 0, "duplicates": 0}
+
+    phash_map = {}
+    duplicate_count = 0
+
+    for i, (file_id, phash_str) in enumerate(rows):
+        h = imagehash.hex_to_hash(phash_str)
+        found_dup = False
+        for existing_id, existing_hash in phash_map.items():
+            if h - existing_hash <= PHASH_THRESHOLD:
+                with _db.connect() as conn:
+                    conn.execute(
+                        "UPDATE photo_metadata SET is_duplicate_of = ? WHERE file_id = ?",
+                        (existing_id, file_id)
+                    )
+                duplicate_count += 1
+                found_dup = True
+                break
+        if not found_dup:
+            phash_map[file_id] = h
+
+        if progress_callback and (i + 1) % 100 == 0:
+            progress_callback(i + 1, len(rows))
+
+    logger.info(f"去重完成: 检查 {len(rows)} 张, 发现 {duplicate_count} 张重复")
+    return {"checked": len(rows), "duplicates": duplicate_count}
+
+
 def index_photos(progress_callback=None, batch_limit=None):
     _db.init_tables()
 
@@ -199,11 +246,13 @@ def index_photos(progress_callback=None, batch_limit=None):
                 else None
             )
 
+            phash = compute_phash(file_path)
+
             conn.execute(
                 """INSERT OR REPLACE INTO photo_metadata
                    (file_id, date_taken, camera_model, gps_lat, gps_lon,
-                    width, height, thumbnail_path, exif_json, indexed_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    width, height, thumbnail_path, exif_json, indexed_at, phash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     file_id,
                     exif_data["date_taken"],
@@ -215,6 +264,7 @@ def index_photos(progress_callback=None, batch_limit=None):
                     thumb_path,
                     exif_json,
                     datetime.now().isoformat(),
+                    phash,
                 ),
             )
             indexed += 1
@@ -249,6 +299,9 @@ def index_photos(progress_callback=None, batch_limit=None):
     conn.close()
     _cp.clear()
     logger.info(f"索引完成: 总计 {total}, 已索引 {indexed}")
+
+    dedup_by_phash()
+
     return {"total": total, "indexed": indexed}
 
 

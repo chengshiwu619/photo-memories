@@ -14,9 +14,16 @@ from config import (
     CATEGORY_NAMES, is_configured,
 )
 from db_manager import Database
+from infra.db.repositories.memories_repo import MemoriesRepository
+from infra.db.repositories.photo_metadata_repo import PhotoMetadataRepository
+from infra.db.repositories.click_history_repo import ClickHistoryRepository
+from core.models import ClickHistory
 from ui.components.virtual_waterfall import VirtualCategoryPage as CategoryPage
 from ui.components.startup_window import StartupWindow
 from ui.components.image_viewer import ImageViewer
+from ui.components.sidebar import Sidebar
+from ui.components.timeline_view import TimelineView
+from ui.components.special_memories import SpecialMemoriesView
 from ui.recommendation import rank_category_photos, load_starred_photos
 from ui.recommendation import CATEGORY_COLORS, PAGE_SIZE, record_shown_photos
 
@@ -148,6 +155,20 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(top_bar)
         self.top_bar = top_bar
 
+        body_layout = QHBoxLayout()
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(0)
+
+        self.sidebar = Sidebar()
+        self.sidebar.navigation_changed.connect(self._on_nav_changed)
+        body_layout.addWidget(self.sidebar)
+
+        self._random_container = QWidget()
+        self._random_container.setStyleSheet("background: #1a1a2e;")
+        random_layout = QVBoxLayout(self._random_container)
+        random_layout.setContentsMargins(0, 0, 0, 0)
+        random_layout.setSpacing(0)
+
         nav_bar = QWidget()
         nav_bar.setObjectName("navBar")
         nav_bar.setStyleSheet("""
@@ -174,7 +195,7 @@ class MainWindow(QMainWindow):
             nav_layout.addWidget(btn)
             self.nav_buttons.append(btn)
 
-        main_layout.addWidget(nav_bar)
+        random_layout.addWidget(nav_bar)
         self.nav_bar = nav_bar
 
         self.stack = QStackedWidget()
@@ -192,11 +213,68 @@ class MainWindow(QMainWindow):
             self.stack.addWidget(page)
             self.pages.append(page)
 
-        main_layout.addWidget(self.stack)
-
+        random_layout.addWidget(self.stack)
         self.nav_buttons[0].setChecked(True)
 
+        self._timeline_view = TimelineView()
+        self._timeline_view.photo_clicked.connect(self.on_photo_clicked)
+
+        self._special_view = SpecialMemoriesView()
+        self._special_view.memory_clicked.connect(self._on_memory_clicked)
+        self._special_view.memory_dismissed.connect(self._on_memory_dismissed)
+
+        self._nav_stack = QStackedWidget()
+        self._nav_stack.addWidget(self._random_container)
+        self._nav_stack.addWidget(self._timeline_view)
+        self._nav_stack.addWidget(self._special_view)
+
+        body_layout.addWidget(self._nav_stack)
+        main_layout.addLayout(body_layout)
+
         self.drag_start = None
+
+    def _on_nav_changed(self, nav_id: str):
+        nav_map = {"random": 0, "timeline": 1, "special": 2}
+        idx = nav_map.get(nav_id, 0)
+        self._nav_stack.setCurrentIndex(idx)
+
+        if nav_id == "timeline":
+            self._load_timeline()
+        elif nav_id == "special":
+            self._load_special_memories()
+
+    def _load_timeline(self):
+        rows = self.db.execute("""
+            SELECT pm.file_id as id, pm.thumbnail_path, pm.date_taken,
+                   pm.width, pm.height, f.file_path, f.file_name,
+                   f.folder_path, f.folder_name as folder_display, f.file_mtime
+            FROM photo_metadata pm
+            LEFT JOIN files f ON pm.file_id = f.id
+            WHERE pm.thumbnail_path IS NOT NULL
+                  AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
+            ORDER BY pm.date_taken DESC, f.file_mtime DESC
+        """).fetchall()
+        from ui.recommendation import _make_photo_dict
+        all_photos = [_make_photo_dict(r) for r in rows]
+        self._timeline_view.load_photos(all_photos)
+
+    def _load_special_memories(self):
+        from business.memory.memory_discovery import get_on_this_day_memories
+        from infra.db.repositories.memories_repo import MemoriesRepository
+
+        repo = MemoriesRepository(Database())
+        all_memories = repo.get_undismissed()
+        on_this_day = get_on_this_day_memories()
+        combined = on_this_day + [m for m in all_memories if m.memory_type != "on_this_day"]
+        self._special_view.load_memories(combined)
+
+    def _on_memory_clicked(self, memory_id: int):
+        from infra.db.repositories.memories_repo import MemoriesRepository
+        repo = MemoriesRepository(Database())
+        repo.update_shown(memory_id)
+
+    def _on_memory_dismissed(self, memory_id: int):
+        logger.info(f"回忆 {memory_id} 已标记不再显示")
 
     def switch_page(self, index):
         if self.image_viewer.isVisible():
@@ -230,11 +308,9 @@ class MainWindow(QMainWindow):
         self._cat_all_loaded = {}
 
         for cat_id, _ in CATEGORIES:
-            mem = self.db.execute(
-                "SELECT title FROM memories WHERE category = ? ORDER BY created_at DESC LIMIT 1",
-                (cat_id,),
-            ).fetchone()
-            summary = f"「{mem['title']}」" if mem else ""
+            memories_repo = MemoriesRepository(Database())
+            title = memories_repo.get_latest_title(cat_id)
+            summary = f"「{title}」" if title else ""
             self.pages[next(i for i, (c, _) in enumerate(CATEGORIES) if c == cat_id)].set_memory_summary(summary)
 
         for i in range(self.stack.count()):
@@ -302,9 +378,37 @@ class MainWindow(QMainWindow):
             self._last_scroll_val = value
 
     def on_photo_clicked(self, photo_data):
+        if isinstance(photo_data, int):
+            file_id = photo_data
+            row = self.db.execute(
+                """SELECT f.id, f.file_path, f.file_name, f.folder_path,
+                          f.folder_name as folder_display, f.file_mtime, pm.thumbnail_path,
+                          pm.width, pm.height, pm.date_taken
+                   FROM files f
+                   LEFT JOIN photo_metadata pm ON f.id = pm.file_id
+                   WHERE f.id = ?""",
+                (file_id,),
+            ).fetchone()
+            if not row:
+                logger.warning(f"时间线点击: file_id={file_id} 未找到")
+                return
+            photo_data = {
+                "id": row["id"], "file_path": row["file_path"], "file_name": row["file_name"],
+                "folder_path": row["folder_path"],
+                "folder_name": row["folder_display"] if "folder_display" in row.keys() else os.path.basename(row["folder_path"]),
+                "thumbnail_path": row["thumbnail_path"],
+                "width": row["width"] if "width" in row.keys() else None,
+                "height": row["height"] if "height" in row.keys() else None,
+                "date_taken": row["date_taken"] if "date_taken" in row.keys() else None,
+                "file_mtime": row["file_mtime"] if "file_mtime" in row.keys() else None,
+            }
+            cat_id = CATEGORIES[self.current_page][0]
+            all_photos = self._cat_photos.get(cat_id, [])
+        else:
+            cat_id = CATEGORIES[self.current_page][0]
+            all_photos = self._cat_photos.get(cat_id, [])
+
         clicked_id = photo_data.get("id")
-        cat_id = CATEGORIES[self.current_page][0]
-        all_photos = self._cat_photos.get(cat_id, [])
         self._record_click(clicked_id, photo_data.get("folder_path", ""))
 
         clicked_folder = os.path.dirname(photo_data.get("file_path", ""))
@@ -318,30 +422,23 @@ class MainWindow(QMainWindow):
 
         idx = next((i for i, p in enumerate(folder_photos) if p.get("id") == clicked_id), 0)
 
-        starred = set()
-        for row in self.db.execute("SELECT file_id FROM photo_metadata WHERE is_starred = 1").fetchall():
-            starred.add(row["file_id"])
+        pm_repo = PhotoMetadataRepository(Database())
+        starred = set(pm_repo.get_starred_file_ids())
 
         self._folder_viewer_photos = folder_photos
         self.image_viewer.setParent(self.centralWidget())
-        self.image_viewer.setGeometry(self.stack.geometry())
+        self.image_viewer.setGeometry(self._nav_stack.geometry())
         self.image_viewer.show_photos(folder_photos, idx, starred)
         self.image_viewer.raise_()
 
     def _record_click(self, file_id, folder_path):
         cat_id = CATEGORIES[self.current_page][0]
-        self.db.execute(
-            "INSERT INTO click_history (file_id, folder_path, category) VALUES (?, ?, ?)",
-            (file_id, folder_path, cat_id),
-        )
-        self.db.commit()
+        click_repo = ClickHistoryRepository(Database())
+        click_repo.insert(ClickHistory(file_id=file_id, folder_path=folder_path, category=cat_id))
 
     def _on_star_toggled(self, file_id, starred):
-        self.db.execute(
-            "UPDATE photo_metadata SET is_starred = ? WHERE file_id = ?",
-            (1 if starred else 0, file_id),
-        )
-        self.db.commit()
+        pm_repo = PhotoMetadataRepository(Database())
+        pm_repo.set_starred(file_id, starred)
 
     def _on_viewer_closed(self):
         pass
@@ -394,11 +491,11 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _apply_recategorize(self, dialog, folder_path, new_category):
-        from classifier.folder_classifier import set_folder_category
+        from business.classifier.folder_classifier import set_folder_category
 
         set_folder_category(folder_path, new_category, "manual")
 
-        from classifier.folder_classifier import build_classification_history
+        from business.classifier.folder_classifier import build_classification_history
         build_classification_history()
         dialog.accept()
         self.load_memories()
@@ -438,7 +535,7 @@ class MainWindow(QMainWindow):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.MouseButton.LeftButton and self._window_drag_pos is not None:
+        if event.buttons() & Qt.MouseButton.LeftButton and self._window_drag_pos is not None:
             delta = event.globalPosition().toPoint() - self._window_drag_pos
             if abs(delta.x()) > 6 or abs(delta.y()) > 6:
                 self._is_dragging = True
@@ -480,6 +577,7 @@ def main():
                 logger.info("MainWindow 构建完成, 调用 show()")
                 main_window[0].show()
                 logger.info("主界面已显示")
+                QTimer.singleShot(1000, start_memory_discovery)
             except Exception as e:
                 logger.exception("MainWindow 构建失败!")
                 import traceback
@@ -493,6 +591,25 @@ def main():
                 st.close()
             start_background_keyword_refine()
 
+        def start_memory_discovery():
+            from PyQt6.QtCore import QThread
+            class BgMemoryWorker(QThread):
+                def run(self):
+                    from business.memory.memory_discovery import discover_on_this_day, discover_recent_memories
+                    try:
+                        logger.info("开始发现回忆...")
+                        on_this_day = discover_on_this_day()
+                        recent = discover_recent_memories()
+                        logger.info(f"发现回忆完成: {len(on_this_day)} 个那年今日, {len(recent)} 个近期回忆")
+                    except Exception as e:
+                        logger.exception("发现回忆失败!")
+
+            bg = BgMemoryWorker()
+            bg.finished.connect(lambda: logger.info("回忆发现线程结束"))
+            bg.start()
+            BackgroundTaskManager.get_instance().register(bg)
+            logger.info("回忆发现线程已启动")
+
         def start_background_keyword_refine():
             if _bg_refine_started[0]:
                 logger.info("后台关键词精分类已在运行，跳过重复启动")
@@ -502,7 +619,7 @@ def main():
 
             class BgRefineWorker(QThread):
                 def run(self):
-                    from classifier.folder_classifier import refine_sample_keywords
+                    from business.classifier.folder_classifier import refine_sample_keywords
                     refined = refine_sample_keywords()
                     logger.info(f"后台关键词精分类完成: {refined} 个文件夹重新分类")
 
@@ -521,10 +638,10 @@ def main():
 
             class BgScanWorker(QThread):
                 def run(self):
-                    from scanner.fast_scan import full_scan, get_checkpoint_status, clear_checkpoint, ScanState
+                    from business.scanner.fast_scan import full_scan, get_checkpoint_status, clear_checkpoint, ScanState
                     while True:
                         cp = get_checkpoint_status()
-                        if cp.get("has_checkpoint") and cp.get("state") in (ScanState.PAUSED, ScanState.STOPPED):
+                        if cp.get("has_checkpoint") and cp.get("state") in (ScanState.PAUSED, ScanState.STOPPED, ScanState.RUNNING):
                             logger.info(f"后台扫描: 检查点状态={cp['state']}，清除后继续")
                             clear_checkpoint()
                         else:
@@ -553,7 +670,7 @@ def main():
                 progress = pyqtSignal(int, int)
 
                 def run(self):
-                    from indexer.photo_indexer import index_photos, get_checkpoint_status, clear_checkpoint, IndexState
+                    from business.indexer.photo_indexer import index_photos, get_checkpoint_status, clear_checkpoint, IndexState
                     while True:
                         cp = get_checkpoint_status()
                         if cp.get("has_checkpoint") and cp.get("state") in (IndexState.PAUSED, IndexState.STOPPED):

@@ -3,7 +3,7 @@ import subprocess
 from datetime import datetime
 
 from logger_setup import logger
-from config import SOURCE_DRIVE, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, DATA_DIR
+from config import SOURCE_DRIVE, SOURCE_DIRS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, DATA_DIR
 from db_manager import Database
 from checkpoint_manager import CheckpointManager, CheckpointState
 
@@ -13,10 +13,8 @@ FALLBACK_ES = os.path.join(os.environ.get("TEMP", os.path.expanduser("~")), "es_
 
 _ES_INSTANCE = None
 
-CHECKPOINT_FILE = os.path.join(DATA_DIR, "scan_checkpoint.json")
-
-_cp = CheckpointManager(CHECKPOINT_FILE)
 _db = Database()
+_cp = CheckpointManager(_db, "scan")
 
 ScanState = CheckpointState
 
@@ -115,6 +113,14 @@ def _run_es(args, timeout=120):
         return "", -1
 
 
+def _match_source_dir(filepath):
+    for sd in SOURCE_DIRS:
+        prefix = sd.rstrip("\\") + "\\"
+        if filepath.startswith(prefix) or filepath.startswith(sd.rstrip("\\") + "/"):
+            return sd
+    return None
+
+
 def _list_all_image_files():
     list_file = os.path.join(DATA_DIR, "filelist.txt")
     if os.path.exists(list_file):
@@ -159,12 +165,11 @@ def _list_all_image_files():
 
 
 def _parse_es_csv(text):
-    src_prefix = SOURCE_DRIVE.rstrip("\\") + "\\"
     files = []
     for line in text.strip().split("\n"):
         line = line.strip()
         filepath = line.strip("\"")
-        if not filepath.startswith(src_prefix):
+        if _match_source_dir(filepath) is None:
             continue
         ext = os.path.splitext(filepath)[1].lower()
         if ext in ALL_EXTENSIONS:
@@ -190,22 +195,26 @@ def _walk_files():
     file_list = []
     with open(tmp_file, "w", encoding="utf-8") as fout:
         fout.write(f"# SOURCE_DRIVE={os.path.normpath(SOURCE_DRIVE)}\n")
-        for root, dirs, files in os.walk(SOURCE_DRIVE):
-            for fname in files:
-                if os.path.splitext(fname)[1].lower() in ALL_EXTENSIONS:
-                    fp = os.path.normpath(os.path.join(root, fname))
-                    fout.write(fp + "\n")
-                    file_list.append(fp)
-            if len(file_list) % 5000 == 0 and file_list:
-                fout.flush()
-                logger.info(f"  已发现 {len(file_list)} 个文件...")
+        for source_dir in SOURCE_DIRS:
+            if not os.path.isdir(source_dir):
+                logger.warning(f"照片库路径不存在, 跳过: {source_dir}")
+                continue
+            for root, dirs, files in os.walk(source_dir):
+                for fname in files:
+                    if os.path.splitext(fname)[1].lower() in ALL_EXTENSIONS:
+                        fp = os.path.normpath(os.path.join(root, fname))
+                        fout.write(fp + "\n")
+                        file_list.append(fp)
+                if len(file_list) % 5000 == 0 and file_list:
+                    fout.flush()
+                    logger.info(f"  已发现 {len(file_list)} 个文件...")
     os.replace(tmp_file, list_file)
     logger.info(f"文件列表已缓存: {list_file}, 共 {len(file_list)} 个")
     return file_list
 
 
 def full_scan(progress_callback=None, batch_limit=None):
-    logger.info(f"扫描驱动器: {SOURCE_DRIVE}")
+    logger.info(f"扫描驱动器: {SOURCE_DRIVE} ({len(SOURCE_DIRS)} 个库)")
 
     file_list = _list_all_image_files()
     if file_list is None:
@@ -253,16 +262,14 @@ def full_scan(progress_callback=None, batch_limit=None):
         try:
             stat = os.stat(filepath)
             is_image = os.path.splitext(filepath)[1].lower() in IMAGE_EXTENSIONS
-            if is_image:
-                file_hash = None
-            else:
-                file_hash = None
+            file_hash = None
 
             folder = os.path.normpath(os.path.dirname(filepath))
+            source_dir = _match_source_dir(filepath) or SOURCE_DIRS[0] if SOURCE_DIRS else None
             conn.execute(
                 """INSERT OR IGNORE INTO files
-                   (file_path, file_name, folder_path, folder_name, file_size, file_mtime, file_hash, is_image, scanned_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (file_path, file_name, folder_path, folder_name, file_size, file_mtime, file_hash, is_image, scanned_at, source_dir)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     filepath,
                     os.path.basename(filepath),
@@ -273,6 +280,7 @@ def full_scan(progress_callback=None, batch_limit=None):
                     file_hash,
                     1 if is_image else 0,
                     datetime.now().isoformat(),
+                    source_dir,
                 ),
             )
             new_added += 1
@@ -316,6 +324,8 @@ def full_scan(progress_callback=None, batch_limit=None):
             conn.execute("DELETE FROM files WHERE file_path = ?", (path,))
         conn.commit()
 
+    _cleanup_removed_source_dirs(conn)
+
     final = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
     conn.commit()
     conn.close()
@@ -325,13 +335,24 @@ def full_scan(progress_callback=None, batch_limit=None):
     return {"total": final, "new": new_added, "removed": len(remove_set)}
 
 
+def _cleanup_removed_source_dirs(conn):
+    if not SOURCE_DIRS:
+        return
+    placeholders = ",".join("?" * len(SOURCE_DIRS))
+    removed = conn.execute(
+        f"SELECT COUNT(*) FROM files WHERE source_dir IS NOT NULL AND source_dir NOT IN ({placeholders})",
+        SOURCE_DIRS
+    ).fetchone()[0]
+    if removed > 0:
+        conn.execute(
+            f"DELETE FROM files WHERE source_dir IS NOT NULL AND source_dir NOT IN ({placeholders})",
+            SOURCE_DIRS
+        )
+        logger.info(f"清理 {removed} 个不在配置中的照片库文件")
+
+
 def fast_scan(num_files=1000, progress_callback=None):
     _db.init_tables()
-
-    ext_queries = []
-    for ext in ALL_EXTENSIONS:
-        ext_queries.append(f"{SOURCE_DRIVE} *{ext}")
-    query = "|".join(ext_queries)
 
     if not es_available():
         logger.warning("es.exe 不可用，回退到 os.walk 扫描")
@@ -343,6 +364,12 @@ def fast_scan(num_files=1000, progress_callback=None):
     if num_files:
         args.append(f"-n {num_files}")
 
+    ext_queries = []
+    for ext in ALL_EXTENSIONS:
+        for sd in SOURCE_DIRS:
+            ext_queries.append(f"{sd} *{ext}")
+    query = "|".join(ext_queries)
+
     logger.info(f"Everything 快速扫描: {SOURCE_DRIVE}")
     out, code = _run_es(args + [query], timeout=120)
 
@@ -353,7 +380,7 @@ def fast_scan(num_files=1000, progress_callback=None):
     files = []
     for line in out.strip().split("\n"):
         line = line.strip()
-        if not line or not line.startswith(SOURCE_DRIVE):
+        if not line or _match_source_dir(line.strip('"')) is None:
             continue
         filepath = line.strip('"').replace("\\\\", "\\")
         ext = os.path.splitext(filepath)[1].lower()
@@ -383,10 +410,11 @@ def fast_scan(num_files=1000, progress_callback=None):
                 file_hash = None
 
                 folder = os.path.dirname(filepath)
+                source_dir = _match_source_dir(filepath) or SOURCE_DIRS[0] if SOURCE_DIRS else None
                 conn.execute(
                     """INSERT OR IGNORE INTO files
-                       (file_path, file_name, folder_path, folder_name, file_size, file_mtime, file_hash, is_image, scanned_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (file_path, file_name, folder_path, folder_name, file_size, file_mtime, file_hash, is_image, scanned_at, source_dir)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         filepath,
                         os.path.basename(filepath),
@@ -397,6 +425,7 @@ def fast_scan(num_files=1000, progress_callback=None):
                         file_hash,
                         1 if is_image else 0,
                         datetime.now().isoformat(),
+                        source_dir,
                     ),
                 )
                 new_added += 1

@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     thumbnail_size: tuple[int, int] = (400, 400)
 
     @property
+    def source_dirs(self) -> list[str]:
+        return [p.strip() for p in self.source_drive.split(";") if p.strip()]
+
+    @property
     def db_path(self) -> str:
         return os.path.join(self.photo_data_dir, "photos.db")
 
@@ -51,22 +55,25 @@ def get_settings() -> Settings:
 
 def _sync_module_vars_from_settings():
     global DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, DEEPSEEK_CLASSIFY_MODEL
-    global SOURCE_DRIVE, DATA_DIR, DB_PATH, THUMBNAIL_DIR, CLASSIFICATION_HISTORY_FILE
+    global SOURCE_DRIVE, SOURCE_DIRS, DATA_DIR, DB_PATH, THUMBNAIL_DIR, CLASSIFICATION_HISTORY_FILE
     s = get_settings()
-    DEEPSEEK_API_KEY = s.deepseek_api_key
-    DEEPSEEK_BASE_URL = s.deepseek_base_url
-    DEEPSEEK_MODEL = s.deepseek_model
-    DEEPSEEK_CLASSIFY_MODEL = s.deepseek_classify_model
-    SOURCE_DRIVE = s.source_drive
-    DATA_DIR = s.photo_data_dir
-    DB_PATH = s.db_path
-    THUMBNAIL_DIR = s.thumbnail_dir
-    CLASSIFICATION_HISTORY_FILE = s.classification_history_file
+    DEEPSEEK_API_KEY = s.deepseek_api_key  # deprecated: use get_settings().deepseek_api_key
+    DEEPSEEK_BASE_URL = s.deepseek_base_url  # deprecated
+    DEEPSEEK_MODEL = s.deepseek_model  # deprecated
+    DEEPSEEK_CLASSIFY_MODEL = s.deepseek_classify_model  # deprecated
+    SOURCE_DRIVE = s.source_drive  # deprecated
+    SOURCE_DIRS = s.source_dirs  # deprecated
+    DATA_DIR = s.photo_data_dir  # deprecated
+    DB_PATH = s.db_path  # deprecated
+    THUMBNAIL_DIR = s.thumbnail_dir  # deprecated
+    CLASSIFICATION_HISTORY_FILE = s.classification_history_file  # deprecated
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif", ".heic", ".heif"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".m4v", ".3gp"}
 THUMBNAIL_SIZE = (400, 400)
+PHASH_THRESHOLD = 8
+MEMORY_HIGH_FREQ_DAYS = 3
 
 CATEGORY_LIFE = 1
 CATEGORY_SAMPLE = 2
@@ -76,18 +83,6 @@ CATEGORY_NAMES = {
     CATEGORY_SAMPLE: "拍摄样片",
 }
 
-_OPENAI_CLIENT = None
-
-
-def get_openai_client():
-    global _OPENAI_CLIENT
-    if _OPENAI_CLIENT is None:
-        from openai import OpenAI
-        s = get_settings()
-        _OPENAI_CLIENT = OpenAI(api_key=s.deepseek_api_key, base_url=s.deepseek_base_url)
-    return _OPENAI_CLIENT
-
-
 def is_configured():
     if not os.path.isfile(ENV_FILE):
         return False
@@ -95,8 +90,6 @@ def is_configured():
 
 
 def save_config(source_drive, data_dir, api_key, base_url="https://api.deepseek.com", model="deepseek-chat"):
-    global _OPENAI_CLIENT
-
     set_key(ENV_FILE, "SOURCE_DRIVE", source_drive)
     set_key(ENV_FILE, "PHOTO_DATA_DIR", data_dir)
     set_key(ENV_FILE, "DEEPSEEK_API_KEY", api_key)
@@ -112,7 +105,6 @@ def save_config(source_drive, data_dir, api_key, base_url="https://api.deepseek.
     global _settings
     _settings = Settings()
     _sync_module_vars_from_settings()
-    _OPENAI_CLIENT = None
 
     s = get_settings()
     os.makedirs(s.photo_data_dir, exist_ok=True)
@@ -123,12 +115,11 @@ def save_config(source_drive, data_dir, api_key, base_url="https://api.deepseek.
 
 
 def reload_config():
-    global _OPENAI_CLIENT, _settings
+    global _settings
 
     load_dotenv(ENV_FILE, override=True)
     _settings = Settings()
     _sync_module_vars_from_settings()
-    _OPENAI_CLIENT = None
 
     s = get_settings()
     os.makedirs(s.photo_data_dir, exist_ok=True)
