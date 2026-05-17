@@ -189,9 +189,17 @@ class VirtualCategoryPage(QScrollArea):
     def append_photos(self, new_photos):
         if new_photos:
             self._photos.extend(new_photos)
+            self._all_loaded = False
             self._destroy_visible_cards()
             self._recompute_layout()
             self._render_visible()
+            # 防膨胀：超过3000张时裁剪前半部分
+            if len(self._photos) > 3000:
+                cut = len(self._photos) // 2
+                self._photos = self._photos[cut:]
+                self._card_widgets.clear()
+                self._recompute_layout()
+                self._render_visible()
         self._loading_more = False
 
     def _destroy_visible_cards(self):
@@ -231,7 +239,7 @@ class VirtualCategoryPage(QScrollArea):
         self._render_visible()
         bar = self.verticalScrollBar()
         if bar.maximum() > 0 and value >= bar.maximum() - 200:
-            if not self._loading_more and not self._all_loaded:
+            if not self._loading_more:
                 self._loading_more = True
                 self.load_more_requested.emit()
 

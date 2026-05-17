@@ -5,12 +5,7 @@ import shutil
 
 def test_config_imports():
     import config
-    assert hasattr(config, "DEEPSEEK_API_KEY")
-    assert hasattr(config, "SOURCE_DRIVE")
-    assert hasattr(config, "SOURCE_DIRS")
-    assert hasattr(config, "DATA_DIR")
-    assert hasattr(config, "DB_PATH")
-    assert hasattr(config, "THUMBNAIL_DIR")
+    assert hasattr(config, "get_settings")
     assert hasattr(config, "IMAGE_EXTENSIONS")
     assert hasattr(config, "VIDEO_EXTENSIONS")
     assert hasattr(config, "PHASH_THRESHOLD")
@@ -100,7 +95,6 @@ def test_source_dirs_single_path():
     try:
         os.environ["SOURCE_DRIVE"] = "D:\\照片"
         config._settings = None
-        config._sync_module_vars_from_settings()
         s = config.get_settings()
         assert s.source_dirs == ["D:\\照片"]
     finally:
@@ -109,7 +103,6 @@ def test_source_dirs_single_path():
         else:
             os.environ.pop("SOURCE_DRIVE", None)
         config._settings = None
-        config._sync_module_vars_from_settings()
 
 
 def test_source_dirs_multiple_paths():
@@ -118,7 +111,6 @@ def test_source_dirs_multiple_paths():
     try:
         os.environ["SOURCE_DRIVE"] = "D:\\照片;E:\\旅行"
         config._settings = None
-        config._sync_module_vars_from_settings()
         s = config.get_settings()
         assert s.source_dirs == ["D:\\照片", "E:\\旅行"]
     finally:
@@ -127,7 +119,6 @@ def test_source_dirs_multiple_paths():
         else:
             os.environ.pop("SOURCE_DRIVE", None)
         config._settings = None
-        config._sync_module_vars_from_settings()
 
 
 def test_phash_and_memory_constants():
@@ -158,14 +149,11 @@ def test_save_config_updates_settings():
         config.ENV_FILE = fake_env
         config._settings = None
         config.reload_config()
-        assert config.SOURCE_DRIVE == "D:\\old"
-        assert config.DATA_DIR == "D:\\olddata"
+        s = config.get_settings()
+        assert s.source_drive == "D:\\old"
+        assert s.photo_data_dir == "D:\\olddata"
 
         config.save_config("D:\\new", "D:\\newdata", "sk-new")
-        assert config.SOURCE_DRIVE == "D:\\new"
-        assert config.DATA_DIR == "D:\\newdata"
-        assert config.DEEPSEEK_API_KEY == "sk-new"
-
         s = config.get_settings()
         assert s.source_drive == "D:\\new"
         assert s.photo_data_dir == "D:\\newdata"

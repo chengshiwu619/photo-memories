@@ -197,9 +197,9 @@ def is_available() -> bool:
 
 def detect_objects(file_id: int) -> List[dict]:
     import os
-    from config import THUMBNAIL_DIR
+    from config import get_settings
 
-    thumb_path = os.path.join(THUMBNAIL_DIR, f"{file_id}.jpg")
+    thumb_path = os.path.join(get_settings().thumbnail_dir, f"{file_id}.jpg")
     if not os.path.exists(thumb_path):
         return []
 

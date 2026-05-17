@@ -3,7 +3,7 @@ import subprocess
 from datetime import datetime
 
 from logger_setup import logger
-from config import SOURCE_DRIVE, SOURCE_DIRS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, DATA_DIR
+from config import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, get_settings
 from db_manager import Database
 from checkpoint_manager import CheckpointManager, CheckpointState
 
@@ -114,7 +114,7 @@ def _run_es(args, timeout=120):
 
 
 def _match_source_dir(filepath):
-    for sd in SOURCE_DIRS:
+    for sd in get_settings().source_dirs:
         prefix = sd.rstrip("\\") + "\\"
         if filepath.startswith(prefix) or filepath.startswith(sd.rstrip("\\") + "/"):
             return sd
@@ -122,11 +122,12 @@ def _match_source_dir(filepath):
 
 
 def _list_all_image_files():
-    list_file = os.path.join(DATA_DIR, "filelist.txt")
+    _s = get_settings()
+    list_file = os.path.join(_s.photo_data_dir, "filelist.txt")
     if os.path.exists(list_file):
         with open(list_file, "r", encoding="utf-8") as f:
             lines = f.readlines()
-        if lines and lines[0].strip() == f"# SOURCE_DRIVE={os.path.normpath(SOURCE_DRIVE)}":
+        if lines and lines[0].strip() == f"# SOURCE_DRIVE={os.path.normpath(_s.source_drive)}":
             paths = [os.path.normpath(l.rstrip("\n")) for l in lines[1:] if l.strip()]
             if paths:
                 logger.info("使用缓存文件列表: %s 个文件" % len(paths))
@@ -138,7 +139,7 @@ def _list_all_image_files():
         logger.info("Everything IPC 不可用, 回退 os.walk")
         return _walk_files()
 
-    logger.info("Everything 全量扫描: %s (实例: [%s])" % (SOURCE_DRIVE, inst or "默认"))
+    logger.info("Everything 全量扫描: %s (实例: [%s])" % (_s.source_drive, inst or "默认"))
 
     ext_list = [e.lstrip(".") for e in ALL_EXTENSIONS]
     ext_query = "ext:%s" % ";".join(ext_list)
@@ -150,10 +151,10 @@ def _list_all_image_files():
         files = _parse_es_csv(out)
         logger.info("Everything 返回 %s 条记录, 过滤后 %s 个媒体文件" % (len(out.split("\n")), len(files)))
         if files:
-            os.makedirs(DATA_DIR, exist_ok=True)
+            os.makedirs(_s.photo_data_dir, exist_ok=True)
             tmp = list_file + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                f.write(f"# SOURCE_DRIVE={os.path.normpath(SOURCE_DRIVE)}\n")
+                f.write(f"# SOURCE_DRIVE={os.path.normpath(_s.source_drive)}\n")
                 for fp in files:
                     f.write(fp + "\n")
             os.replace(tmp, list_file)
@@ -178,11 +179,12 @@ def _parse_es_csv(text):
 
 
 def _walk_files():
-    list_file = os.path.join(DATA_DIR, "filelist.txt")
+    _s = get_settings()
+    list_file = os.path.join(_s.photo_data_dir, "filelist.txt")
     if os.path.exists(list_file):
         with open(list_file, "r", encoding="utf-8") as f:
             lines = f.readlines()
-        if lines and lines[0].strip() == f"# SOURCE_DRIVE={os.path.normpath(SOURCE_DRIVE)}":
+        if lines and lines[0].strip() == f"# SOURCE_DRIVE={os.path.normpath(_s.source_drive)}":
             paths = [os.path.normpath(line.rstrip("\n")) for line in lines[1:] if line.strip()]
             if paths:
                 logger.info(f"使用缓存文件列表: {len(paths)} 个文件")
@@ -190,12 +192,12 @@ def _walk_files():
         logger.info("缓存文件列表来源不匹配当前 SOURCE_DRIVE, 重新扫描")
 
     logger.info("os.walk 遍历中, 请耐心等待...")
-    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(_s.photo_data_dir, exist_ok=True)
     tmp_file = list_file + ".tmp"
     file_list = []
     with open(tmp_file, "w", encoding="utf-8") as fout:
-        fout.write(f"# SOURCE_DRIVE={os.path.normpath(SOURCE_DRIVE)}\n")
-        for source_dir in SOURCE_DIRS:
+        fout.write(f"# SOURCE_DRIVE={os.path.normpath(_s.source_drive)}\n")
+        for source_dir in _s.source_dirs:
             if not os.path.isdir(source_dir):
                 logger.warning(f"照片库路径不存在, 跳过: {source_dir}")
                 continue
@@ -214,7 +216,8 @@ def _walk_files():
 
 
 def full_scan(progress_callback=None, batch_limit=None):
-    logger.info(f"扫描驱动器: {SOURCE_DRIVE} ({len(SOURCE_DIRS)} 个库)")
+    _s = get_settings()
+    logger.info(f"扫描驱动器: {_s.source_drive} ({len(_s.source_dirs)} 个库)")
 
     file_list = _list_all_image_files()
     if file_list is None:
@@ -265,7 +268,7 @@ def full_scan(progress_callback=None, batch_limit=None):
             file_hash = None
 
             folder = os.path.normpath(os.path.dirname(filepath))
-            source_dir = _match_source_dir(filepath) or SOURCE_DIRS[0] if SOURCE_DIRS else None
+            source_dir = _match_source_dir(filepath) or _s.source_dirs[0] if _s.source_dirs else None
             conn.execute(
                 """INSERT OR IGNORE INTO files
                    (file_path, file_name, folder_path, folder_name, file_size, file_mtime, file_hash, is_image, scanned_at, source_dir)
@@ -336,22 +339,24 @@ def full_scan(progress_callback=None, batch_limit=None):
 
 
 def _cleanup_removed_source_dirs(conn):
-    if not SOURCE_DIRS:
+    _dirs = get_settings().source_dirs
+    if not _dirs:
         return
-    placeholders = ",".join("?" * len(SOURCE_DIRS))
+    placeholders = ",".join("?" * len(_dirs))
     removed = conn.execute(
         f"SELECT COUNT(*) FROM files WHERE source_dir IS NOT NULL AND source_dir NOT IN ({placeholders})",
-        SOURCE_DIRS
+        _dirs
     ).fetchone()[0]
     if removed > 0:
         conn.execute(
             f"DELETE FROM files WHERE source_dir IS NOT NULL AND source_dir NOT IN ({placeholders})",
-            SOURCE_DIRS
+            _dirs
         )
         logger.info(f"清理 {removed} 个不在配置中的照片库文件")
 
 
 def fast_scan(num_files=1000, progress_callback=None):
+    _s = get_settings()
     _db.init_tables()
 
     if not es_available():
@@ -366,11 +371,11 @@ def fast_scan(num_files=1000, progress_callback=None):
 
     ext_queries = []
     for ext in ALL_EXTENSIONS:
-        for sd in SOURCE_DIRS:
+        for sd in _s.source_dirs:
             ext_queries.append(f"{sd} *{ext}")
     query = "|".join(ext_queries)
 
-    logger.info(f"Everything 快速扫描: {SOURCE_DRIVE}")
+    logger.info(f"Everything 快速扫描: {_s.source_drive}")
     out, code = _run_es(args + [query], timeout=120)
 
     if code != 0 or not out:
@@ -410,7 +415,7 @@ def fast_scan(num_files=1000, progress_callback=None):
                 file_hash = None
 
                 folder = os.path.dirname(filepath)
-                source_dir = _match_source_dir(filepath) or SOURCE_DIRS[0] if SOURCE_DIRS else None
+                source_dir = _match_source_dir(filepath) or _s.source_dirs[0] if _s.source_dirs else None
                 conn.execute(
                     """INSERT OR IGNORE INTO files
                        (file_path, file_name, folder_path, folder_name, file_size, file_mtime, file_hash, is_image, scanned_at, source_dir)

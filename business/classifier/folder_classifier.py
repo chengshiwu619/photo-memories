@@ -4,15 +4,10 @@ import json
 
 from logger_setup import logger
 from config import (
-    DEEPSEEK_API_KEY,
-    DEEPSEEK_BASE_URL,
-    DEEPSEEK_MODEL,
-    DEEPSEEK_CLASSIFY_MODEL,
-    CLASSIFICATION_HISTORY_FILE,
     CATEGORY_LIFE,
     CATEGORY_SAMPLE,
     CATEGORY_NAMES,
-    SOURCE_DRIVE,
+    get_settings,
 )
 from db_manager import Database
 
@@ -243,7 +238,7 @@ def _get_branch_folders():
     if not all_folders:
         return []
 
-    source = os.path.normpath(SOURCE_DRIVE)
+    source = os.path.normpath(get_settings().source_drive)
     branches = set()
     for fp in all_folders:
         norm_fp = os.path.normpath(fp)
@@ -304,16 +299,18 @@ def build_classification_history():
 
     text = "\n".join(lines)
 
-    with open(CLASSIFICATION_HISTORY_FILE, "w", encoding="utf-8") as f:
+    _hist_file = get_settings().classification_history_file
+    with open(_hist_file, "w", encoding="utf-8") as f:
         f.write(text)
 
-    logger.info(f"分类历史已写入 {CLASSIFICATION_HISTORY_FILE}: {len(rows)} 条")
+    logger.info(f"分类历史已写入 {_hist_file}: {len(rows)} 条")
     return text
 
 
 def _load_history_context():
-    if os.path.exists(CLASSIFICATION_HISTORY_FILE):
-        with open(CLASSIFICATION_HISTORY_FILE, "r", encoding="utf-8") as f:
+    _hist_file = get_settings().classification_history_file
+    if os.path.exists(_hist_file):
+        with open(_hist_file, "r", encoding="utf-8") as f:
             content = f.read().strip()
         if content:
             return f"""
@@ -347,7 +344,7 @@ def classify_branches_with_llm(branch_info):
             from infra.llm.client import get_llm_client
             llm = get_llm_client()
             response = llm.chat(
-                model=DEEPSEEK_CLASSIFY_MODEL,
+                model=get_settings().deepseek_classify_model,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
                 temperature=0.1,
@@ -683,7 +680,7 @@ def refine_sample_keywords():
                 except (json.JSONDecodeError, TypeError):
                     folder_info[fp]["exif_texts"].append(exif_j.lower())
 
-        source_norm = os.path.normpath(SOURCE_DRIVE)
+        source_norm = os.path.normpath(get_settings().source_drive)
 
         branch_cat_map = {}
         for fp, (cat, conf) in classified_map.items():

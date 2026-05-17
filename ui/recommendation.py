@@ -1,6 +1,5 @@
 import os
 import random
-from config import DB_PATH
 
 CATEGORY_COLORS = {
     1: "#27ae60", 2: "#2980b9",
@@ -271,3 +270,23 @@ def rank_search_photos(db, matched_ids):
     photos = load_photos_from_ids(db, matched_ids)
     random.shuffle(photos)
     return _interleave_small_folders(photos)
+
+
+def reshuffle_photos(photos, shown_ids=None):
+    """对照片列表重新洗牌，已显示过的照片降权排到后面"""
+    if not photos:
+        return []
+
+    if shown_ids is None:
+        shown_ids = set()
+
+    fresh = [p for p in photos if p["id"] not in shown_ids]
+    stale = [p for p in photos if p["id"] in shown_ids]
+
+    random.shuffle(fresh)
+    random.shuffle(stale)
+
+    result = []
+    result.extend(fresh)
+    result.extend(stale)
+    return _interleave_by_time(_interleave_small_folders(result))

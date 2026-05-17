@@ -12,7 +12,7 @@ register_heif_opener()
 Image.MAX_IMAGE_PIXELS = 500_000_000
 
 from logger_setup import logger
-from config import THUMBNAIL_DIR, THUMBNAIL_SIZE, DATA_DIR, PHASH_THRESHOLD
+from config import THUMBNAIL_SIZE, PHASH_THRESHOLD, get_settings
 from db_manager import Database
 from checkpoint_manager import CheckpointManager, CheckpointState
 
@@ -133,8 +133,9 @@ def _convert_gps(value):
 
 
 def generate_thumbnail(filepath, thumbnail_name):
-    os.makedirs(THUMBNAIL_DIR, exist_ok=True)
-    thumb_path = os.path.join(THUMBNAIL_DIR, thumbnail_name)
+    _thumb_dir = get_settings().thumbnail_dir
+    os.makedirs(_thumb_dir, exist_ok=True)
+    thumb_path = os.path.join(_thumb_dir, thumbnail_name)
 
     if os.path.exists(thumb_path):
         return thumb_path, None, None

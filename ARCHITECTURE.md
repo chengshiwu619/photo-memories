@@ -9,16 +9,15 @@
 │  sidebar / timeline / special_memories            │
 ├──────────────────────────────────────────────────┤
 │                  服务层 (services/)                │
-│  pipeline / background_task_manager               │
-│  recognition_scheduler                            │
+│  background_task_manager                          │
 ├──────────────────────────────────────────────────┤
 │                     业务层                         │
 │  business/image_recognition / business/memory     │
-│  business/scanner / business/classifier           │
+│  business/scanner / business/classifier            │
 │  business/indexer / memory (generator)            │
 ├──────────────────────────────────────────────────┤
 │                基础设施层 (infra/)                  │
-│  llm / fs / db / image                           │
+│  llm / db/repositories / image                    │
 ├──────────────────────────────────────────────────┤
 │                  核心层 (core/)                    │
 │  models / config / db_manager / logger            │
@@ -27,9 +26,10 @@
 
 ### 层间依赖规则
 
-- 上层可调用下层，下层不可调用上层
+- **严格单向依赖**：上层可调用下层，下层禁止调用上层
 - 同层模块间通过公开函数交互，不直接操作对方内部状态
-- UI 层禁止直接写 SQL，必须通过 recommendation.py 或 db_manager 获取数据
+- 跨层调用必须通过层间接口表（见第 11 节），禁止直接 import 层内未导出模块
+- UI 层禁止直接写 SQL，必须通过 Repository 或 db_manager 获取数据
 - 业务层禁止直接操作 UI 组件
 - AI 识别任务使用缩略图，不读取原图
 - 涉及用户照片的删除/移动操作，永远走"标记"而非物理操作
@@ -38,65 +38,65 @@
 
 ### 2.1 核心层
 
-| 模块 | 文件 | 职责 |
-|------|------|------|
-| 配置 | `config.py` | 环境变量读取、Settings 单例、全局常量（分类ID/扩展名/模型名）、多照片库路径支持（分号分隔，通过 `source_dirs` 解析） |
-| 数据库 | `db_manager.py` | SQLite 连接管理、表结构定义与初始化、v0.2→v0.3 自动迁移 |
-| 数据模型 | `core/models.py` | 数据类定义（File、PhotoMetadata、Memory、FaceEmbedding、FaceCluster、Event、MemoryReasoning、TaskCheckpoint 等） |
-| 日志 | `logger_setup.py` | 全局 logger 配置、多文件分级（app.log 全量 / error.log WARNING+ / crash.log 未捕获异常）、sys.excepthook + threading.excepthook 接管、启动崩溃 marker（last_run.txt）、按天滚动 |
-| 断点 | `checkpoint_manager.py` | 通用长任务断点持久化（扫描/索引/识别统一使用 `task_checkpoints` 表） |
+| 模块 | 文件 | 职责 | 状态 |
+|------|------|------|------|
+| 配置 | `config.py` | 环境变量读取、Settings 单例、全局常量（分类ID/扩展名/模型名）、多照片库路径支持（分号分隔，通过 `source_dirs` 解析） | ✅ 活跃 |
+| 数据库 | `db_manager.py` | SQLite 连接管理、表结构定义与初始化、版本自动迁移 | ✅ 活跃 |
+| 数据模型 | `core/models.py` | 数据类定义（File、PhotoMetadata、Memory、FaceEmbedding、FaceCluster、Event、MemoryReasoning、TaskCheckpoint 等） | ✅ 活跃 |
+| 日志 | `logger_setup.py` | 全局 logger 配置、多文件分级（app.log 全量 / error.log WARNING+ / crash.log 未捕获异常）、sys.excepthook + threading.excepthook 接管、启动崩溃 marker（last_run.txt）、按天滚动 | ✅ 活跃 |
+| 断点 | `checkpoint_manager.py` | 通用长任务断点持久化（扫描/索引/识别统一使用 `task_checkpoints` 表） | ✅ 活跃 |
 
 ### 2.2 基础设施层
 
-| 模块 | 文件 | 职责 |
-|------|------|------|
-| LLM | `infra/llm/client.py` | OpenAI 兼容客户端封装、重试策略 |
-| 文件系统 | `infra/fs/everything.py` | Everything 搜索工具封装、多路径查询支持 |
-| 数据仓库 | `infra/db/repositories/` | 各表 CRUD 操作封装（FilesRepo、PhotoMetadataRepo、MemoriesRepo、PhotoTagsRepo、ClickHistoryRepo） |
-| CLIP编码器 | `infra/image/clip_encoder.py` | SigLIP/OpenCLIP 图像嵌入提取（后台，使用缩略图） |
-| 人脸检测 | `infra/image/face_detector.py` | DeepFace 人脸检测与特征提取（使用缩略图，固定 ArcFace 后端） |
-| 目标检测 | `infra/image/object_detector.py` | 目标检测抽象接口 + YOLOv8 实现（ultralytics，预留切换后端） |
-| 缩略图加载 | `infra/image/thumbnail_loader.py` | 识别模块共享的缩略图加载器，统一 LRU 内存管理（256张） |
+| 模块 | 文件 | 职责 | 状态 |
+|------|------|------|------|
+| LLM | `infra/llm/client.py` | OpenAI 兼容客户端封装、重试策略 | ✅ 活跃 |
+| 数据仓库 | `infra/db/repositories/` | 各表 CRUD 操作封装（FilesRepo、PhotoMetadataRepo、MemoriesRepo、PhotoTagsRepo、FaceEmbeddingsRepo、EventsRepo、ClickHistoryRepo） | ✅ 活跃 |
+| CLIP编码器 | `infra/image/clip_encoder.py` | SigLIP/OpenCLIP 图像嵌入提取（后台，使用缩略图） | ✅ 活跃 |
+| 人脸检测 | `infra/image/face_detector.py` | DeepFace 人脸检测与特征提取（使用缩略图，固定 ArcFace 后端） | ✅ 活跃 |
+| 目标检测 | `infra/image/object_detector.py` | 目标检测抽象接口 + LibreYOLO ONNX 实现（基于 onnxruntime，MIT 许可） | ✅ 活跃 |
+| 缩略图加载 | `infra/image/thumbnail_loader.py` | 识别模块共享的缩略图加载器，统一 LRU 内存管理（256张） | ✅ 活跃 |
 
 ### 2.3 业务层
 
-| 模块 | 文件 | 职责 |
-|------|------|------|
-| 扫描 | `business/scanner/fast_scan.py` | 磁盘文件发现（Everything/os.walk）、入库 files 表、多照片库路径遍历、`source_dir` 字段标记 |
-| 分类 | `business/classifier/folder_classifier.py` | 关键词预分类 + LLM 分类 + 后台精分类、自动清理旧分类残留 |
-| 索引 | `business/indexer/photo_indexer.py` | EXIF 提取、缩略图生成、感知哈希去重（`dedup_by_phash`）、入库 photo_metadata 表 |
-| 图像标签 | `business/image_recognition/tag_generator.py` | 基于 SigLIP 嵌入的图像标签生成策略 |
-| 人脸聚类 | `business/image_recognition/face_cluster.py` | 人脸向量聚类、人物分组管理、用户纠偏（标记为他人）、rename_cluster、reassign_face |
-| 场景聚类 | `business/image_recognition/scene_cluster.py` | CLIP 场景聚类（距离判定） |
-| 回忆发现 | `business/memory/memory_discovery.py` | 那年今日回忆、近期回忆、人物回忆、事件回忆、场景回忆、数据查询与过滤 |
-| 事件检测 | `business/memory/event_detector.py` | 时间断裂聚类 + GPS 聚类、事件/旅行发现 |
-| 回忆叙事 | `business/memory/memory_narrator.py` | LLM 叙事生成 |
-| 回忆推理 | `business/memory/memory_reasoning.py` | 碎裂回忆反馈记录、负面提示管理 |
-| 回忆生成 | `memory/memory_generator.py` | LLM 回忆标题/描述生成（v0.2 保留模块，与 memory_discovery 并存：discovery 负责规则发现入口，generator 负责 LLM 叙事能力） |
+| 模块 | 文件 | 职责 | 状态 |
+|------|------|------|------|
+| 扫描 | `business/scanner/fast_scan.py` | 磁盘文件发现（Everything/os.walk）、入库 files 表、多照片库路径遍历、`source_dir` 字段标记 | ✅ 活跃 |
+| 分类 | `business/classifier/folder_classifier.py` | 关键词预分类 + LLM 分类 + 后台精分类、自动清理旧分类残留 | ✅ 活跃 |
+| 索引 | `business/indexer/photo_indexer.py` | EXIF 提取、缩略图生成、感知哈希去重（`dedup_by_phash`）、入库 photo_metadata 表 | ✅ 活跃 |
+| 图像标签 | `business/image_recognition/tag_generator.py` | 基于 SigLIP 嵌入的图像标签生成策略 | ✅ 活跃 |
+| 人脸聚类 | `business/image_recognition/face_cluster.py` | 人脸向量聚类、人物分组管理、用户纠偏（标记为他人）、rename_cluster、reassign_face | ✅ 活跃 |
+| 场景聚类 | `business/image_recognition/scene_cluster.py` | CLIP 场景聚类（距离判定） | ✅ 活跃 |
+| 回忆发现 | `business/memory/memory_discovery.py` | 那年今日回忆、近期回忆、数据查询与过滤 | ✅ 活跃 |
+| 事件检测 | `business/memory/event_detector.py` | 时间断裂聚类 + GPS 聚类、事件/旅行发现 | ⚠️ 代码存在，未被 UI 调用 |
+| 回忆叙事 | `business/memory/memory_narrator.py` | LLM 叙事生成 | ⚠️ 代码存在，未被 UI 调用 |
+| 回忆推理 | `business/memory/memory_reasoning.py` | 碎裂回忆反馈记录、负面提示管理 | ✅ 活跃 |
+| 回忆生成 | `memory/memory_generator.py` | LLM 回忆标题/描述生成（v0.2 保留模块，与 memory_discovery 并存：discovery 负责规则发现入口，generator 负责 LLM 叙事能力） | ✅ 活跃 |
 
 ### 2.4 服务层
 
-| 模块 | 文件 | 职责 |
-|------|------|------|
-| 流水线 | `services/background_task_manager.py` | Stage 模式流水线（扫描/分类/索引/回忆）、进度回调、取消机制、交互式分类、批量限制；后台线程统一注册与安全等待退出 |
-| 识别调度 | `services/recognition_scheduler.py` | 识别任务调度初始实现（支持 SigLIP 单批推理，断点续传，进度上报；完整 AI 流水线待后续完善） |
+| 模块 | 文件 | 职责 | 状态 |
+|------|------|------|------|
+| 流水线 | `services/background_task_manager.py` | Stage 模式流水线（扫描/分类/索引/回忆）、进度回调、取消机制、交互式分类、批量限制；后台线程统一注册与安全等待退出 | ✅ 活跃 |
+| 识别调度 | `services/recognition_scheduler.py` | 识别任务调度（SigLIP/人脸/YOLO/场景四阶段，断点续传） | ⚠️ 代码存在，功能已部分并入 background_task_manager，待整合或移除 |
+| 数据服务 | `services/data_service.py` | 数据访问门面（封装 Repository 调用） | ❌ 死代码，0引用，待清理 |
 
 ### 2.5 UI 层
 
-| 模块 | 文件 | 职责 |
-|------|------|------|
-| 主窗口 | `ui/app.py` | MainWindow、侧边栏导航切换（随机回忆/时间线/特殊回忆） |
-| 推荐 | `ui/recommendation.py` | 照片排序、打散、新鲜度、分页、去重过滤（`is_duplicate_of`） |
-| 瀑布流 | `ui/components/virtual_waterfall.py` | 虚拟滚动瀑布流布局、卡片渲染 |
-| 图片查看器 | `ui/components/image_viewer.py` | 全屏查看、收藏、分类调整 |
-| 启动窗口 | `ui/components/startup_window.py` | 初始化进度、后台任务启动 |
-| 设置窗口 | `ui/components/setup_window.py` | 首次配置/修改配置、关键词管理、多照片库路径管理 |
-| 分类对话框 | `ui/components/folder_classifier_dialog.py` | 用户手动分类交互 |
-| 回忆卡片 | `ui/components/memory_cards.py` | 回忆卡片展示（v0.3 重写） |
-| 侧边栏导航 | `ui/components/sidebar.py` | 3个导航项切换 |
-| 时间线视图 | `ui/components/timeline_view.py` | 按日期分组的照片时间线布局 |
-| 特殊回忆视图 | `ui/components/special_memories.py` | 回忆卡片堆叠布局、碎裂动画框架（QPropertyAnimation） |
-| 人物详情页 | `ui/components/person_detail.py` | 人物回忆详情页、命名、纠偏入口 |
+| 模块 | 文件 | 职责 | 状态 |
+|------|------|------|------|
+| 主窗口 | `ui/app.py` | MainWindow、侧边栏导航切换（随机回忆/时间线/特殊回忆） | ✅ 活跃 |
+| 推荐 | `ui/recommendation.py` | 照片排序、打散、新鲜度、分页、去重过滤（`is_duplicate_of`） | ✅ 活跃 |
+| 瀑布流 | `ui/components/virtual_waterfall.py` | 虚拟滚动瀑布流布局、卡片渲染 | ✅ 活跃 |
+| 图片查看器 | `ui/components/image_viewer.py` | 全屏查看、收藏、分类调整 | ✅ 活跃 |
+| 启动窗口 | `ui/components/startup_window.py` | 初始化进度、后台任务启动 | ✅ 活跃 |
+| 设置窗口 | `ui/components/setup_window.py` | 首次配置/修改配置、关键词管理、多照片库路径管理 | ✅ 活跃 |
+| 分类对话框 | `ui/components/folder_classifier_dialog.py` | 用户手动分类交互 | ✅ 活跃 |
+| 回忆卡片 | `ui/components/memory_cards.py` | 回忆卡片展示（v0.3 重写） | ✅ 活跃 |
+| 侧边栏导航 | `ui/components/sidebar.py` | 3个导航项切换 | ✅ 活跃 |
+| 时间线视图 | `ui/components/timeline_view.py` | 按日期分组的照片时间线布局 | ✅ 活跃 |
+| 特殊回忆视图 | `ui/components/special_memories.py` | 回忆卡片堆叠布局、碎裂动画框架（QPropertyAnimation） | ⚠️ 框架已实现，细节待完善 |
+| 人物详情页 | `ui/components/person_detail.py` | 人物回忆详情页、命名、纠偏入口 | ✅ 活跃 |
 
 ## 3. 数据流
 
@@ -158,7 +158,7 @@ VirtualCategoryPage → load_more_requested
 #### 当前实现状态
 
 ```
-recognition_scheduler.py（初始框架）
+background_task_manager.py（Stage 模式流水线）
   → tag_generator.py
     → clip_encoder.py（SigLIP 推理）
     → PhotoTagsRepo 写入（source=siglip）
@@ -248,6 +248,38 @@ special_memories.py
 - `photo_metadata.is_duplicate_of` 标记原图 file_id
 - 推荐流程过滤 is_duplicate_of 非空的照片
 - 不物理删除，不拒绝入库
+
+### 3.11 缩略图版本复用策略
+
+版本更迭或配置变更时，已有缩略图数据应尽量复用，避免全量重新生成。
+
+#### 复用原则
+
+- 缩略图文件命名：`{file_id}.jpg`，存储于 `{PHOTO_DATA_DIR}/thumbnails/`
+- 缩略图生成开销大（万张照片约 10-20 分钟），复用优先于重建
+- AI 侧接受重采样（400→224/112），不因尺寸微调强制全量重建
+
+#### 迁移场景与策略
+
+| 场景 | 触发条件 | 策略 |
+|------|----------|------|
+| A. 缓存目录变更 | 用户修改 `PHOTO_DATA_DIR` | `shutil.copytree` 整体搬迁旧 thumbnails 目录到新路径 |
+| B. DB 重建导致 file_id 变化 | 删库重建、版本迁移 | 读取旧 DB 建立 `file_path → old_file_id` 映射，查新 DB 得 `file_path → new_file_id`，批量 `os.rename({old_id}.jpg, {new_id}.jpg)` |
+| C. 缩略图尺寸变更 | `THUMBNAIL_SIZE` 调整 | 惰性重建：不强制全量重新生成，索引阶段 `generate_thumbnail()` 按需补缺 |
+
+#### 实施步骤（DB 迁移阶段自动执行）
+
+1. **检测旧目录**：迁移前记录旧 `thumbnail_dir` 路径
+2. **路径搬迁**：若 `PHOTO_DATA_DIR` 变更，`copytree` 旧目录 → 新目录
+3. **ID 重映射**：若 DB 重建，基于 `file_path` 双库映射，批量 rename 缩略图文件
+4. **路径更新**：`photo_metadata.thumbnail_path` 字段更新为新路径
+5. **惰性清理**：无映射的旧缩略图保留不删（避免误删），索引阶段按需补缺
+6. **日志记录**：`"缩略图复用: 迁移 N 个, 跳过 M 个 (无映射)"`
+
+#### 缩略图完整性校验
+
+- `generate_thumbnail()` 跳过条件扩展：不仅检查文件存在，还需 `os.path.getsize() > 0`
+- 损坏/零字节缩略图视为缺失，索引阶段自动重新生成
 
 ## 4. 数据库表结构
 
@@ -451,12 +483,13 @@ special_memories.py
 | 7 | 事件/旅行回忆（时间断裂+GPS聚类） | business | 中 | ✅ 已实现 |
 | 8 | CLIP场景聚类卡片堆叠 | infra/image、business | 中 | ✅ 已实现 |
 | 9 | SigLIP语义标签（后台） | infra/image、pipeline | 高 | ✅ 已实现 |
-| 10 | 目标检测（YOLOv8） | infra/image | 中 | ✅ 已实现 |
+| 10 | 目标检测（LibreYOLO ONNX） | infra/image | 中 | ✅ 已实现 |
 | 11 | custom-ui-pyqt6增强卡片效果 | UI层 | 延后 | ⏸️ 延后（原生PyQt6） |
 | 12 | 特殊回忆卡片碎裂动画 | UI层 | 中 | ⚠️ 框架已实现（细节待完善） |
 | 13 | 碎裂回忆反馈机制 | memory、LLM | 中 | ✅ 已实现 |
 | 14 | 人物回忆纠偏 | UI层、business | 中 | ✅ 已实现 |
 | 15 | 多照片库支持 | config、scanner、everything、setup_window | 中 | ✅ 已实现 |
+| 16 | 缩略图版本复用 | db_manager、photo_indexer | 高 | 📋 待实现 |
 
 ## 7. 依赖与风险
 
@@ -467,7 +500,7 @@ special_memories.py
 | imagehash | 感知哈希去重 | BSD-2 | ✅ requirements.txt |
 | open-clip-torch | SigLIP/OpenCLIP 语义标签 | Apache-2.0 | ⚠️ 代码已实现，待添加到 requirements.txt |
 | deepface | 人脸检测与聚类 | MIT | ⚠️ 代码已实现，待添加到 requirements.txt |
-| onnxruntime | YOLOv8 ONNX 目标检测 | MIT | ✅ requirements.txt（替代 ultralytics，消除 AGPL 风险） |
+| onnxruntime | LibreYOLO ONNX 目标检测 | MIT | ✅ requirements.txt（替代 ultralytics，消除 AGPL 风险） |
 | sqlite-vec | 向量近似检索 | MIT | ❌ 暂未集成（当前纯Python） |
 | custom-ui-pyqt6 | 增强卡片视觉效果 | 未确认 | ⏸️ 延后 |
 
@@ -476,7 +509,7 @@ special_memories.py
 class ObjectDetector(Protocol):
     def detect(self, image_path: str) -> list[dict]: ...
 
-class YOLOv8ONNXDetector:  # 当前实现，基于 onnxruntime
+class LibreYOLOONNXDetector:  # 当前实现，基于 onnxruntime
     ...
 ```
 
@@ -499,12 +532,15 @@ class YOLOv8ONNXDetector:  # 当前实现，基于 onnxruntime
 10. **LLM调用最小化**
 11. **数据库迁移必须可逆**：迁移前自动备份
 12. **涉及用户照片的删除/移动操作，永远走标记而非物理操作**
+13. **禁止死代码入库**：新增函数/变量必须有调用方，否则不入
+14. **层间调用走接口表**：跨层 import 必须符合第 11 节的层间接口定义
+15. **Config 统一走 get_settings()**：禁止新增 deprecated 全局变量引用
 
 ## 9. 架构变更审核规则
 
 以下变更属于架构变更，需提出审核方案、经明确确认后方可执行：
 1. **新增/删除模块**：新增 Python 包或删除现有模块
-2. **层间依赖变更**：违反分层规则的新调用
+2. **层间依赖变更**：违反分层规则的新调用，或修改层间接口表
 3. **数据流变更**：改变模块间数据传递方式
 4. **数据库表结构变更**：新增/删除/修改表或索引
 5. **外部依赖变更**：新增/移除/替换外部依赖库
@@ -545,3 +581,143 @@ class YOLOv8ONNXDetector:  # 当前实现，基于 onnxruntime
 ### 缩略图尺寸说明
 
 AI 侧接受重采样开销（400→224/112），不生成第二套缩略图。实测 10000 张额外耗时约 10-20 秒，可接受。
+
+## 11. 层间接口定义
+
+各层对外只暴露以下接口，跨层调用必须且只能使用这些接口。未列入的模块/函数属于层内实现细节，禁止跨层直接引用。
+
+### 11.1 核心层对外接口
+
+所有层均可调用。
+
+| 接口 | 模块 | 函数/类 | 说明 |
+|------|------|----------|------|
+| 配置读取 | `config.py` | `get_settings() → Settings` | 获取配置单例，所有配置项通过此接口读取 |
+| 配置写入 | `config.py` | `save_config(...)` | 保存用户配置到 .env |
+| 配置检测 | `config.py` | `is_configured() → bool` | 检查是否已完成初始配置 |
+| 数据库 | `db_manager.py` | `Database` 类 | 连接管理、表初始化、版本迁移 |
+| 数据模型 | `core/models.py` | 所有 dataclass | File, PhotoMetadata, Memory, FaceEmbedding, FaceCluster, Event, MemoryReasoning, PhotoTag, TaskCheckpoint |
+| 断点 | `checkpoint_manager.py` | `CheckpointManager` 类 | 长任务断点持久化 |
+| 日志 | `logger_setup.py` | `logger` | 全局 logger 实例 |
+
+**禁止**：其他层禁止 import `config.py` 中的 deprecated 全局变量（`SOURCE_DRIVE`、`THUMBNAIL_DIR` 等），统一使用 `get_settings().xxx`。现有 deprecated 变量按第 12 节计划逐步清理。
+
+**已知层反转**：`config.py` 的 `save_config()` 和 `reload_config()` 内部引用了 `infra.llm.client.LLMClient.reset()`。这是 Core → Infra 的违规，待后续重构时将 reset 逻辑改为事件/回调模式消除。
+
+### 11.2 基础设施层对外接口
+
+业务层和服务层可调用。UI 层禁止直接调用（必须通过业务层或服务层间接使用）。
+
+| 接口 | 模块 | 函数/类 | 说明 |
+|------|------|----------|------|
+| LLM 客户端 | `infra/llm/client.py` | `get_llm_client() → LLMClient` | OpenAI 兼容客户端，自动重试 |
+| 缩略图加载 | `infra/image/thumbnail_loader.py` | `get_thumbnail_loader() → ThumbnailLoader` | 缩略图 LRU 缓存加载 |
+| CLIP 编码 | `infra/image/clip_encoder.py` | `encode_images(file_ids) → list[ndarray]` | SigLIP 图像嵌入提取 |
+| 人脸检测 | `infra/image/face_detector.py` | `extract_embeddings_batch(file_ids) → list` | DeepFace 人脸特征提取 |
+| 目标检测 | `infra/image/object_detector.py` | `detect_objects(file_id) → list[dict]` | LibreYOLO ONNX 目标检测 |
+| Files 仓库 | `infra/db/repositories/files_repo.py` | `FilesRepository` | files 表 CRUD |
+| Metadata 仓库 | `infra/db/repositories/photo_metadata_repo.py` | `PhotoMetadataRepository` | photo_metadata 表 CRUD |
+| Memories 仓库 | `infra/db/repositories/memories_repo.py` | `MemoriesRepository` | memories 表 CRUD |
+| Tags 仓库 | `infra/db/repositories/photo_tags_repo.py` | `PhotoTagsRepository` | photo_tags 表 CRUD |
+| FaceEmbeddings 仓库 | `infra/db/repositories/face_embeddings_repo.py` | `FaceEmbeddingsRepository` | face_embeddings 表 CRUD |
+| Events 仓库 | `infra/db/repositories/events_repo.py` | `EventsRepository` | events 表 CRUD |
+| ClickHistory 仓库 | `infra/db/repositories/click_history_repo.py` | `ClickHistoryRepository` | click_history 表 CRUD |
+
+### 11.3 业务层对外接口
+
+服务层和 UI 层可调用。
+
+| 接口 | 模块 | 函数 | 说明 |
+|------|------|------|------|
+| 全量扫描 | `business/scanner/fast_scan.py` | `full_scan(progress_callback, batch_limit) → dict` | 磁盘文件发现与入库 |
+| 扫描控制 | `business/scanner/fast_scan.py` | `clear_checkpoint() / set_paused() / set_stopped()` | 断点管理 |
+| 文件夹分类 | `business/classifier/folder_classifier.py` | `classify_folders() → dict` | 关键词+LLM 分类 |
+| 精分类 | `business/classifier/folder_classifier.py` | `refine_sample_keywords() → dict` | 后台 5 级优先级精分类 |
+| 照片索引 | `business/indexer/photo_indexer.py` | `index_photos(progress_callback, batch_limit) → dict` | EXIF/缩略图/phash 入库 |
+| 索引控制 | `business/indexer/photo_indexer.py` | `clear_checkpoint() / set_paused() / set_stopped()` | 断点管理 |
+| 去重 | `business/indexer/photo_indexer.py` | `dedup_by_phash(progress_callback) → dict` | 感知哈希去重 |
+| 标签生成 | `business/image_recognition/tag_generator.py` | `generate_tags_for_image(file_id) → list[str]` | SigLIP 图像标签 |
+| 人脸聚类 | `business/image_recognition/face_cluster.py` | `cluster_faces(embeddings) → dict` | 人脸向量聚类 |
+| 场景聚类 | `business/image_recognition/scene_cluster.py` | `cluster_by_scene(file_ids) → list` | CLIP 场景聚类 |
+| 那年今日 | `business/memory/memory_discovery.py` | `discover_on_this_day(category) → list` | 按月日匹配历史照片 |
+| 近期回忆 | `business/memory/memory_discovery.py` | `discover_recent_memories(category) → list` | 近 N 天照片 |
+| 回忆查询 | `business/memory/memory_discovery.py` | `get_on_this_day_memories(category) → list` | 查询已生成的回忆 |
+| 回忆推理 | `business/memory/memory_reasoning.py` | `record_dismissal(memory_id, reasoning) / get_negative_hints() → list` | 碎裂反馈与负面提示 |
+| LLM 回忆 | `memory/memory_generator.py` | `generate_all_memories() → list` | DeepSeek 标题/描述生成 |
+
+### 11.4 服务层对外接口
+
+UI 层可调用。
+
+| 接口 | 模块 | 函数/类 | 说明 |
+|------|------|----------|------|
+| 后台流水线 | `services/background_task_manager.py` | `BackgroundTaskManager` 类 | Stage 模式后台任务管理 |
+| 流水线阶段 | `services/background_task_manager.py` | `Pipeline`, `ScanStage`, `ClassifyStage`, `IndexStage` | 各阶段定义 |
+
+### 11.5 UI 层对外接口
+
+UI 层不对外暴露接口，仅作为应用入口。
+
+### 11.6 接口变更规则
+
+- 新增接口：在对应层的接口表中登记后即可使用
+- 删除接口：需确认无调用方后方可移除，并在架构变更审核中说明
+- 修改接口签名：属于架构变更，需走审核流程
+
+## 12. 技术债与清理计划
+
+### 12.1 死代码清单
+
+以下模块/函数经审计确认为 0 引用，标记为待清理。在清理前功能不受影响，但禁止新增对这些死代码的调用。
+
+| 文件 | 死代码 | 类型 | 估计行数 |
+|------|--------|------|----------|
+| `services/data_service.py` | 整文件（`DataService`, `get_data_service`） | 整文件 | 41 |
+| `services/recognition_scheduler.py` | 整文件（4 阶段调度逻辑已并入 background_task_manager） | 整文件 | 279 |
+| `business/memory/event_detector.py` | 整文件（`detect_events`, `get_events`） | 整文件 | 130 |
+| `business/memory/memory_narrator.py` | 整文件（`narrate_memory`） | 整文件 | ~50 |
+| `infra/fs/everything.py` | 整文件（`is_available`, `search_images`） | 整文件 | 24 |
+| `infra/db/repositories/folder_categories_repo.py` | 整文件（`FolderCategoriesRepository`） | 整文件 | ~30 |
+| `infra/db/repositories/task_checkpoints_repo.py` | 整文件（`TaskCheckpointsRepository`） | 整文件 | ~30 |
+| `memory/memory_generator.py` | `star_memory()`, `unstar_memory()`, `get_memories()`, `get_photo_thumbnails()` | 4 函数 | ~60 |
+| `business/memory/memory_discovery.py` | `discover_person_memories()`, `discover_event_memories()`, `discover_scene_memories()` | 3 函数 | ~90 |
+
+**总计约 700+ 行**，清理时直接删除文件/函数，不影响现有功能。
+
+### 12.2 Deprecated 全局变量迁移计划
+
+`config.py` 中的 deprecated 全局变量应逐步迁移到 `get_settings()` 调用。迁移完成后可移除 `_sync_module_vars_from_settings()` 和所有 deprecated 变量。
+
+| 全局变量 | 实际调用方 | 迁移动作 | 优先级 |
+|----------|-----------|----------|--------|
+| `DEEPSEEK_API_KEY` | 无（3处死导入） | 直接删除导入 | 高 |
+| `DEEPSEEK_BASE_URL` | 无（3处死导入） | 直接删除导入 | 高 |
+| `DEEPSEEK_MODEL` | `memory_generator.py:156` (1处) | 改为 `get_settings().deepseek_model` | 中 |
+| `DEEPSEEK_CLASSIFY_MODEL` | `folder_classifier.py:350`, `memory_narrator.py:31,60` | 改为 `get_settings().deepseek_classify_model` | 中 |
+| `SOURCE_DRIVE` | `folder_classifier.py:246,686`, `fast_scan.py` (9处) | 改为 `get_settings().source_drive` | 低（改动多） |
+| `SOURCE_DIRS` | `fast_scan.py` (10处) | 改为 `get_settings().source_dirs` | 低（改动多） |
+| `DATA_DIR` | `fast_scan.py:125,153,181,193` | 改为 `get_settings().photo_data_dir` | 低 |
+| `DB_PATH` | 无（1处死导入 `recommendation.py`） | 直接删除导入 | 高 |
+| `THUMBNAIL_DIR` | `photo_indexer.py`, `object_detector.py`, `thumbnail_loader.py`, `person_detail.py` | 改为 `get_settings().thumbnail_dir` | 低（4文件） |
+| `CLASSIFICATION_HISTORY_FILE` | `folder_classifier.py:307,310,315,316` | 改为 `get_settings().classification_history_file` | 低 |
+
+### 12.3 已知层反转
+
+| 来源 | 目标 | 说明 | 修复方向 |
+|------|------|------|----------|
+| `config.py` (Core) | `infra.llm.client.LLMClient` (Infra) | `save_config()` / `reload_config()` 调用 `LLMClient.reset()` | 改为事件/回调模式，由 Infra 层自行监听配置变更 |
+
+### 12.4 数据访问不一致
+
+| 问题 | 涉及模块 | 改进方向 |
+|------|----------|----------|
+| 业务层一半用 Repository 模式，一半用 raw SQL | `fast_scan.py`, `folder_classifier.py`, `photo_indexer.py`, `memory_generator.py` 用 raw SQL；`face_cluster.py`, `event_detector.py`, `memory_discovery.py`, `memory_reasoning.py` 用 Repository | 逐步迁移至 Repository 模式，新代码必须用 Repository |
+| UI 层直接实例化 Database 和 Repository | `ui/app.py` | 逐步改为通过业务层接口间接访问 |
+| `db_manager.py` 存在重复方法 | `_create_v03_new_tables` vs `_create_v03_new_tables_stmt` | 合并为一个方法 |
+
+### 12.5 待补充依赖
+
+| 依赖 | 说明 | 优先级 |
+|------|------|--------|
+| `open-clip-torch` | 代码已实现，缺 requirements.txt | 中 |
+| `deepface` | 代码已实现，缺 requirements.txt | 中 |

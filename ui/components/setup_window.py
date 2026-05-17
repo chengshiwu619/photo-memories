@@ -10,7 +10,6 @@ from PyQt6.QtGui import QFont
 
 from logger_setup import logger
 from config import (
-    SOURCE_DRIVE, DATA_DIR, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL,
     save_config, get_settings,
 )
 

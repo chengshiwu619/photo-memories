@@ -24,7 +24,7 @@ from ui.components.image_viewer import ImageViewer
 from ui.components.sidebar import Sidebar
 from ui.components.timeline_view import TimelineView
 from ui.components.special_memories import SpecialMemoriesView
-from ui.recommendation import rank_category_photos, load_starred_photos
+from ui.recommendation import rank_category_photos, load_starred_photos, reshuffle_photos
 from ui.recommendation import CATEGORY_COLORS, PAGE_SIZE, record_shown_photos
 
 
@@ -54,6 +54,7 @@ class MainWindow(QMainWindow):
         self._cat_photos = {}
         self._cat_offsets = {}
         self._cat_all_loaded = {}
+        self._cat_shown_ids = {}
         self._folder_viewer_photos = []
         self._folder_view_counts = {}
         self._suppressed_folders = set()
@@ -306,6 +307,7 @@ class MainWindow(QMainWindow):
         self._folder_view_counts.clear()
         self._cat_offsets = {}
         self._cat_all_loaded = {}
+        self._cat_shown_ids = {}
 
         for cat_id, _ in CATEGORIES:
             memories_repo = MemoriesRepository(Database())
@@ -324,6 +326,7 @@ class MainWindow(QMainWindow):
 
         self._cat_offsets[cat_id] = 0
         self._cat_all_loaded[cat_id] = False
+        self._cat_shown_ids[cat_id] = set()
 
         if self.starred_only:
             all_photos = load_starred_photos(self.db, cat_id)
@@ -334,6 +337,7 @@ class MainWindow(QMainWindow):
 
         first_page = all_photos[:PAGE_SIZE]
         self._cat_offsets[cat_id] = len(first_page)
+        self._cat_shown_ids[cat_id].update(p["id"] for p in first_page)
         self._cat_all_loaded[cat_id] = len(first_page) >= len(all_photos)
 
         record_shown_photos(self.db, first_page, cat_id)
@@ -345,21 +349,28 @@ class MainWindow(QMainWindow):
             self.pages[index].load_photos(first_page)
 
     def _on_load_more(self, cat_id):
-        if self._cat_all_loaded.get(cat_id, False):
-            return
         page_index = next(i for i, (c, _) in enumerate(CATEGORIES) if c == cat_id)
         offset = self._cat_offsets.get(cat_id, 0)
         all_photos = self._cat_photos.get(cat_id, [])
 
-        next_page = all_photos[offset:offset + PAGE_SIZE]
-        if not next_page:
-            self._cat_all_loaded[cat_id] = True
-            return
+        if self._cat_all_loaded.get(cat_id, False):
+            # 已全部加载过，执行洗牌：已显示照片降权
+            reshuffled = reshuffle_photos(all_photos, self._cat_shown_ids.get(cat_id))
+            self._cat_photos[cat_id] = reshuffled
+            self._cat_offsets[cat_id] = 0
+            self._cat_all_loaded[cat_id] = False
+            next_page = reshuffled[:PAGE_SIZE]
+        else:
+            next_page = all_photos[offset:offset + PAGE_SIZE]
+            if not next_page:
+                self._cat_all_loaded[cat_id] = True
+                return
 
-        self._cat_offsets[cat_id] = offset + len(next_page)
-        if self._cat_offsets[cat_id] >= len(all_photos):
+        self._cat_offsets[cat_id] = offset + len(next_page) if not self._cat_all_loaded.get(cat_id, False) else len(next_page)
+        if self._cat_offsets[cat_id] >= len(all_photos) and not self._cat_all_loaded.get(cat_id, False):
             self._cat_all_loaded[cat_id] = True
 
+        self._cat_shown_ids.setdefault(cat_id, set()).update(p["id"] for p in next_page)
         record_shown_photos(self.db, next_page, cat_id)
         self.pages[page_index].append_photos(next_page)
 

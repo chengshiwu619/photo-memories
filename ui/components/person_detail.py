@@ -155,12 +155,13 @@ class PersonDetailView(QWidget):
                 w.setParent(None)
 
         import os
-        from config import THUMBNAIL_DIR
+        from config import get_settings
 
         cols = 6
+        _thumb_dir = get_settings().thumbnail_dir
         for i, fid in enumerate(file_ids):
             thumb = FaceThumbnail(fid)
-            thumb_path = os.path.join(THUMBNAIL_DIR, f"{fid}.jpg")
+            thumb_path = os.path.join(_thumb_dir, f"{fid}.jpg")
             if os.path.exists(thumb_path):
                 pm = QPixmap(thumb_path)
                 if not pm.isNull():

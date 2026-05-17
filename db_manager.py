@@ -160,55 +160,6 @@ class Database:
             );
         """)
 
-    def _create_v03_new_tables_stmt(self, conn):
-        conn.execute("""CREATE TABLE IF NOT EXISTS face_clusters (
-                cluster_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                person_name TEXT DEFAULT '',
-                user_corrected INTEGER DEFAULT 0,
-                representative_face INTEGER,
-                created_at TEXT DEFAULT (datetime('now'))
-            )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS face_embeddings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_id INTEGER NOT NULL,
-                embedding BLOB NOT NULL,
-                cluster_id INTEGER,
-                FOREIGN KEY (file_id) REFERENCES files(id),
-                FOREIGN KEY (cluster_id) REFERENCES face_clusters(cluster_id)
-            )""")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_fe_file ON face_embeddings(file_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_fe_cluster ON face_embeddings(cluster_id)")
-        conn.execute("""CREATE TABLE IF NOT EXISTS events (
-                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                start_date TEXT NOT NULL,
-                end_date TEXT NOT NULL,
-                gps_cluster TEXT,
-                location_name TEXT,
-                photo_ids TEXT NOT NULL,
-                event_type TEXT DEFAULT 'event'
-            )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS memory_reasoning (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                memory_id INTEGER NOT NULL,
-                reasoning TEXT,
-                feedback_type TEXT,
-                created_at TEXT DEFAULT (datetime('now')),
-                FOREIGN KEY (memory_id) REFERENCES memories(id)
-            )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS migration_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                version_from TEXT NOT NULL,
-                version_to TEXT NOT NULL,
-                migrated_at TEXT DEFAULT (datetime('now'))
-            )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS task_checkpoints (
-                task_type TEXT NOT NULL,
-                task_key TEXT NOT NULL,
-                status_json TEXT,
-                updated_at TEXT DEFAULT (datetime('now')),
-                PRIMARY KEY (task_type, task_key)
-            )""")
-
     def _create_all_tables(self, conn):
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS files (
@@ -382,7 +333,7 @@ class Database:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_file ON photo_tags(file_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_source ON photo_tags(source)")
 
-        self._create_v03_new_tables_stmt(conn)
+        self._create_v03_new_tables(conn)
 
         conn.execute(
             "INSERT INTO migration_log (version_from, version_to) VALUES (?, ?)",

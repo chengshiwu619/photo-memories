@@ -53,22 +53,6 @@ def get_settings() -> Settings:
     return _settings
 
 
-def _sync_module_vars_from_settings():
-    global DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, DEEPSEEK_CLASSIFY_MODEL
-    global SOURCE_DRIVE, SOURCE_DIRS, DATA_DIR, DB_PATH, THUMBNAIL_DIR, CLASSIFICATION_HISTORY_FILE
-    s = get_settings()
-    DEEPSEEK_API_KEY = s.deepseek_api_key  # deprecated: use get_settings().deepseek_api_key
-    DEEPSEEK_BASE_URL = s.deepseek_base_url  # deprecated
-    DEEPSEEK_MODEL = s.deepseek_model  # deprecated
-    DEEPSEEK_CLASSIFY_MODEL = s.deepseek_classify_model  # deprecated
-    SOURCE_DRIVE = s.source_drive  # deprecated
-    SOURCE_DIRS = s.source_dirs  # deprecated
-    DATA_DIR = s.photo_data_dir  # deprecated
-    DB_PATH = s.db_path  # deprecated
-    THUMBNAIL_DIR = s.thumbnail_dir  # deprecated
-    CLASSIFICATION_HISTORY_FILE = s.classification_history_file  # deprecated
-
-
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif", ".heic", ".heif"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".m4v", ".3gp"}
 THUMBNAIL_SIZE = (400, 400)
@@ -104,7 +88,6 @@ def save_config(source_drive, data_dir, api_key, base_url="https://api.deepseek.
 
     global _settings
     _settings = Settings()
-    _sync_module_vars_from_settings()
 
     s = get_settings()
     os.makedirs(s.photo_data_dir, exist_ok=True)
@@ -119,7 +102,6 @@ def reload_config():
 
     load_dotenv(ENV_FILE, override=True)
     _settings = Settings()
-    _sync_module_vars_from_settings()
 
     s = get_settings()
     os.makedirs(s.photo_data_dir, exist_ok=True)
@@ -129,7 +111,6 @@ def reload_config():
     LLMClient.reset()
 
 
-_sync_module_vars_from_settings()
 _s = get_settings()
 os.makedirs(_s.photo_data_dir, exist_ok=True)
 os.makedirs(_s.thumbnail_dir, exist_ok=True)

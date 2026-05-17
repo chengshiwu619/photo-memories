@@ -5,9 +5,7 @@ from datetime import datetime, timedelta
 
 from logger_setup import logger
 from config import (
-    DEEPSEEK_API_KEY,
-    DEEPSEEK_BASE_URL,
-    DEEPSEEK_MODEL,
+    get_settings,
     CATEGORY_LIFE,
     CATEGORY_SAMPLE,
     CATEGORY_NAMES,
@@ -153,7 +151,7 @@ def generate_memories_for_category(category):
 
     try:
         response = llm.chat(
-            model=DEEPSEEK_MODEL,
+            model=get_settings().deepseek_model,
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             temperature=temp,
@@ -203,68 +201,6 @@ def generate_all_memories(progress_callback=None):
             progress_callback(i + 1, len(MEMORY_CATEGORIES), CATEGORY_NAMES[cat], "done")
         results.append(r)
     return results
-
-
-def star_memory(memory_id):
-    with _db.connect() as conn:
-        conn.execute("UPDATE memories SET is_starred = 1 WHERE id = ?", (memory_id,))
-
-
-def unstar_memory(memory_id):
-    with _db.connect() as conn:
-        conn.execute("UPDATE memories SET is_starred = 0 WHERE id = ?", (memory_id,))
-
-
-def get_memories(category=None, starred_only=False):
-    with _db.connect() as conn:
-        query = "SELECT id, category, memory_type, title, description, photo_ids, cover_file_id, is_starred, created_at FROM memories WHERE 1=1"
-        params = []
-        if category:
-            query += " AND category = ?"
-            params.append(category)
-        if starred_only:
-            query += " AND is_starred = 1"
-        query += " ORDER BY created_at DESC"
-        rows = conn.execute(query, params).fetchall()
-
-    return [
-        {
-            "id": r[0],
-            "category": r[1],
-            "category_name": CATEGORY_NAMES.get(r[1], "未知"),
-            "memory_type": r[2],
-            "title": r[3],
-            "description": r[4],
-            "photo_ids": json.loads(r[5]) if r[5] else [],
-            "cover_file_id": r[6],
-            "is_starred": bool(r[7]),
-            "created_at": r[8],
-        }
-        for r in rows
-    ]
-
-
-def get_photo_thumbnails(photo_ids):
-    if not photo_ids:
-        return []
-
-    with _db.connect() as conn:
-        placeholders = ",".join("?" * len(photo_ids))
-        rows = conn.execute(
-            f"SELECT f.id, f.file_path, f.file_name, f.folder_path, pm.thumbnail_path FROM files f LEFT JOIN photo_metadata pm ON f.id = pm.file_id WHERE f.id IN ({placeholders})",
-            photo_ids,
-        ).fetchall()
-
-    return [
-        {
-            "id": r[0],
-            "file_path": r[1],
-            "file_name": r[2],
-            "folder_path": r[3],
-            "thumbnail_path": r[4],
-        }
-        for r in rows
-    ]
 
 
 if __name__ == "__main__":

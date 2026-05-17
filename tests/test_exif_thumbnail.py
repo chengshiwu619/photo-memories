@@ -35,6 +35,7 @@ def test_extract_exif_file_not_found():
 
 def test_generate_thumbnail_creates_file():
     from business.indexer.photo_indexer import generate_thumbnail
+    from unittest.mock import patch
     tmp = tempfile.mkdtemp()
     try:
         src = os.path.join(tmp, "src.jpg")
@@ -43,20 +44,22 @@ def test_generate_thumbnail_creates_file():
         os.makedirs(thumb_dir, exist_ok=True)
 
         import config
-        orig = config.THUMBNAIL_DIR
-        config.THUMBNAIL_DIR = thumb_dir
-        try:
-            thumb_path, w, h = generate_thumbnail(src, "1.jpg")
-            assert thumb_path is not None
-            assert os.path.exists(thumb_path)
-        finally:
-            config.THUMBNAIL_DIR = orig
+        fake_settings = config.get_settings()
+        with patch("business.indexer.photo_indexer.get_settings", return_value=fake_settings):
+            fake_settings.__dict__["thumbnail_dir"] = thumb_dir
+            try:
+                thumb_path, w, h = generate_thumbnail(src, "1.jpg")
+                assert thumb_path is not None
+                assert os.path.exists(thumb_path)
+            finally:
+                pass
     finally:
         shutil.rmtree(tmp)
 
 
 def test_generate_thumbnail_skips_existing():
     from business.indexer.photo_indexer import generate_thumbnail
+    from unittest.mock import patch
     tmp = tempfile.mkdtemp()
     try:
         src = os.path.join(tmp, "src.jpg")
@@ -65,22 +68,24 @@ def test_generate_thumbnail_skips_existing():
         os.makedirs(thumb_dir, exist_ok=True)
 
         import config
-        orig = config.THUMBNAIL_DIR
-        config.THUMBNAIL_DIR = thumb_dir
-        try:
-            thumb_path1, w1, h1 = generate_thumbnail(src, "2.jpg")
-            assert thumb_path1 is not None
-            thumb_path2, w2, h2 = generate_thumbnail(src, "2.jpg")
-            assert w2 is None
-            assert h2 is None
-        finally:
-            config.THUMBNAIL_DIR = orig
+        fake_settings = config.get_settings()
+        with patch("business.indexer.photo_indexer.get_settings", return_value=fake_settings):
+            fake_settings.__dict__["thumbnail_dir"] = thumb_dir
+            try:
+                thumb_path1, w1, h1 = generate_thumbnail(src, "2.jpg")
+                assert thumb_path1 is not None
+                thumb_path2, w2, h2 = generate_thumbnail(src, "2.jpg")
+                assert w2 is None
+                assert h2 is None
+            finally:
+                pass
     finally:
         shutil.rmtree(tmp)
 
 
 def test_generate_thumbnail_respects_max_size():
     from business.indexer.photo_indexer import generate_thumbnail
+    from unittest.mock import patch
     tmp = tempfile.mkdtemp()
     try:
         src = os.path.join(tmp, "big.jpg")
@@ -89,15 +94,16 @@ def test_generate_thumbnail_respects_max_size():
         os.makedirs(thumb_dir, exist_ok=True)
 
         import config
-        orig = config.THUMBNAIL_DIR
-        config.THUMBNAIL_DIR = thumb_dir
-        try:
-            thumb_path, w, h = generate_thumbnail(src, "3.jpg")
-            thumb_img = Image.open(thumb_path)
-            assert thumb_img.width <= 400
-            assert thumb_img.height <= 400
-        finally:
-            config.THUMBNAIL_DIR = orig
+        fake_settings = config.get_settings()
+        with patch("business.indexer.photo_indexer.get_settings", return_value=fake_settings):
+            fake_settings.__dict__["thumbnail_dir"] = thumb_dir
+            try:
+                thumb_path, w, h = generate_thumbnail(src, "3.jpg")
+                thumb_img = Image.open(thumb_path)
+                assert thumb_img.width <= 400
+                assert thumb_img.height <= 400
+            finally:
+                pass
     finally:
         shutil.rmtree(tmp)
 

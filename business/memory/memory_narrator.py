@@ -6,7 +6,7 @@ from db_manager import Database
 from infra.llm.client import get_llm_client
 from infra.db.repositories.events_repo import EventsRepository
 from infra.db.repositories.memories_repo import MemoriesRepository
-import config
+from config import get_settings
 
 
 def narrate_event(event_id: int) -> Optional[str]:
@@ -28,7 +28,7 @@ def narrate_event(event_id: int) -> Optional[str]:
     try:
         client = get_llm_client()
         response = client.chat.completions.create(
-            model=config.DEEPSEEK_CLASSIFY_MODEL,
+            model=get_settings().deepseek_classify_model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
             temperature=0.7,
@@ -57,7 +57,7 @@ def narrate_memory(memory_id: int) -> Optional[str]:
     try:
         client = get_llm_client()
         response = client.chat.completions.create(
-            model=config.DEEPSEEK_CLASSIFY_MODEL,
+            model=get_settings().deepseek_classify_model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
             temperature=0.7,
