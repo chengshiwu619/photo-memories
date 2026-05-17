@@ -343,7 +343,15 @@ class SpecialMemoriesView(QWidget):
         self._layout = QVBoxLayout(self._container)
         self._layout.setContentsMargins(24, 16, 24, 16)
         self._layout.setSpacing(8)
-        self._layout.addStretch()
+        self._bottom_spacer = QWidget()
+        self._bottom_spacer.setFixedHeight(0)
+        self._layout.addWidget(self._bottom_spacer)
+
+        self._end_label = QLabel("—— 已展示全部回忆 ——")
+        self._end_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._end_label.setStyleSheet("color: #555; font-size: 12px; padding: 12px 0 24px 0;")
+        self._end_label.hide()
+        self._layout.addWidget(self._end_label)
 
         self._scroll.setWidget(self._container)
         outer.addWidget(self._scroll)
@@ -398,6 +406,12 @@ class SpecialMemoriesView(QWidget):
                 self._stacks.append(stack)
 
                 QTimer.singleShot(0, lambda s=stack, mem=m: self._load_stack_photos(s, mem))
+
+        # 底部留白，确保用户可以滚动到最后一项到屏幕中间
+        viewport_h = self._scroll.viewport().height() if self._scroll.viewport() else 400
+        spacer_h = max(200, int(viewport_h * 0.5))
+        self._bottom_spacer.setFixedHeight(spacer_h)
+        self._end_label.show()
 
     def _load_stack_photos(self, stack, memory):
         from db_manager import Database

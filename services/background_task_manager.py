@@ -53,21 +53,21 @@ class IndexStage(Stage):
         self._batch_limit = batch_limit
 
     def run(self, progress_callback=None) -> dict:
-        import os
-        from business.indexer.photo_indexer import index_photos, clear_checkpoint
+        from business.indexer.photo_indexer import clear_checkpoint
         clear_checkpoint()
-        try:
-            from db_manager import Database
-            db = Database()
-            with db.connect() as conn:
-                n = conn.execute(
-                    "SELECT COUNT(*) FROM photo_metadata WHERE thumbnail_path IS NOT NULL AND thumbnail_path != '__FAILED__'"
-                ).fetchone()[0]
-            if n >= 100:
-                return {"total": 0, "indexed": 0, "batch_limit_reached": True}
-        except Exception:
-            pass
-        return index_photos(progress_callback=progress_callback, batch_limit=self._batch_limit)
+        from db_manager import Database
+        db = Database()
+        with db.connect() as conn:
+            n = conn.execute("""
+                SELECT COUNT(*) FROM files f
+                LEFT JOIN photo_metadata pm ON f.id = pm.file_id
+                WHERE f.is_image = 1
+                  AND (pm.file_id IS NULL OR pm.thumbnail_path IS NULL OR pm.thumbnail_path = '__FAILED__')
+            """).fetchone()[0]
+        if n > 0:
+            logger.info(f"检测到 {n} 张待索引照片，全部交给后台线程处理")
+        # 不在启动流水线中阻塞生成缩略图，全部交给后台 BgIndexWorker
+        return {"total": n, "indexed": 0, "batch_limit_reached": n > 0}
 
 
 class MemoryStage(Stage):

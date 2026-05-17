@@ -269,6 +269,192 @@ def discover_folder_memories(top_n: int = 5) -> List[Memory]:
     return memories
 
 
+def discover_person_memories(threshold: int = 3) -> List[Memory]:
+    """发现人物回忆：基于人脸聚类生成每人物的回忆卡片"""
+    from infra.db.repositories.face_clusters_repo import FaceClustersRepository
+    from infra.db.repositories.face_embeddings_repo import FaceEmbeddingsRepository
+
+    db = Database()
+    clusters_repo = FaceClustersRepository(db)
+    embeddings_repo = FaceEmbeddingsRepository(db)
+    memories_repo = MemoriesRepository(db)
+
+    clusters = clusters_repo.get_all()
+    if not clusters:
+        return []
+
+    memories = []
+    for cluster in clusters:
+        file_ids = embeddings_repo.get_file_ids_by_cluster(cluster.cluster_id)
+        if not file_ids or len(file_ids) < threshold:
+            continue
+
+        # 检查是否已存在
+        existing = _find_existing_memory(memories_repo, "person", str(cluster.cluster_id))
+        if existing:
+            continue
+
+        person_name = cluster.person_name or f"人物 {cluster.cluster_id}"
+        photo_ids = file_ids[:20]  # 限制 20 张
+
+        m = Memory(
+            category=1,  # 默认分类
+            memory_type="person",
+            title=person_name,
+            photo_ids=json.dumps(photo_ids),
+            cover_file_id=photo_ids[0],
+            payload=json.dumps({"cluster_id": cluster.cluster_id}),
+        )
+        mid = memories_repo.insert(m)
+        m.id = mid
+        memories.append(m)
+        logger.info(f"人物回忆: {person_name}, {len(photo_ids)} 张")
+
+    logger.info(f"人物回忆发现 {len(memories)} 组")
+    return memories
+
+
+def discover_scene_memories(threshold: int = 5) -> List[Memory]:
+    """发现场景回忆：基于 SigLIP 标签聚合生成场景回忆"""
+    from infra.db.repositories.photo_tags_repo import PhotoTagsRepository
+
+    db = Database()
+    tags_repo = PhotoTagsRepository(db)
+    memories_repo = MemoriesRepository(db)
+
+    # 获取所有 siglip 标签及其关联的照片
+    with db.connect() as conn:
+        rows = conn.execute("""
+            SELECT tag, COUNT(*) as cnt, GROUP_CONCAT(file_id) as file_ids
+            FROM photo_tags
+            WHERE source = 'siglip'
+            GROUP BY tag
+            HAVING cnt >= ?
+            ORDER BY cnt DESC
+            LIMIT 20
+        """, (threshold,)).fetchall()
+
+    if not rows:
+        return []
+
+    memories = []
+    for tag, cnt, file_ids_str in rows:
+        if not file_ids_str:
+            continue
+        file_ids = [int(x) for x in file_ids_str.split(",")]
+        if len(file_ids) < threshold:
+            continue
+
+        existing = _find_existing_memory(memories_repo, "scene", str(tag))
+        if existing:
+            continue
+
+        title = f"场景: {tag}"
+        photo_ids = file_ids[:20]
+
+        m = Memory(
+            category=1,
+            memory_type="scene",
+            title=title,
+            photo_ids=json.dumps(photo_ids),
+            cover_file_id=photo_ids[0],
+            payload=json.dumps({"scene_tag": tag, "count": cnt}),
+        )
+        mid = memories_repo.insert(m)
+        m.id = mid
+        memories.append(m)
+        logger.info(f"场景回忆: {tag}, {len(photo_ids)} 张")
+
+    logger.info(f"场景回忆发现 {len(memories)} 组")
+    return memories
+
+
+def discover_event_memories(threshold: int = 5, gps_delta: float = 0.01) -> List[Memory]:
+    """发现事件回忆：基于 GPS 坐标 + 时间断裂聚合同地点事件"""
+    db = Database()
+    memories_repo = MemoriesRepository(db)
+
+    # 获取有 GPS 的照片，按时间排序
+    with db.connect() as conn:
+        rows = conn.execute("""
+            SELECT pm.file_id, pm.date_taken, pm.gps_lat, pm.gps_lon
+            FROM photo_metadata pm
+            WHERE pm.gps_lat IS NOT NULL AND pm.gps_lon IS NOT NULL
+              AND pm.date_taken IS NOT NULL
+              AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
+            ORDER BY pm.date_taken ASC
+        """).fetchall()
+
+    if not rows:
+        return []
+
+    # 按 GPS 聚类
+    events = {}  # (lat_round, lon_round) -> list of (file_id, date_taken)
+    for file_id, date_taken, lat, lon in rows:
+        lat_r = round(lat / gps_delta) * gps_delta
+        lon_r = round(lon / gps_delta) * gps_delta
+        key = (lat_r, lon_r)
+        if key not in events:
+            events[key] = []
+        events[key].append((file_id, date_taken))
+
+    memories = []
+    for (lat_r, lon_r), photos in events.items():
+        if len(photos) < threshold:
+            continue
+
+        # 检查时间跨度
+        dates = [p[1][:10] for p in photos]
+        unique_dates = sorted(set(dates))
+        if len(unique_dates) < 1:
+            continue
+
+        # 检查是否已存在
+        location_key = f"{lat_r},{lon_r}"
+        existing = _find_existing_memory(memories_repo, "event", location_key)
+        if existing:
+            continue
+
+        file_ids = [p[0] for p in photos[:20]]
+        start_date = min(dates)
+        end_date = max(dates)
+
+        # 判断是否为 trip（跨多天且 ≥3天）
+        from datetime import datetime
+        try:
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+            days_diff = (end_dt - start_dt).days
+            event_type = "trip" if days_diff >= 3 else "event"
+        except:
+            event_type = "event"
+
+        title = f"{start_date[:7]} 回忆" if event_type == "event" else f"{start_date[:7]} 旅行"
+        if len(unique_dates) > 1:
+            title += f" ({len(unique_dates)}天)"
+
+        m = Memory(
+            category=1,
+            memory_type="event",
+            title=title,
+            photo_ids=json.dumps(file_ids),
+            cover_file_id=file_ids[0],
+            payload=json.dumps({
+                "event_type": event_type,
+                "gps_cluster": location_key,
+                "start_date": start_date,
+                "end_date": end_date,
+            }),
+        )
+        mid = memories_repo.insert(m)
+        m.id = mid
+        memories.append(m)
+        logger.info(f"事件回忆: {title}, {len(file_ids)} 张, 类型={event_type}")
+
+    logger.info(f"事件回忆发现 {len(memories)} 组")
+    return memories
+
+
 def _find_existing_memory(memories_repo: MemoriesRepository, memory_type: str, payload_key: str) -> Optional[int]:
     rows = memories_repo.find_by_type_and_payload_key(memory_type)
 

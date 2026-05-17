@@ -90,6 +90,7 @@ class MainWindow(QMainWindow):
         self._timeline_refresh_timer.setInterval(30000)
         self._timeline_refresh_timer.timeout.connect(self._refresh_timeline_incremental)
 
+        self._check_file_id_integrity()
         self.load_memories()
 
     def closeEvent(self, event):
@@ -102,6 +103,34 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.warning(f"关闭持久连接时出错: {e}")
         super().closeEvent(event)
+
+    def _check_file_id_integrity(self):
+        """启动时检查 memories 表的 file_id 悬空引用，自动清理过期记录"""
+        try:
+            rows = self.db.execute("""
+                SELECT m.id
+                FROM memories m, json_each(m.photo_ids) j
+                LEFT JOIN photo_metadata pm ON pm.file_id = j.value
+                WHERE m.dismissed_at IS NULL AND m.photo_ids LIKE '[%'
+                GROUP BY m.id
+                HAVING SUM(CASE WHEN pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__' THEN 1 ELSE 0 END) < COUNT(*)
+            """).fetchall()
+
+            if not rows:
+                return
+
+            stale_ids = [r["id"] for r in rows]
+            logger.warning(f"启动检查发现 {len(stale_ids)} 条 memories 记录存在悬空 file_id 引用，将自动清理")
+
+            with Database().connect() as conn:
+                placeholders = ",".join("?" * len(stale_ids))
+                conn.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", stale_ids)
+
+            logger.info(f"已清理 {len(stale_ids)} 条过期 memories 记录，特殊回忆将在下次切换时重新加载")
+            self._special_loaded = False
+
+        except Exception as e:
+            logger.warning(f"启动时 file_id 完整性检查失败: {e}")
 
     def setup_ui(self):
         central = QWidget()
@@ -320,7 +349,14 @@ class MainWindow(QMainWindow):
             logger.warning(f"时间线增量刷新失败: {e}")
 
     def _load_special_memories(self):
-        from business.memory.memory_discovery import get_on_this_day_memories, discover_special_date_memories, discover_folder_memories
+        from business.memory.memory_discovery import (
+            get_on_this_day_memories,
+            discover_special_date_memories,
+            discover_folder_memories,
+            discover_person_memories,
+            discover_scene_memories,
+            discover_event_memories,
+        )
         from infra.db.repositories.memories_repo import MemoriesRepository
 
         repo = MemoriesRepository(Database())
@@ -340,6 +376,28 @@ class MainWindow(QMainWindow):
         if len(combined) < 3:
             folder = discover_folder_memories(top_n=2)
             for m in folder:
+                if m.id not in existing_ids:
+                    combined.append(m)
+                    existing_ids.add(m.id)
+
+        # 新增：人物/场景/事件回忆
+        if len(combined) < 3:
+            person = discover_person_memories()
+            for m in person:
+                if m.id not in existing_ids:
+                    combined.append(m)
+                    existing_ids.add(m.id)
+
+        if len(combined) < 3:
+            scene = discover_scene_memories()
+            for m in scene:
+                if m.id not in existing_ids:
+                    combined.append(m)
+                    existing_ids.add(m.id)
+
+        if len(combined) < 3:
+            event = discover_event_memories()
+            for m in event:
                 if m.id not in existing_ids:
                     combined.append(m)
                     existing_ids.add(m.id)

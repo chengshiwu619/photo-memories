@@ -280,6 +280,13 @@ class Database:
             ("init", SCHEMA_VERSION)
         )
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS thumbnail_params (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+
     def _migrate_v02_to_v03(self, conn):
         from config import get_settings
 
@@ -364,6 +371,7 @@ class Database:
                 raise
 
         self._ensure_missing_tables(conn)
+        self._check_and_clear_thumbnails(conn)
 
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         conn.close()
@@ -402,6 +410,12 @@ class Database:
                     created_at TEXT DEFAULT (datetime('now'))
                 )
             """, []),
+            ("thumbnail_params", """
+                CREATE TABLE IF NOT EXISTS thumbnail_params (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """, []),
         ]
         for table_name, create_sql, indexes in missing:
             if not self._table_exists(conn, table_name):
@@ -410,6 +424,51 @@ class Database:
                     conn.execute(idx_sql)
                 logger.info(f"补建缺失表: {table_name}")
         conn.commit()
+
+    def _check_and_clear_thumbnails(self, conn):
+        """检测缩略图参数版本变化，自动清理旧缓存并标记重建"""
+        from config import get_settings
+        import os
+
+        current_size = get_settings().thumbnail_size
+        current_sig = f"{current_size[0]}x{current_size[1]}_q90"
+
+        row = conn.execute("SELECT value FROM thumbnail_params WHERE key = 'thumbnail_sig'").fetchone()
+        if row is None:
+            conn.execute("INSERT INTO thumbnail_params (key, value) VALUES (?, ?)", ("thumbnail_sig", current_sig))
+            conn.commit()
+            return
+
+        if row[0] == current_sig:
+            return
+
+        logger.warning(f"缩略图参数变更: {row[0]} -> {current_sig}，开始清理旧缓存")
+
+        rows = conn.execute("""
+            SELECT file_id, thumbnail_path FROM photo_metadata
+            WHERE thumbnail_path IS NOT NULL AND thumbnail_path != '__FAILED__'
+        """).fetchall()
+
+        deleted_count = 0
+        for file_id, thumb_path in rows:
+            if thumb_path and os.path.exists(thumb_path):
+                try:
+                    os.remove(thumb_path)
+                    deleted_count += 1
+                except Exception as e:
+                    logger.warning(f"删除旧缩略图失败 {thumb_path}: {e}")
+
+        if rows:
+            conn.execute("""
+                UPDATE photo_metadata
+                SET thumbnail_path = NULL
+                WHERE thumbnail_path IS NOT NULL AND thumbnail_path != '__FAILED__'
+            """)
+
+        conn.execute("UPDATE thumbnail_params SET value = ? WHERE key = ?", (current_sig, "thumbnail_sig"))
+        conn.commit()
+
+        logger.info(f"缩略图缓存清理完成: 删除 {deleted_count} 个文件, 重置 {len(rows)} 条记录")
 
 
 def get_database():

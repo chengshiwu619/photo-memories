@@ -53,7 +53,8 @@ def get_unindexed_photos():
         rows = conn.execute("""
             SELECT f.id, f.file_path FROM files f
             LEFT JOIN photo_metadata pm ON f.id = pm.file_id
-            WHERE f.is_image = 1 AND pm.file_id IS NULL
+            WHERE f.is_image = 1
+              AND (pm.file_id IS NULL OR pm.thumbnail_path IS NULL OR pm.thumbnail_path = '__FAILED__')
         """).fetchall()
     return rows
 
