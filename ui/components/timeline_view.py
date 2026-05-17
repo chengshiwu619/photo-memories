@@ -1,8 +1,8 @@
 from datetime import datetime
 from typing import Optional
 
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QScrollArea, QLabel, QFrame
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QSize
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QScrollArea, QLabel, QFrame, QPushButton
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QSize, QPoint
 from PyQt6.QtGui import QPixmap, QFont
 
 from logger_setup import logger
@@ -84,40 +84,40 @@ QPixmapCache = _PixmapCache
 
 
 class _YearIndex(QWidget):
-    """时间线右侧年份索引拉球（替代原生滚动条）"""
+    """时间线右侧年月索引拉球（替代原生滚动条）"""
     year_selected = pyqtSignal(int)
+    scroll_continuous = pyqtSignal(int)
+    drag_ended = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        # year_data: [(year, photo_count), ...] 按年份降序
-        self._year_data: list[tuple[int, int]] = []
-        self._year_map: list[int] = []      # dot_index -> year (点数到年份映射)
+        # month_data: [(year, month, photo_count), ...] 按年月降序
+        self._month_data: list[tuple[int, int, int]] = []
+        self._date_map: list[tuple[int, int]] = []  # dot_index -> (year, month)
         self._total_dots: int = 0
         self._dot_spacing: float = 10.0
-        self._ball_y: float = 0.0           # 拉球 Y 位置
+        self._ball_y: float = 10.0     # 默认顶部位置，避免初始 0 导致 ym 计算失败
         self._ball_visible: bool = False
         self._is_dragging: bool = False
-        self._hover_year: int = 0
+        self._hover_ym: tuple[int, int] = (0, 0)
         self._indicator: Optional[QLabel] = None
-        self._scroll_range: int = 0         # 滚动条最大范围
+        self._scroll_range: int = 0
 
         self.setFixedWidth(28)
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setStyleSheet("background: transparent;")
 
-    def set_data(self, year_data: list[tuple[int, int]]):
-        """设置年份数据: [(year, photo_count), ...]"""
-        self._year_data = year_data
+    def set_data(self, month_data: list[tuple[int, int, int]]):
+        """设置年月数据: [(year, month, photo_count), ...] 按年月降序"""
+        self._month_data = month_data
         self._rebuild_dots()
         self.update()
 
     def set_scroll_range(self, max_val: int):
-        """设置滚动条最大范围，用于映射拉球位置"""
         self._scroll_range = max_val
 
     def set_scroll_value(self, val: int):
-        """从外部滚动条同步拉球位置"""
         if self._is_dragging or self._scroll_range <= 0:
             return
         h = self.height()
@@ -127,28 +127,24 @@ class _YearIndex(QWidget):
         self.update()
 
     def _rebuild_dots(self):
-        """重建点数映射"""
-        self._year_map = []
-        if not self._year_data:
+        self._date_map = []
+        if not self._month_data:
             self._total_dots = 0
             return
 
-        # 计算平均年照片数
-        avg = sum(c for _, c in self._year_data) / len(self._year_data)
+        avg = sum(c for _, _, c in self._month_data) / len(self._month_data)
         avg = max(1, avg)
 
-        for year, count in self._year_data:
-            # 1个年份点
-            self._year_map.append(year)
-            # N个间距点
-            n = max(2, int(count / avg * 5))
+        for year, month, count in self._month_data:
+            self._date_map.append((year, month))
+            n = max(1, int(count / avg * 3))
             for _ in range(n):
-                self._year_map.append(-1)  # -1 表示间距点
+                self._date_map.append((-1, -1))
 
-        self._total_dots = len(self._year_map)
+        self._total_dots = len(self._date_map)
 
     def paintEvent(self, event):
-        if not self._year_data:
+        if not self._month_data:
             return
         from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QFont
 
@@ -157,9 +153,8 @@ class _YearIndex(QWidget):
 
         w = self.width()
         h = self.height()
-        usable_h = h - 20  # 上下各留 10px
+        usable_h = h - 20
 
-        # 背景条
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(0, 0, 0, 60))
         painter.drawRoundedRect(2, 0, w - 4, h, 6, 6)
@@ -171,21 +166,18 @@ class _YearIndex(QWidget):
         cent_x = w // 2
 
         for di in range(self._total_dots):
-            yr = self._year_map[di]
+            yr, mo = self._date_map[di]
             dot_y = 10 + di * self._dot_spacing
 
             if yr == -1:
-                # 间距点：空心小圆
                 painter.setPen(QPen(QColor(60, 60, 90), 1))
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawEllipse(cent_x - 2, int(dot_y) - 2, 4, 4)
             else:
-                # 年份点：实心圆
                 painter.setPen(QPen(QColor(100, 110, 200), 1))
                 painter.setBrush(QBrush(QColor(100, 110, 200)))
                 painter.drawEllipse(cent_x - 4, int(dot_y) - 4, 8, 8)
 
-        # 拉球（拖动时或悬停时显示）
         if self._ball_visible:
             ball_y = int(self._ball_y)
             ball_alpha = 255 if self._is_dragging else 180
@@ -194,13 +186,14 @@ class _YearIndex(QWidget):
             painter.setBrush(QBrush(ball_color))
             painter.drawEllipse(cent_x - 10, ball_y - 10, 20, 20)
 
-        # 更新浮层
-        if self._is_dragging and self._hover_year:
-            self._show_indicator(self._hover_year)
+        if self._ball_visible and self._hover_ym and self._hover_ym[0]:
+            self._show_indicator(self._hover_ym)
 
         painter.end()
 
-    def _show_indicator(self, year: int):
+    def _show_indicator(self, ym: tuple[int, int]):
+        year, month = ym
+        text = f"{year}年{month}月"
         if not self._indicator:
             self._indicator = QLabel(self.window())
             self._indicator.setFont(QFont("Microsoft YaHei", 14, QFont.Weight.Bold))
@@ -210,53 +203,59 @@ class _YearIndex(QWidget):
                 border-radius: 6px;
             """)
             self._indicator.show()
-        self._indicator.setText(str(year))
+        self._indicator.setText(text)
         self._indicator.adjustSize()
-        # 定位在拉球左侧
-        gp = self.mapToGlobal(self.pos())
-        ball_y = int(self._ball_y)
-        self._indicator.move(gp.x() - self._indicator.width() - 10, gp.y() + ball_y - 12)
+        # 将拉球中心位置映射到窗口坐标系（indicator 的父控件）
+        ball_local = QPoint(0, int(self._ball_y))
+        ball_in_window = self.mapTo(self.window(), ball_local)
+        label_x = ball_in_window.x() - self._indicator.width() - 10
+        label_y = ball_in_window.y() - self._indicator.height() // 2
+        self._indicator.move(label_x, label_y)
 
     def _hide_indicator(self):
         if self._indicator:
             self._indicator.hide()
             self._indicator = None
 
-    def _ball_y_to_year(self, ball_y: float) -> int:
-        """将拉球位置映射到最近的年份"""
+    def _ball_y_to_ym(self, ball_y: float) -> tuple[int, int]:
+        """将拉球位置映射到最近的年月"""
         h = self.height()
         usable_h = h - 20
         if self._total_dots == 0 or self._dot_spacing <= 0:
-            return 0
+            return (0, 0)
         di = max(0, min(self._total_dots - 1, int((ball_y - 10) / self._dot_spacing)))
-        yr = self._year_map[di]
-        # 向前后找最近的年份
+        yr, mo = self._date_map[di]
         if yr != -1:
-            return yr
-        # 向前找
+            return (yr, mo)
         for d in range(di, -1, -1):
-            if self._year_map[d] != -1:
-                return self._year_map[d]
-        # 向后找
+            r, m = self._date_map[d]
+            if r != -1:
+                return (r, m)
         for d in range(di, self._total_dots):
-            if self._year_map[d] != -1:
-                return self._year_map[d]
-        return 0
+            r, m = self._date_map[d]
+            if r != -1:
+                return (r, m)
+        return (0, 0)
 
-    def _year_to_ball_y(self, year: int) -> float:
-        """将年份映射到拉球位置"""
-        for di, yr in enumerate(self._year_map):
-            if yr == year:
-                return 10 + di * self._dot_spacing
-        return self._ball_y
+    def _ball_y_to_scroll(self, ball_y: float) -> int:
+        """将拉球位置按比例映射到滚动条值"""
+        if self._scroll_range <= 0:
+            return 0
+        h = self.height()
+        usable_h = h - 20
+        ratio = max(0, min(1, (ball_y - 10) / usable_h))
+        return int(ratio * self._scroll_range)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._is_dragging = True
             self._ball_visible = True
             self._ball_y = max(10, min(self.height() - 10, event.pos().y()))
-            year = self._ball_y_to_year(self._ball_y)
-            self._hover_year = year
+            ym = self._ball_y_to_ym(self._ball_y)
+            self._hover_ym = ym
+            if ym[0]:
+                sv = self._ball_y_to_scroll(self._ball_y)
+                self.scroll_continuous.emit(sv)
             self.update()
 
     def mouseMoveEvent(self, event):
@@ -264,32 +263,33 @@ class _YearIndex(QWidget):
         self._ball_y = max(10, min(h - 10, event.pos().y()))
 
         if self._is_dragging:
-            year = self._ball_y_to_year(self._ball_y)
-            if year != self._hover_year:
-                self._hover_year = year
+            ym = self._ball_y_to_ym(self._ball_y)
+            if ym != self._hover_ym:
+                self._hover_ym = ym
+            sv = self._ball_y_to_scroll(self._ball_y)
+            self.scroll_continuous.emit(sv)
             self.update()
         else:
-            # 悬停时也显示拉球
             self._ball_visible = True
-            self._hover_year = self._ball_y_to_year(self._ball_y)
+            self._hover_ym = self._ball_y_to_ym(self._ball_y)
             self.update()
 
     def mouseReleaseEvent(self, event):
         if self._is_dragging:
-            year = self._ball_y_to_year(self._ball_y)
-            if year:
-                self.year_selected.emit(year)
-        self._is_dragging = False
+            self._is_dragging = False
+            self.drag_ended.emit()
         self._hide_indicator()
         self.update()
 
     def enterEvent(self, event):
         self._ball_visible = True
+        self._hover_ym = self._ball_y_to_ym(self._ball_y)
         self.update()
 
     def leaveEvent(self, event):
         if not self._is_dragging:
             self._ball_visible = False
+            self._hide_indicator()
         self.update()
 
 
@@ -331,37 +331,89 @@ class TimelineView(QWidget):
         self._scroll.setWidget(self._container)
         outer.addWidget(self._scroll)
 
-        # 侧边年份索引（挂在 viewport 上，固定在视口右侧不随内容滚动）
+        # 侧边年月索引（挂在 viewport 上，固定在视口右侧不随内容滚动）
         vp = self._scroll.viewport()
         self._year_index = _YearIndex(vp)
-        self._year_index.year_selected.connect(self._scroll_to_year)
+        self._year_index.drag_ended.connect(self._on_year_drag_ended)
+        self._year_index.scroll_continuous.connect(self._on_continuous_scroll)
         self._year_index.move(vp.width() - 28, 0)
         self._year_index.resize(28, vp.height())
         self._year_index.raise_()
+
+        # 渲染防抖：拖动时避免高频 widget 创建/销毁导致的跳动
+        self._render_debounce = QTimer()
+        self._render_debounce.setSingleShot(True)
+        self._render_debounce.timeout.connect(self._render_visible)
+
         self._scroll.verticalScrollBar().valueChanged.connect(self._on_scroll)
         self._resize_timer = QTimer()
         self._resize_timer.setSingleShot(True)
         self._resize_timer.timeout.connect(self._recompute)
 
+        # 回到最新按钮（右下角浮动）
+        self._top_btn = QPushButton("△", self._scroll.viewport())
+        self._top_btn.setFixedSize(32, 32)
+        self._top_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(100, 110, 200, 150);
+                color: #fff;
+                border: none;
+                border-radius: 16px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: rgba(100, 110, 200, 230);
+            }
+        """)
+        self._top_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._top_btn.clicked.connect(lambda: self._scroll.verticalScrollBar().setValue(0))
+        self._top_btn.hide()
+        # 滚动时决定按钮显示/隐藏
+        self._scroll.verticalScrollBar().valueChanged.connect(self._on_scroll_for_top_btn)
+
     def _build_year_index(self):
-        """构建年份索引，传入 [(year, photo_count), ...] 给拉球组件"""
-        year_counts: dict[int, int] = {}
+        """构建年月索引，传入 [(year, month, photo_count), ...] 给拉球组件"""
+        month_counts: dict[tuple[int, int], int] = {}
         for group in self._groups:
             date_key = group.get("date_key", "")
-            if date_key and len(date_key) >= 4:
+            if date_key and len(date_key) >= 7:
                 try:
                     year = int(date_key[:4])
-                    year_counts[year] = year_counts.get(year, 0) + len(group["photos"])
+                    month = int(date_key[5:7])
+                    key = (year, month)
+                    month_counts[key] = month_counts.get(key, 0) + len(group["photos"])
                 except ValueError:
                     pass
-        sorted_data = sorted(year_counts.items(), key=lambda x: x[0], reverse=True)
-        self._year_index.set_data(sorted_data)
+        sorted_data = sorted(month_counts.items(), key=lambda x: x[0], reverse=True)
+        data_list = [(y, m, c) for (y, m), c in sorted_data]
+        self._year_index.set_data(data_list)
         self._year_index.set_scroll_range(self._scroll.verticalScrollBar().maximum())
 
     def _scroll_to_year(self, year: int):
-        """滚动到指定年份"""
+        """滚动到指定年份（保留以备将来纯点击跳转）"""
         if year in self._year_positions:
             self._scroll.verticalScrollBar().setValue(self._year_positions[year])
+
+    def _on_continuous_scroll(self, scroll_value: int):
+        """拉球拖动时连续滚动"""
+        self._scroll.verticalScrollBar().setValue(scroll_value)
+
+    def _on_year_drag_ended(self):
+        """拉球释放后立即执行一次最终渲染"""
+        self._render_debounce.stop()
+        self._render_visible()
+
+    def _on_scroll_for_top_btn(self, value: int):
+        """滚动时控制回到最新按钮的显示/隐藏"""
+        if value > 200:
+            self._top_btn.show()
+            # 定位在右下角
+            vp_w = self._scroll.viewport().width()
+            vp_h = self._scroll.viewport().height()
+            self._top_btn.move(vp_w - 44, vp_h - 44)
+        else:
+            self._top_btn.hide()
 
     def load_photos(self, photos: list[dict]):
         self._clear_all()
@@ -457,7 +509,10 @@ class TimelineView(QWidget):
                         needed_cards.add(key)
                         if key not in self._visible_cards:
                             photo = group["photos"][idx]
-                            card = _PhotoCard(photo.get("file_id", 0), self._card_size)
+                            photo_id = photo.get("id", 0)
+                            if not photo_id:
+                                continue
+                            card = _PhotoCard(photo_id, self._card_size)
                             card_x = _GAP + ci * (self._card_size + _GAP)
                             card_y = row_y
                             card.move(card_x, card_y)
@@ -482,7 +537,11 @@ class TimelineView(QWidget):
             lbl.deleteLater()
 
     def _on_scroll(self, value):
-        self._render_visible()
+        if self._year_index._is_dragging:
+            # 拖动中：防抖渲染，避免高频 widget 操作导致跳动
+            self._render_debounce.start(30)
+        else:
+            self._render_visible()
         self._year_index.set_scroll_value(value)
 
     def _clear_all(self):
@@ -496,7 +555,7 @@ class TimelineView(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._resize_timer.start(_DEBOUNCE_MS)
-        # 更新年份索引拉球位置
         vp = self._scroll.viewport()
         self._year_index.move(vp.width() - 28, 0)
         self._year_index.resize(28, vp.height())
+        self._top_btn.move(vp.width() - 44, vp.height() - 44)

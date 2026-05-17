@@ -11,6 +11,19 @@ from infra.db.repositories.photo_metadata_repo import PhotoMetadataRepository
 from config import get_settings
 
 
+def _filter_life_photos(file_ids: List[int]) -> List[int]:
+    """只保留分类为生活照片(category=1)的文件ID"""
+    if not file_ids:
+        return []
+    with Database().connect() as conn:
+        rows = conn.execute("""
+            SELECT f.id FROM files f
+            JOIN folder_categories fc ON f.folder_path = fc.folder_path
+            WHERE fc.category = 1 AND f.id IN ({})
+        """.format(",".join("?" * len(file_ids))), file_ids).fetchall()
+    return [r[0] for r in rows]
+
+
 def discover_on_this_day(lookback_years: Optional[List[int]] = None) -> List[Memory]:
     if lookback_years is None:
         lookback_years = list(range(1, 11))
@@ -38,11 +51,14 @@ def discover_on_this_day(lookback_years: Optional[List[int]] = None) -> List[Mem
 
     groups = {}
     for file_id, folder_path, date_taken, category in rows:
+        # 只保留生活样片分类的照片
+        if category != 1:
+            continue
         month_day = date_taken[5:10]
         year = date_taken[:4]
         key = f"{year}-{month_day}"
         if key not in groups:
-            groups[key] = {"ids": [], "category": category or 1, "date": date_taken}
+            groups[key] = {"ids": [], "date": date_taken}
         groups[key]["ids"].append(file_id)
 
     memories = []
@@ -57,7 +73,7 @@ def discover_on_this_day(lookback_years: Optional[List[int]] = None) -> List[Mem
             continue
 
         m = Memory(
-            category=group["category"],
+            category=1,
             memory_type="on_this_day",
             title=title,
             description=description,
@@ -89,9 +105,11 @@ def discover_recent_memories(days: Optional[int] = None) -> List[Memory]:
 
     groups = {}
     for file_id, folder_path, date_taken, category in rows:
+        if category != 1:
+            continue
         day = date_taken[:10]
         if day not in groups:
-            groups[day] = {"ids": [], "category": category or 1}
+            groups[day] = {"ids": []}
         groups[day]["ids"].append(file_id)
 
     memories = []
@@ -103,7 +121,7 @@ def discover_recent_memories(days: Optional[int] = None) -> List[Memory]:
             continue
 
         m = Memory(
-            category=group["category"],
+            category=1,
             memory_type="recent",
             title=title,
             photo_ids=json.dumps(photo_ids),
@@ -167,11 +185,13 @@ def discover_special_date_memories() -> List[Memory]:
         folder_path = row[1]
         date_taken = row[2]
         category = row[3]
+        if category != 1:
+            continue
         month_day = date_taken[5:10]
         year = date_taken[:4]
         key = f"{year}-{month_day}"
         if key not in groups:
-            groups[key] = {"ids": [], "category": category or 1, "month_day": month_day}
+            groups[key] = {"ids": [], "month_day": month_day}
         groups[key]["ids"].append(file_id)
 
     memories = []
@@ -188,7 +208,7 @@ def discover_special_date_memories() -> List[Memory]:
             continue
 
         m = Memory(
-            category=group["category"],
+            category=1,
             memory_type="special_date",
             title=title,
             photo_ids=json.dumps(photo_ids),
@@ -210,13 +230,13 @@ def discover_folder_memories(top_n: int = 5) -> List[Memory]:
     with db.connect() as conn:
         rows = conn.execute("""
             SELECT f.folder_path, f.folder_name,
-                   fc.category,
                    COUNT(*) as cnt,
                    MIN(pm.date_taken) as first_date
             FROM files f
             JOIN photo_metadata pm ON f.id = pm.file_id
-            LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
+            JOIN folder_categories fc ON f.folder_path = fc.folder_path
             WHERE f.is_image = 1
+              AND fc.category = 1
               AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
               AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
             GROUP BY f.folder_path
@@ -229,7 +249,7 @@ def discover_folder_memories(top_n: int = 5) -> List[Memory]:
         return []
 
     memories = []
-    for folder_path, folder_name, category, cnt, first_date in rows:
+    for folder_path, folder_name, cnt, first_date in rows:
         with db.connect() as conn:
             file_rows = conn.execute("""
                 SELECT f.id FROM files f
@@ -246,15 +266,14 @@ def discover_folder_memories(top_n: int = 5) -> List[Memory]:
             continue
 
         display_name = folder_name or os.path.basename(folder_path)
-        date_label = first_date[:10] if first_date else ""
-        title = f"{display_name} · {date_label}" if date_label else display_name
+        title = f"{display_name} · {cnt}张"
 
         existing = _find_existing_memory(memories_repo, "folder", folder_path)
         if existing:
             continue
 
         m = Memory(
-            category=category or 1,
+            category=1,
             memory_type="folder",
             title=title,
             photo_ids=json.dumps(photo_ids),
@@ -294,11 +313,15 @@ def discover_person_memories(threshold: int = 3) -> List[Memory]:
         if existing:
             continue
 
-        person_name = cluster.person_name or f"人物 {cluster.cluster_id}"
+        person_name = cluster.person_name or f"一位朋友 · {len(file_ids)}张照片"
         photo_ids = file_ids[:20]  # 限制 20 张
+        # 只保留生活样片分类的照片
+        photo_ids = _filter_life_photos(photo_ids)
+        if not photo_ids or len(photo_ids) < threshold:
+            continue
 
         m = Memory(
-            category=1,  # 默认分类
+            category=1,
             memory_type="person",
             title=person_name,
             photo_ids=json.dumps(photo_ids),
@@ -351,6 +374,10 @@ def discover_scene_memories(threshold: int = 5) -> List[Memory]:
 
         title = f"场景: {tag}"
         photo_ids = file_ids[:20]
+        # 只保留生活样片分类的照片
+        photo_ids = _filter_life_photos(photo_ids)
+        if len(photo_ids) < threshold:
+            continue
 
         m = Memory(
             category=1,
@@ -416,6 +443,10 @@ def discover_event_memories(threshold: int = 5, gps_delta: float = 0.01) -> List
             continue
 
         file_ids = [p[0] for p in photos[:20]]
+        # 只保留生活样片分类的照片
+        file_ids = _filter_life_photos(file_ids)
+        if len(file_ids) < threshold:
+            continue
         start_date = min(dates)
         end_date = max(dates)
 

@@ -171,7 +171,13 @@ def load_photos_from_ids(db, all_ids):
                   AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'""",
         unique_ids,
     ).fetchall()
-    return _interleave_small_folders([_make_photo_dict(r) for r in rows])
+    import os
+    valid = []
+    for r in rows:
+        d = _make_photo_dict(r)
+        if d.get("thumbnail_path") and os.path.exists(d["thumbnail_path"]):
+            valid.append(d)
+    return _interleave_small_folders(valid)
 
 
 def load_category_photos_batch(db, cat_id, offset, limit=PAGE_SIZE):
@@ -201,7 +207,13 @@ def load_category_photos_batch(db, cat_id, offset, limit=PAGE_SIZE):
                 ORDER BY pm.date_taken DESC
                 LIMIT ?
             """, (limit,)).fetchall()
-    return _interleave_small_folders([_make_photo_dict(r) for r in rows])
+    import os as _os
+    valid = []
+    for r in rows:
+        d = _make_photo_dict(r)
+        if d.get("thumbnail_path") and _os.path.exists(d["thumbnail_path"]):
+            valid.append(d)
+    return _interleave_small_folders(valid)
 
 
 def load_starred_photos(db, cat_id):
@@ -215,7 +227,13 @@ def load_starred_photos(db, cat_id):
         WHERE pm.is_starred = 1 AND f.is_image = 1 AND fc.category = ? AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
         ORDER BY pm.date_taken DESC
     """, (cat_id,)).fetchall()
-    return _interleave_small_folders([_make_photo_dict(r) for r in rows])
+    import os as _os
+    valid = []
+    for r in rows:
+        d = _make_photo_dict(r)
+        if d.get("thumbnail_path") and _os.path.exists(d["thumbnail_path"]):
+            valid.append(d)
+    return _interleave_small_folders(valid)
 
 
 def rank_category_photos(db, cat_id):
@@ -238,6 +256,17 @@ def rank_category_photos(db, cat_id):
     if all_ids:
         memory_photos = load_photos_from_ids(db, all_ids)
         memory_photos = [p for p in memory_photos if p.get("thumbnail_path")]
+        # 交叉验证：确保 memory 中的照片确实属于目标分类（防止脏数据泄漏）
+        if memory_photos:
+            mem_ids = [p["id"] for p in memory_photos]
+            placeholders = ",".join("?" * len(mem_ids))
+            valid_ids = {
+                r[0] for r in db.execute(
+                    f"SELECT f.id FROM files f JOIN folder_categories fc ON f.folder_path = fc.folder_path WHERE fc.category = ? AND f.id IN ({placeholders})",
+                    [cat_id] + mem_ids,
+                ).fetchall()
+            }
+            memory_photos = [p for p in memory_photos if p["id"] in valid_ids]
 
     batch_photos = load_category_photos_batch(db, cat_id, 0, limit=9999)
 
@@ -276,7 +305,7 @@ def rank_search_photos(db, matched_ids):
 
 
 def reshuffle_photos(photos, shown_ids=None):
-    """对照片列表重新洗牌，已显示过的照片排到后面；fresh 为空时才从 stale 取"""
+    """对照片列表重新洗牌，按 fresh + stale 合并排序返回"""
     if not photos:
         return []
 
@@ -289,6 +318,5 @@ def reshuffle_photos(photos, shown_ids=None):
     random.shuffle(fresh)
     random.shuffle(stale)
 
-    if fresh:
-        return _interleave_by_time(_interleave_small_folders(fresh))
-    return _interleave_by_time(_interleave_small_folders(stale))
+    combined = fresh + stale
+    return _interleave_by_time(_interleave_small_folders(combined))

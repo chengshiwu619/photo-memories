@@ -1,6 +1,51 @@
 # 版本变更记录
 
+## v0.4.1 (2026-05-17)
+
+### Bug 修复
+- **堆叠态限定 6 张**：`special_memories.py/_layout_collapsed()` 固定 `max_visible = min(len(photos), 6)`
+- **特殊回忆仅用生活照片**：所有 discover 函数在创建 memories 前通过 `_filter_life_photos()` 过滤为 `category=1` 的照片，写法为 `Memory(category=1)`
+- **随机回忆跨分类漏洞修复**：`recommendation.py/rank_category_photos()` 从 memories 表加载照片后，通过 JOIN folder_categories 交叉验证每张照片是否确实属于目标分类，防止脏数据泄漏
+- **DB 清理**：删除 3 条 `category=1` 但含样片照片的脏 event memory（希威社文件夹），session id=17,19,21
+
+### 架构改进
+- **人脸嵌入聚类后台接入**：`face_cluster.py` 新增 `recluster_all()` 函数；`app.py` 新增 `BgTagsWorker`（SigLIP 标签生成）+ `BgFaceWorker`（人脸嵌入+聚类）；后台索引完成后自动编排启动
+- **特殊回忆三阶段触发机制**：`app.py` 新增 `_get_index_progress()`，<30% 仅文件夹回忆，30-70% 增加日期+近期回忆，>70% 全量
+- **跨分类聚合防御**：移除 `_get_majority_category()`，改为统一 `_filter_life_photos()` 硬过滤 + 运行时交叉验证双重保护
+
+### 代码清理
+- 删除 `overview.md`（内容已并入 changelog）
+- 删除所有 `__pycache__` 目录及 `.pyc` 文件
+
+---
+
 ## v0.3 (2026-05-17)
+
+### 时间线拉球跳动修复 (2026-05-17)
+- Bug：拉球拖动时每个 mouseMoveEvent 都触发 `_render_visible()`，高频创建/销毁 widget 导致画面跳动
+- Bug：释放时 `year_selected → _scroll_to_year` 跳到年初位置，与拖动最终停留位置不一致
+- 修复：
+  - 拖动时 `_render_visible` 改为 30ms 防抖渲染（`_render_debounce`），降低 widget 操作频率
+  - 释放时不跳年份：删除 `year_selected` 发射，改为 `drag_ended` 信号立即触发一次最终渲染
+  - 新增 `_YearIndex.drag_ended` 信号，`TimelineView._on_year_drag_ended()` 停止防抖并执行最终渲染
+- 修改文件：`ui/components/timeline_view.py`
+
+### 时间线拉球年月指示器定位修复 (2026-05-17)
+- Bug：`_YearIndex._show_indicator()` 中 `self.mapToGlobal(self.pos())` 坐标计算错误（pos 重复加倍偏移），且 indicator 的 parent 为 MainWindow 但 move 用了全局屏幕坐标，导致年月标签跑出可视区域
+- 修复：改用 `self.mapTo(self.window(), QPoint(0, ball_y))` 正确映射到窗口坐标系，指示器紧贴拉球左侧垂直居中
+- 补 import QPoint
+- 修改文件：`ui/components/timeline_view.py`
+
+### 批量修改：随机回忆去重 + 时间线增强 + 特殊回忆修复 (2026-05-17)
+- **随机回忆不重复**：`reshuffle_photos()` 改为返回 fresh + stale 合并列表；`_on_load_more()` 洗牌后不再清空 `_cat_shown_ids`，同次会话照片不重复出现
+- **缩略图过滤**：`load_photos_from_ids()`/`load_category_photos_batch()`/`load_starred_photos()` 增加 `os.path.exists(thumbnail_path)` 检查；瀑布流渲染时跳过缩略图文件不存在的卡片
+- **时间线拉球增强**：改为月粒度 `(year, month, count)` 数据；悬停显示「2026年5月」浮层指示器；拖动时连续滚动（新增 `scroll_continuous` 信号）；回到最新按钮（右下角「△」浮动按钮）
+- **优秀回忆按钮统一**：`toggle_starred()` 根据当前视图切换；时间线支持 `AND pm.is_starred = 1` 过滤
+- **时间线性能**：`_timeline_refresh_timer` 只在时间线可见时运行，切出时 stop()
+- **Bug 修复**：`_PhotoCard` 构造使用 `"id"` key 而非 `"file_id"`（之前所有时间线点击报 file_id=0）；PokerStack 顶部 margin 8→2，卡片 y 偏移 6→0
+- **特殊回忆三阶段触发**：新增 `_get_index_progress()`；<30% 仅文件夹，30-70% 文件夹+那年今日+近期，>70% 全量
+- **缓存目录迁移**：`storage/` → `D:\photo-memories-cache`；`thumbnail_path` 数据库路径批量更新（13410 条）
+- **修改文件**：`ui/app.py`、`ui/recommendation.py`、`ui/components/timeline_view.py`、`ui/components/special_memories.py`、`ui/components/virtual_waterfall.py`、`config.py`、`.env`
 
 ### P0+P1 修复
 - P0-1: 删除 yolov8n.pt（6.3MB PyTorch 权重残留），.gitignore 改为 `*.pt` 通配符

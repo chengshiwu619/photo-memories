@@ -55,8 +55,10 @@
 ## 特殊回忆分栏
 - 展开态：5 列网格布局（`GridCard`，80×80 方形缩略图），最多显示 20 张
 - 手风琴模式：`collapse_others` 信号，同时只展开一个 `PokerStack`
-- 展开态点击缩略图：`photo_clicked` 信号 → `_on_special_photo_clicked` → `on_photo_clicked` 打开图片查看器
-- 文件夹回忆上限 `top_n=2`
+- 展开态点击缩略图：`photo_clicked` 信号 → `_on_special_photo_clicked` → `on_photo_clicked` 打开图片查看器，**支持前后翻页**（传入该 PokerStack 完整照片列表）
+- 折叠态堆叠：最多 3 张（`max_visible=3`），按 `created_at` 降序排列，**无分组 headers**
+- 触发条件：生活照片 ≥200 张（`_get_life_photo_count()`）→ Phase 3 全量发现；<200 张 → Phase 1 仅文件夹回忆 `top_n=3`
+- 文件夹回忆上限 `top_n=3`
 - 缩略图缓存：使用自定义 `_PixmapCache`（dict 实现），不使用 PyQt6 内置 `QPixmapCache`（PyQt6 已移除字符串 key 的 find/insert API）
 
 ## 文档索引

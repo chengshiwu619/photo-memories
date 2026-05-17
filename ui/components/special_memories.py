@@ -85,7 +85,7 @@ class GridCard(QFrame):
         self.setStyleSheet("""
             GridCard {
                 background: #222;
-                border-radius: 4px;
+                border-radius: 2px;
                 border: 1px solid #3a3a5e;
             }
             GridCard:hover {
@@ -126,12 +126,12 @@ class GridCard(QFrame):
 
 _EXPAND_COLS = 5
 _EXPAND_CARD_SIZE = 80
-_EXPAND_GAP = 4
+_EXPAND_GAP = 3
 
 
 class PokerStack(QWidget):
     expanded = pyqtSignal(int)
-    photo_clicked = pyqtSignal(dict)
+    photo_clicked = pyqtSignal(object, object)
     collapse_others = pyqtSignal(object)
 
     def __init__(self, memory: Memory, parent=None):
@@ -146,7 +146,7 @@ class PokerStack(QWidget):
         self.setStyleSheet("background: transparent;")
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setContentsMargins(12, 2, 12, 8)
         layout.setSpacing(4)
 
         header_layout = QHBoxLayout()
@@ -201,12 +201,14 @@ class PokerStack(QWidget):
             self._layout_collapsed()
 
     def _layout_collapsed(self):
-        max_visible = 6
+        # 固定展示最多 6 张堆叠
+        max_visible = min(len(self._photos), 6)
+
         visible_photos = self._photos[:max_visible]
         x_offset = 0
         for i, photo in enumerate(visible_photos):
             card = StackedCard(photo, self._stack_container)
-            card.move(x_offset, 6)
+            card.move(x_offset, 0)
             card.raise_()
             card.clicked.connect(lambda p: self._on_card_clicked(p))
             card.show()
@@ -214,37 +216,45 @@ class PokerStack(QWidget):
             self._cards.append(card)
             x_offset += 30
 
-        if len(self._photos) > max_visible:
-            more = QLabel(f"+{len(self._photos) - max_visible}", self._stack_container)
+        remaining = len(self._photos) - max_visible
+        if remaining > 0:
+            more = QLabel(f"+{remaining}", self._stack_container)
             more.setFont(QFont("Microsoft YaHei", 9))
             more.setStyleSheet("color: #888; background: transparent;")
             more.move(x_offset + 4, 40)
             more.show()
             self._cards.append(more)
 
-        total_w = min(max_visible, len(self._photos)) * 30 + 60
-        self._stack_container.setFixedWidth(max(total_w, 200))
+        # 不设固定宽度 —— 由父布局撑满至全宽
         self._stack_container.setFixedHeight(112)
 
     def _layout_expanded(self):
         max_visible = min(len(self._photos), 20)
         visible_photos = self._photos[:max_visible]
+
+        # 动态计算卡片尺寸，对齐时间线风格
+        container_w = self._stack_container.width()
+        if container_w > 0:
+            card_size = max(60, (container_w - _EXPAND_GAP * (_EXPAND_COLS + 1)) // _EXPAND_COLS)
+        else:
+            card_size = _EXPAND_CARD_SIZE
+
         rows = (len(visible_photos) + _EXPAND_COLS - 1) // _EXPAND_COLS
 
         for i, photo in enumerate(visible_photos):
             row = i // _EXPAND_COLS
             col = i % _EXPAND_COLS
-            card = GridCard(photo, _EXPAND_CARD_SIZE, self._stack_container)
-            x = col * (_EXPAND_CARD_SIZE + _EXPAND_GAP)
-            y = row * (_EXPAND_CARD_SIZE + _EXPAND_GAP)
+            card = GridCard(photo, card_size, self._stack_container)
+            x = col * (card_size + _EXPAND_GAP)
+            y = row * (card_size + _EXPAND_GAP)
             card.move(x, y)
-            card.clicked.connect(self.photo_clicked.emit)
+            card.clicked.connect(lambda p, photos=self._photos: self.photo_clicked.emit(p, photos))
             card.show()
             card.load_thumbnail()
             self._cards.append(card)
 
-        total_w = _EXPAND_COLS * (_EXPAND_CARD_SIZE + _EXPAND_GAP) - _EXPAND_GAP
-        total_h = rows * (_EXPAND_CARD_SIZE + _EXPAND_GAP) - _EXPAND_GAP
+        total_w = _EXPAND_COLS * (card_size + _EXPAND_GAP) - _EXPAND_GAP
+        total_h = rows * (card_size + _EXPAND_GAP) - _EXPAND_GAP
         self._stack_container.setFixedWidth(max(total_w, 200))
         self._stack_container.setFixedHeight(total_h + 12)
 
@@ -316,7 +326,7 @@ class ShatterWidget(QWidget):
 class SpecialMemoriesView(QWidget):
     memory_clicked = pyqtSignal(int)
     memory_dismissed = pyqtSignal(int)
-    photo_clicked = pyqtSignal(dict)
+    photo_clicked = pyqtSignal(object, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -343,75 +353,70 @@ class SpecialMemoriesView(QWidget):
         self._layout = QVBoxLayout(self._container)
         self._layout.setContentsMargins(24, 16, 24, 16)
         self._layout.setSpacing(8)
+        # bottom_spacer 和 end_label 在 load_memories 末尾再添加到底部
         self._bottom_spacer = QWidget()
         self._bottom_spacer.setFixedHeight(0)
-        self._layout.addWidget(self._bottom_spacer)
+        self._bottom_spacer.hide()
 
         self._end_label = QLabel("—— 已展示全部回忆 ——")
         self._end_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._end_label.setStyleSheet("color: #555; font-size: 12px; padding: 12px 0 24px 0;")
         self._end_label.hide()
-        self._layout.addWidget(self._end_label)
 
         self._scroll.setWidget(self._container)
         outer.addWidget(self._scroll)
 
     def load_memories(self, memories: list):
+        # 清理旧 items（但保留 bottom_spacer 和 end_label 引用）
         for s in self._stacks:
             s.setParent(None)
         self._stacks.clear()
 
-        type_groups = {}
-        type_order = []
-        for m in memories:
-            mt = m.memory_type
-            if mt not in type_groups:
-                type_groups[mt] = []
-                type_order.append(mt)
-            type_groups[mt].append(m)
+        # 移除旧布局中可能残留的 spacer/end_label
+        old_items = []
+        for i in range(self._layout.count()):
+            w = self._layout.itemAt(i).widget()
+            if w and w not in (self._bottom_spacer, self._end_label):
+                old_items.append(w)
+        for w in old_items:
+            self._layout.removeWidget(w)
+            w.deleteLater()
+        # 把 spacer/end_label 也从布局移除，后面重新加到底部
+        self._layout.removeWidget(self._bottom_spacer)
+        self._layout.removeWidget(self._end_label)
 
-        type_labels = {
-            "on_this_day": "📅 那年今日",
-            "person": "👤 人物回忆",
-            "event": "🎯 事件与旅行",
-            "scene": "🏞️ 场景回忆",
-            "recent": "🕐 近期回忆",
-            "special_date": "🎯 特殊日期",
-            "folder": "📁 文件夹回忆",
-        }
+        # 按 created_at 降序排列（新先生成的最先展示）
+        sorted_memories = sorted(memories, key=lambda m: m.created_at or "", reverse=True)
 
-        for mt in type_order:
-            label = type_labels.get(mt, mt)
-            header = QLabel(label)
-            header.setFont(QFont("Microsoft YaHei", 13, QFont.Weight.Bold))
-            header.setStyleSheet("color: #e0e0e0; padding: 8px 0 4px 0;")
-            self._layout.insertWidget(self._layout.count() - 1, header)
+        for m in sorted_memories:
+            stack = PokerStack(m)
+            stack.expanded.connect(self.memory_clicked.emit)
+            stack.photo_clicked.connect(self.photo_clicked.emit)
+            stack.collapse_others.connect(self._on_collapse_others)
+            stack.setStyleSheet("""
+                PokerStack {
+                    background: #222240;
+                    border-radius: 8px;
+                    border: 1px solid #3a3a5e;
+                }
+                PokerStack:hover {
+                    border-color: #4a4a7e;
+                }
+            """)
+            self._layout.addWidget(stack)
+            self._stacks.append(stack)
 
-            for m in type_groups[mt][:6]:
-                stack = PokerStack(m)
-                stack.expanded.connect(self.memory_clicked.emit)
-                stack.photo_clicked.connect(self.photo_clicked.emit)
-                stack.collapse_others.connect(self._on_collapse_others)
-                stack.setStyleSheet("""
-                    PokerStack {
-                        background: #222240;
-                        border-radius: 8px;
-                        border: 1px solid #3a3a5e;
-                    }
-                    PokerStack:hover {
-                        border-color: #4a4a7e;
-                    }
-                """)
-                self._layout.insertWidget(self._layout.count() - 1, stack)
-                self._stacks.append(stack)
+            QTimer.singleShot(0, lambda s=stack, mem=m: self._load_stack_photos(s, mem))
 
-                QTimer.singleShot(0, lambda s=stack, mem=m: self._load_stack_photos(s, mem))
-
-        # 底部留白，确保用户可以滚动到最后一项到屏幕中间
+        # 底部留白 + 结束提示
         viewport_h = self._scroll.viewport().height() if self._scroll.viewport() else 400
         spacer_h = max(200, int(viewport_h * 0.5))
         self._bottom_spacer.setFixedHeight(spacer_h)
+        self._bottom_spacer.show()
+        self._layout.addWidget(self._bottom_spacer)
+
         self._end_label.show()
+        self._layout.addWidget(self._end_label)
 
     def _load_stack_photos(self, stack, memory):
         from db_manager import Database

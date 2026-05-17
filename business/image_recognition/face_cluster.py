@@ -80,3 +80,57 @@ def get_person_memories() -> Dict[str, List[int]]:
         if members:
             result[name] = members
     return result
+
+
+def recluster_all(threshold: float = _DISTANCE_THRESHOLD) -> Dict[int, int]:
+    """读取 DB 中所有嵌入，清空旧聚类，重新聚类并更新 cluster_id"""
+    db = Database()
+    clusters_repo = FaceClustersRepository(db)
+
+    with db.connect() as conn:
+        rows = conn.execute("SELECT id, file_id, embedding FROM face_embeddings").fetchall()
+
+    if not rows:
+        logger.info("重聚类跳过：face_embeddings 表为空")
+        return {}
+
+    items = [(r[0], np.frombuffer(r[2], dtype=np.float32)) for r in rows]
+
+    # 清空旧聚类
+    with db.connect() as conn:
+        conn.execute("UPDATE face_embeddings SET cluster_id = NULL")
+        conn.execute("DELETE FROM face_clusters")
+
+    clusters = greedy_cluster(
+        [(emb_id, emb) for emb_id, _ in items],
+        metric="euclidean",
+        threshold=threshold,
+    )
+
+    file_to_cluster: Dict[int, int] = {}
+    for cluster in clusters:
+        representative_emb_id = cluster[0][0]
+        # 找到该嵌入对应的 file_id，作为聚类的代表照片
+        rep_file_id = None
+        for emb_id, file_id, _ in rows:
+            if emb_id == representative_emb_id:
+                rep_file_id = file_id
+                break
+
+        cluster_id = clusters_repo.insert(FaceCluster(person_name="", representative_face=rep_file_id))
+
+        emb_ids = [emb_id for emb_id, _ in cluster]
+        with db.connect() as conn:
+            for emb_id in emb_ids:
+                conn.execute(
+                    "UPDATE face_embeddings SET cluster_id = ? WHERE id = ?",
+                    (cluster_id, emb_id),
+                )
+
+        for emb_id, _ in cluster:
+            for row_emb_id, row_file_id, _ in rows:
+                if row_emb_id == emb_id:
+                    file_to_cluster[row_file_id] = cluster_id
+
+    logger.info(f"人脸重聚类完成: {len(rows)} 个嵌入 -> {len(clusters)} 个聚类")
+    return file_to_cluster

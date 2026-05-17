@@ -68,6 +68,7 @@ class MainWindow(QMainWindow):
         self._timeline_known_ids = set()
         self._timeline_loaded = False
         self._special_loaded = False
+        self._special_stack_photos = []
 
         self.setStyleSheet("""
             QMainWindow {
@@ -95,6 +96,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         logger.info("MainWindow 正在关闭，等待后台线程...")
+        self._timeline_refresh_timer.stop()
         BackgroundTaskManager.get_instance().wait_all(5000)
         try:
             if self.db:
@@ -295,15 +297,22 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'nav_bar'):
             self.nav_bar.show()
 
+        # 暂停/恢复时间线刷新定时器
         if nav_id == "timeline":
             if not self._timeline_loaded:
                 self._load_timeline()
-        elif nav_id == "special":
-            if not self._special_loaded:
-                self._load_special_memories()
+            elif self.starred_only:
+                self._reload_timeline_starred()
+            self._timeline_refresh_timer.start()
+        else:
+            self._timeline_refresh_timer.stop()
+            if nav_id == "special":
+                if not self._special_loaded:
+                    self._load_special_memories()
 
     def _load_timeline(self):
-        rows = self.db.execute("""
+        starred_clause = "AND pm.is_starred = 1" if self.starred_only else ""
+        rows = self.db.execute(f"""
             SELECT pm.file_id as id, pm.thumbnail_path, pm.date_taken,
                    pm.width, pm.height, f.file_path, f.file_name,
                    f.folder_path, f.folder_name as folder_display, f.file_mtime
@@ -311,6 +320,7 @@ class MainWindow(QMainWindow):
             LEFT JOIN files f ON pm.file_id = f.id
             WHERE pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
                   AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
+                  {starred_clause}
             ORDER BY pm.date_taken DESC, f.file_mtime DESC
         """).fetchall()
         from ui.recommendation import _make_photo_dict
@@ -348,56 +358,93 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.warning(f"时间线增量刷新失败: {e}")
 
+    def _get_index_progress(self) -> float:
+        """获取索引进度（0.0 ~ 1.0），用于特殊回忆分阶段生成"""
+        try:
+            total = self.db.execute(
+                "SELECT COUNT(*) FROM files WHERE is_image = 1"
+            ).fetchone()[0]
+            if total == 0:
+                return 0.0
+            indexed = self.db.execute(
+                "SELECT COUNT(*) FROM photo_metadata WHERE thumbnail_path IS NOT NULL AND thumbnail_path != '__FAILED__'"
+            ).fetchone()[0]
+            return min(1.0, indexed / total)
+        except Exception as e:
+            logger.warning(f"获取索引进度失败: {e}")
+            return 0.0
+
+    def _get_life_photo_count(self) -> int:
+        """获取已索引的生活照片数量（与随机回忆瀑布流口径一致）"""
+        try:
+            row = self.db.execute("""
+                SELECT COUNT(*) FROM files f
+                JOIN folder_categories fc ON f.folder_path = fc.folder_path
+                LEFT JOIN photo_metadata pm ON f.id = pm.file_id
+                WHERE fc.category = 1
+                  AND f.is_image = 1
+                  AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
+                  AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
+            """).fetchone()
+            return row[0] if row else 0
+        except Exception as e:
+            logger.warning(f"获取生活照片数量失败: {e}")
+            return 0
+
     def _load_special_memories(self):
         from business.memory.memory_discovery import (
             get_on_this_day_memories,
+            discover_on_this_day,
             discover_special_date_memories,
             discover_folder_memories,
             discover_person_memories,
             discover_scene_memories,
             discover_event_memories,
+            discover_recent_memories,
         )
         from infra.db.repositories.memories_repo import MemoriesRepository
+
+        life_count = self._get_life_photo_count()
+        logger.info(f"特殊回忆加载: 生活照片数={life_count}")
 
         repo = MemoriesRepository(Database())
         all_memories = repo.get_undismissed()
         on_this_day = get_on_this_day_memories()
-        combined = on_this_day + [m for m in all_memories if m.memory_type != "on_this_day"]
+        # 那年今日最多展示最近 2 个（按 created_at 降序）
+        on_this_day = on_this_day[:2]
 
+        # 始终以现有回忆为基底，避免 discover 只返回新创建而丢失已有
+        combined = list(on_this_day) + [m for m in all_memories if m.memory_type != "on_this_day"]
         existing_ids = {m.id for m in combined}
 
-        if len(combined) < 3:
-            special_date = discover_special_date_memories()
-            for m in special_date:
-                if m.id not in existing_ids:
-                    combined.append(m)
-                    existing_ids.add(m.id)
+        # Phase 1: <200 张生活照片 → 仅文件夹回忆兜底
+        if life_count < 200:
+            logger.info(f"特殊回忆 Phase 1: 生活照片{life_count}<200")
 
-        if len(combined) < 3:
-            folder = discover_folder_memories(top_n=2)
-            for m in folder:
-                if m.id not in existing_ids:
-                    combined.append(m)
-                    existing_ids.add(m.id)
+        # Phase 3: >=200 张生活照片 → 全量发现（不含文件夹，后面统一决定）
+        else:
+            logger.info(f"特殊回忆 Phase 3: 生活照片{life_count}>=200，全量生成")
+            for discover in [
+                discover_special_date_memories,
+                discover_person_memories,
+                discover_scene_memories,
+                discover_event_memories,
+                discover_recent_memories,
+            ]:
+                for m in (discover() or []):
+                    if m.id not in existing_ids:
+                        combined.append(m)
+                        existing_ids.add(m.id)
 
-        # 新增：人物/场景/事件回忆
-        if len(combined) < 3:
-            person = discover_person_memories()
-            for m in person:
-                if m.id not in existing_ids:
-                    combined.append(m)
-                    existing_ids.add(m.id)
-
-        if len(combined) < 3:
-            scene = discover_scene_memories()
-            for m in scene:
-                if m.id not in existing_ids:
-                    combined.append(m)
-                    existing_ids.add(m.id)
-
-        if len(combined) < 3:
-            event = discover_event_memories()
-            for m in event:
+        # 有其他非文件夹回忆时，去掉文件夹回忆（文件夹仅作兜底）
+        has_non_folder = any(m.memory_type != "folder" for m in combined)
+        if has_non_folder:
+            combined = [m for m in combined if m.memory_type != "folder"]
+            logger.info(f"特殊回忆: 存在非文件夹回忆，已移除文件夹回忆，剩余 {len(combined)} 条")
+        else:
+            # 没有任何回忆时，补文件夹回忆兜底
+            new_folder = discover_folder_memories(top_n=1)
+            for m in (new_folder or []):
                 if m.id not in existing_ids:
                     combined.append(m)
                     existing_ids.add(m.id)
@@ -413,7 +460,8 @@ class MainWindow(QMainWindow):
     def _on_memory_dismissed(self, memory_id: int):
         logger.info(f"回忆 {memory_id} 已标记不再显示")
 
-    def _on_special_photo_clicked(self, photo_data: dict):
+    def _on_special_photo_clicked(self, photo_data: dict, stack_photos: list):
+        self._special_stack_photos = stack_photos
         self.on_photo_clicked(photo_data)
 
     def switch_page(self, index):
@@ -427,7 +475,15 @@ class MainWindow(QMainWindow):
 
     def toggle_starred(self):
         self.starred_only = self.star_btn.isChecked()
-        self._reload_random()
+        if self._current_nav == "timeline":
+            self._reload_timeline_starred()
+        else:
+            self._reload_random()
+
+    def _reload_timeline_starred(self):
+        """重新加载时间线，根据 starred_only 过滤"""
+        self._timeline_loaded = False
+        self._load_timeline()
 
     def _open_settings(self):
         from ui.components.setup_window import SetupWindow
@@ -522,7 +578,6 @@ class MainWindow(QMainWindow):
             self._cat_photos[cat_id] = reshuffled
             self._cat_offsets[cat_id] = 0
             self._cat_all_loaded[cat_id] = False
-            self._cat_shown_ids[cat_id] = set()
             self.pages[page_index].reset_for_shuffle()
             next_page = reshuffled[:PAGE_SIZE]
         else:
@@ -590,7 +645,7 @@ class MainWindow(QMainWindow):
             all_photos = self._timeline_photos
         elif self._current_nav == "special":
             cat_id = None
-            all_photos = [photo_data]
+            all_photos = self._special_stack_photos
         else:
             cat_id = CATEGORIES[self.current_page][0]
             all_photos = self._cat_photos.get(cat_id, [])
@@ -818,6 +873,118 @@ def main():
             BackgroundTaskManager.get_instance().register(bg)
             logger.info("后台关键词精分类线程已启动")
 
+        _bg_tags_started = [False]
+        _bg_faces_started = [False]
+
+        def start_background_tags():
+            """后台生成 SigLIP 标签"""
+            if _bg_tags_started[0]:
+                logger.info("后台标签生成已在运行，跳过重复启动")
+                return
+            _bg_tags_started[0] = True
+            from PyQt6.QtCore import QThread
+
+            class BgTagsWorker(QThread):
+                def run(self):
+                    from business.image_recognition.tag_generator import generate_tags_batch
+                    from infra.db.repositories.photo_tags_repo import PhotoTagsRepository
+                    from db_manager import Database
+
+                    tagged = PhotoTagsRepository(Database()).get_file_ids_by_source("siglip")
+                    with Database().connect() as conn:
+                        rows = conn.execute("""
+                            SELECT DISTINCT pm.file_id FROM photo_metadata pm
+                            WHERE pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
+                              AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
+                            ORDER BY pm.file_id
+                        """).fetchall()
+                    file_ids = [r[0] for r in rows if r[0] not in tagged]
+                    if not file_ids:
+                        logger.info("后台标签生成: 无新照片需要处理")
+                        return
+                    logger.info(f"后台标签生成: 将处理 {len(file_ids)} 张照片")
+                    batch_size = 32
+                    for i in range(0, len(file_ids), batch_size):
+                        batch = file_ids[i:i + batch_size]
+                        tags_dict = generate_tags_batch(batch)
+                        pending = []
+                        for fid, tags in tags_dict.items():
+                            for tag in tags:
+                                pending.append((fid, tag, "siglip"))
+                        if pending:
+                            with Database().connect() as conn:
+                                conn.executemany(
+                                    "INSERT OR IGNORE INTO photo_tags (file_id, tag, source) VALUES (?, ?, ?)",
+                                    pending,
+                                )
+                        logger.debug(f"后台标签: {i + len(batch)}/{len(file_ids)}")
+                    logger.info(f"后台标签生成完成: 已处理 {len(file_ids)} 张照片")
+
+            bg = BgTagsWorker()
+            bg.finished.connect(lambda: logger.info("后台标签生成线程结束"))
+            bg.finished.connect(start_background_faces)
+            bg.start()
+            BackgroundTaskManager.get_instance().register(bg)
+            logger.info("后台标签生成线程已启动")
+
+        def start_background_faces():
+            """后台人脸检测 + 嵌入提取 + 聚类"""
+            if _bg_faces_started[0]:
+                logger.info("后台人脸处理已在运行，跳过重复启动")
+                return
+            _bg_faces_started[0] = True
+            from PyQt6.QtCore import QThread
+
+            class BgFaceWorker(QThread):
+                def run(self):
+                    from infra.image.face_detector import extract_embeddings_batch
+                    from db_manager import Database
+
+                    db = Database()
+                    with db.connect() as conn:
+                        existing = {r[0] for r in conn.execute("SELECT DISTINCT file_id FROM face_embeddings").fetchall()}
+                        rows = conn.execute("""
+                            SELECT pm.file_id FROM photo_metadata pm
+                            WHERE pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
+                              AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
+                            ORDER BY pm.file_id
+                        """).fetchall()
+                    file_ids = [r[0] for r in rows if r[0] not in existing]
+                    if not file_ids:
+                        logger.info("后台人脸处理: 无新照片需要处理，检查是否需要重聚类")
+                        _recluster_faces()
+                        return
+                    logger.info(f"后台人脸处理: 将处理 {len(file_ids)} 张照片")
+                    batch_size = 16
+                    total = len(file_ids)
+                    for i in range(0, total, batch_size):
+                        batch = file_ids[i:i + batch_size]
+                        embeddings = extract_embeddings_batch(batch)
+                        pending = [(fid, emb.astype(np.float32).tobytes()) for fid, emb in embeddings]
+                        if pending:
+                            with db.connect() as conn:
+                                conn.executemany(
+                                    "INSERT INTO face_embeddings (file_id, embedding) VALUES (?, ?)",
+                                    pending,
+                                )
+                        logger.debug(f"后台人脸: {i + len(batch)}/{total}")
+                    logger.info(f"后台人脸嵌入提取完成，开始重聚类")
+                    _recluster_faces()
+
+            def _recluster_faces():
+                from business.image_recognition.face_cluster import recluster_all
+                try:
+                    result = recluster_all()
+                    logger.info(f"人脸重聚类完成: {len(result)} 张照片分配到聚类")
+                except Exception as e:
+                    logger.error(f"人脸重聚类失败: {e}")
+
+            bg = BgFaceWorker()
+            bg.finished.connect(lambda: logger.info("后台人脸处理线程结束"))
+            bg.start()
+            BackgroundTaskManager.get_instance().register(bg)
+            logger.info("后台人脸处理线程已启动")
+
         def start_background_scan():
             if _bg_scan_started[0]:
                 logger.info("后台扫描已在运行，跳过重复启动")
@@ -877,6 +1044,7 @@ def main():
             bg = BgIndexWorker()
             bg.progress.connect(lambda cur, tot: logger.info(f"后台索引: {cur}/{tot}"))
             bg.finished.connect(lambda: logger.info("后台索引线程结束"))
+            bg.finished.connect(start_background_tags)
             bg.start()
             BackgroundTaskManager.get_instance().register(bg)
             logger.info("后台索引线程已启动")

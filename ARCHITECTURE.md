@@ -1,4 +1,4 @@
-# NAS 照片回忆 - v0.3 架构
+# NAS 照片回忆 - v0.4.1 架构
 
 ## 1. 分层架构
 
@@ -67,15 +67,15 @@ UI 层 (ui/)          → app.py / components/ / recommendation
 | 模块 | 文件 | 职责 |
 |------|------|------|
 | 主窗口 | `ui/app.py` | MainWindow、侧边栏导航切换 |
-| 推荐 | `ui/recommendation.py` | 照片排序、打散、新鲜度、分页、reshuffle |
-| 瀑布流 | `ui/components/virtual_waterfall.py` | 虚拟滚动瀑布流、footer 提示、reset_for_shuffle |
+| 推荐 | `ui/recommendation.py` | 照片排序、打散、新鲜度、分页、reshuffle（fresh+stale 合并返回） |
+| 瀑布流 | `ui/components/virtual_waterfall.py` | 虚拟滚动瀑布流、footer 提示、reset_for_shuffle、缩略图文件存在性检查 |
 | 图片查看器 | `ui/components/image_viewer.py` | 异步原图加载（PIL→临时文件→主线程 QPixmap） |
 | 启动窗口 | `ui/components/startup_window.py` | 初始化进度、后台任务启动 |
 | 设置窗口 | `ui/components/setup_window.py` | 首次/修改配置、关键词管理、多照片库路径 |
 | 分类对话框 | `ui/components/folder_classifier_dialog.py` | 用户手动分类交互 |
 | 回忆卡片 | `ui/components/memory_cards.py` | 回忆卡片展示 |
 | 侧边栏 | `ui/components/sidebar.py` | 三等分竖排导航 |
-| 时间线 | `ui/components/timeline_view.py` | 按日期分组照片 |
+| 时间线 | `ui/components/timeline_view.py` | 按日期分组照片、年月索引拉球（月粒度+连续拖动+年月指示器）、回到顶部按钮 |
 | 特殊回忆 | `ui/components/special_memories.py` | 卡片堆叠+碎裂动画（⚠️ 细节待完善） |
 | 人物详情 | `ui/components/person_detail.py` | 人物回忆详情、命名、纠偏 |
 
@@ -96,7 +96,8 @@ ClassifyStage: 关键词预分类 → LLM 分类剩余 → 后台 refine_sample_
 ### 3.3 随机回忆
 
 ```
-load_category → rank_category_photos（去重/新鲜度/打散）→ 分页渲染 → 滚动加载 → 全部加载后洗牌续滚
+load_category → rank_category_photos（去重/新鲜度/打散）→ 分页渲染 → 滚动加载 → 全部加载后 reshuffle 续滚
+reshuffle 返回 fresh + stale 合并列表，_cat_shown_ids 持续累积不清理，确保同次会话不重复
 ```
 
 ### 3.4 识别（后台）
@@ -113,6 +114,7 @@ background_task_manager → tag_generator → clip_encoder → PhotoTagsRepo
 memory_discovery: on_this_day / recent / special_date / folder → memories 表
 memory_generator: LLM 叙事 → memories 表（memory_type=auto）
 special_memories: 查询未 dismissed → 卡片堆叠展示
+                  三阶段触发：<30%仅文件夹 → 30-70%文件夹+日期+近期 → >70%全量
 ```
 
 LLM 调用场景：文件夹分类（启动1次）、事件/旅行叙事（按需）。回忆标题模板化不调用 LLM。
@@ -177,9 +179,11 @@ es.exe 查询 → _match_source_dir（盘符↔UNC↔IP 交叉匹配）→ _norm
 | FRESHNESS_WINDOW_DAYS | recommendation.py | 7 | 新鲜度窗口（天） |
 | MAX_SAME_DAY_STREAK | recommendation.py | 12 | 同日最大出现数 |
 | COL_COUNT | virtual_waterfall.py | 3 | 瀑布流列数 |
-| thumbnail_size | config.py (Settings) | (400,400) | 缩略图尺寸（UI/AI 共用） |
+| thumbnail_size | config.py (Settings) | (600,600) | 缩略图尺寸（UI/AI 共用） |
 | memory_high_freq_days | config.py (Settings) | 3 | 回忆高频生成天数 |
 | phash_threshold | config.py (Settings) | 8 | 感知哈希去重阈值 |
+| SPECIAL_PHASE1_THRESHOLD | app.py `_get_index_progress()` | 0.3 | 特殊回忆 Phase 1→2 索引进度阈值 |
+| SPECIAL_PHASE2_THRESHOLD | app.py `_get_index_progress()` | 0.7 | 特殊回忆 Phase 2→3 索引进度阈值 |
 
 ## 6. 功能清单
 
@@ -204,7 +208,13 @@ es.exe 查询 → _match_source_dir（盘符↔UNC↔IP 交叉匹配）→ _norm
 | 17 | 大图异步加载 | UI层 | 高 | ✅ |
 | 18 | 特殊回忆卡片碎裂动画 | UI层 | 中 | ⚠️ 框架已实现 |
 | 19 | 缩略图版本复用 | db/indexer | 高 | 📋 v0.4 |
-| 20 | custom-ui-pyqt6增强卡片 | UI层 | 延后 | ⏸️ |
+| 20 | 随机回忆同页不重复（shown_ids 累积） | UI层 | 高 | ✅ |
+| 21 | 时间线年月拉球（月粒度+连续滚动+年月指示器） | UI层 | 高 | ✅ |
+| 22 | 时间线回到最新按钮 | UI层 | 中 | ✅ |
+| 23 | 优秀回忆按钮统一（时间线+随机） | UI层 | 高 | ✅ |
+| 24 | 特殊回忆三阶段触发机制 | UI/business | 高 | ✅ |
+| 25 | 缓存目录外部化 | config | 中 | ✅ |
+| 26 | custom-ui-pyqt6增强卡片 | UI层 | 延后 | ⏸️ |
 
 ## 7. 依赖与风险
 

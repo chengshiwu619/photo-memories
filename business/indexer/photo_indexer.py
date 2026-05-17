@@ -227,7 +227,7 @@ def _index_single_photo(file_id, file_path):
 
     try:
         with Image.open(file_path) as _test:
-            pass
+            _test.load()  # 强制解码像素数据，提前捕获截断文件
     except Exception as e:
         logger.warning(f"无法识别图片, 标记跳过: {file_path}: {e}")
         return (

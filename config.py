@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     deepseek_classify_model: str = "deepseek-v4-flash"
 
     source_drive: str = "D:\\测试"
-    photo_data_dir: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage")
+    photo_data_dir: str = "D:\\photo-memories-cache"
 
     thumbnail_size: tuple[int, int] = (600, 600)
     phash_threshold: int = 8
