@@ -166,8 +166,9 @@ def load_photos_from_ids(db, all_ids):
                    f.folder_name as folder_display, f.file_mtime, pm.thumbnail_path,
                    pm.width, pm.height, pm.date_taken
             FROM files f
-            LEFT JOIN photo_metadata pm ON f.id = pm.file_id
-            WHERE f.id IN ({placeholders})""",
+            JOIN photo_metadata pm ON f.id = pm.file_id
+            WHERE f.id IN ({placeholders})
+                  AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'""",
         unique_ids,
     ).fetchall()
     return _interleave_small_folders([_make_photo_dict(r) for r in rows])

@@ -144,18 +144,19 @@ def discover_special_date_memories() -> List[Memory]:
     rows = pm_repo.get_photos_by_month_day(month_days)
 
     if not rows:
-        with db.connect() as conn:
-            rows = conn.execute(f"""
-                SELECT f.id, f.folder_path, pm.date_taken, fc.category
-                FROM files f
-                JOIN photo_metadata pm ON f.id = pm.file_id
-                LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
-                WHERE f.is_image = 1
-                  AND pm.date_taken IS NOT NULL
-                  AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
-                  AND ({" OR ".join("substr(pm.date_taken, 6, 5) = ?" for _ in month_days)})
-                ORDER BY pm.date_taken DESC
-            """, month_days).fetchall()
+            with db.connect() as conn:
+                rows = conn.execute(f"""
+                    SELECT f.id, f.folder_path, pm.date_taken, fc.category
+                    FROM files f
+                    JOIN photo_metadata pm ON f.id = pm.file_id
+                    LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
+                    WHERE f.is_image = 1
+                      AND pm.date_taken IS NOT NULL
+                      AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
+                      AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
+                      AND ({" OR ".join("substr(pm.date_taken, 6, 5) = ?" for _ in month_days)})
+                    ORDER BY pm.date_taken DESC
+                """, month_days).fetchall()
 
     if not rows:
         return []
@@ -217,6 +218,7 @@ def discover_folder_memories(top_n: int = 5) -> List[Memory]:
             LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
             WHERE f.is_image = 1
               AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
+              AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
             GROUP BY f.folder_path
             HAVING cnt >= 3
             ORDER BY cnt DESC
@@ -235,6 +237,7 @@ def discover_folder_memories(top_n: int = 5) -> List[Memory]:
                 WHERE f.folder_path = ?
                   AND f.is_image = 1
                   AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
+                  AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
                 ORDER BY pm.date_taken DESC
                 LIMIT 20
             """, (folder_path,)).fetchall()

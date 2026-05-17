@@ -234,11 +234,17 @@ class MainWindow(QMainWindow):
 
         self._timeline_view = TimelineView()
         self._timeline_view.photo_clicked.connect(self.on_photo_clicked)
+        self._timeline_view._scroll.verticalScrollBar().valueChanged.connect(
+            lambda v: self._on_page_scroll(self._timeline_view, v)
+        )
 
         self._special_view = SpecialMemoriesView()
         self._special_view.memory_clicked.connect(self._on_memory_clicked)
         self._special_view.memory_dismissed.connect(self._on_memory_dismissed)
         self._special_view.photo_clicked.connect(self._on_special_photo_clicked)
+        self._special_view._scroll.verticalScrollBar().valueChanged.connect(
+            lambda v: self._on_page_scroll(self._special_view, v)
+        )
 
         self._nav_stack = QStackedWidget()
         self._nav_stack.addWidget(self._random_container)
@@ -255,6 +261,10 @@ class MainWindow(QMainWindow):
         idx = nav_map.get(nav_id, 0)
         self._nav_stack.setCurrentIndex(idx)
         self._current_nav = nav_id
+
+        self.top_bar.show()
+        if hasattr(self, 'nav_bar'):
+            self.nav_bar.show()
 
         if nav_id == "timeline":
             if not self._timeline_loaded:
@@ -474,7 +484,8 @@ class MainWindow(QMainWindow):
 
     def _on_page_scroll(self, page, value):
         if value > 10:
-            page.memory_summary.hide()
+            if hasattr(page, 'memory_summary'):
+                page.memory_summary.hide()
 
         page_key = id(page)
         last_val = self._last_scroll_vals.get(page_key, 0)
@@ -482,10 +493,12 @@ class MainWindow(QMainWindow):
         if abs(delta) > 5:
             if delta > 0 and value > 40:
                 self.top_bar.hide()
-                self.nav_bar.hide()
+                if hasattr(self, 'nav_bar'):
+                    self.nav_bar.hide()
             elif delta < 0:
                 self.top_bar.show()
-                self.nav_bar.show()
+                if hasattr(self, 'nav_bar'):
+                    self.nav_bar.show()
             self._last_scroll_vals[page_key] = value
 
     def on_photo_clicked(self, photo_data):
@@ -519,7 +532,7 @@ class MainWindow(QMainWindow):
             all_photos = self._timeline_photos
         elif self._current_nav == "special":
             cat_id = None
-            all_photos = []
+            all_photos = [photo_data]
         else:
             cat_id = CATEGORIES[self.current_page][0]
             all_photos = self._cat_photos.get(cat_id, [])

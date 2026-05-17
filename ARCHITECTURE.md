@@ -13,7 +13,7 @@ UI 层 (ui/)          → app.py / components/ / recommendation
 ### 层间依赖规则
 
 - 严格单向依赖：上层可调用下层，下层禁止调用上层
-- 跨层调用必须通过层间接口表（§11），禁止直接 import 层内未导出模块
+- 跨层调用必须通过层间接口表（§10），禁止直接 import 层内未导出模块
 - UI 层禁止直接写 SQL，必须通过 Repository 或 db_manager
 - 业务层禁止直接操作 UI 组件
 - AI 识别任务使用缩略图，不读取原图
@@ -234,7 +234,7 @@ es.exe 查询 → _match_source_dir（盘符↔UNC↔IP 交叉匹配）→ _norm
 10. 数据库迁移必须可逆（迁移前自动备份）
 11. 涉及用户照片的删除/移动操作，永远走标记而非物理操作
 12. 禁止死代码入库
-13. 层间调用走接口表（§11）
+13. 层间调用走接口表（§10）
 14. Config 统一走 get_settings()
 
 ### 架构变更审核范围
@@ -320,7 +320,48 @@ es.exe 查询 → _match_source_dir（盘符↔UNC↔IP 交叉匹配）→ _norm
 
 新增：登记后即可使用。删除：确认无调用方后移除+架构审核。修改签名：架构审核。
 
-## 11. 技术债（P2 延后至 v0.4）
+## 11. 数据库版本更迭与数据完整性
+
+### 11.1 核心问题：file_id 漂移
+
+文件扫描器每次全量重建时，同一物理文件可能被分配新的 `file_id`（因为扫描顺序不确定、增量删除后 ID 空洞被复用等）。这导致所有通过 `file_id` 关联的表都可能产生**悬空引用**：
+
+| 表 | 受影响字段 | 恢复策略 |
+|----|-----------|---------|
+| memories | `photo_ids` (JSON) | **可删后重建**：回忆发现流程无状态，重新运行即可生成等效结果。首选项。 |
+| face_embeddings | `file_id` | 需通过 `file_path` 匹配重新映射 |
+| events | `photo_ids` (JSON) | 同 memories，重新聚类生成 |
+| photo_tags | `file_id` | 需重新运行标签生成 |
+| photo_shown_history | `file_id` | 历史记录，可接受丢失 |
+| click_history | `file_id` | 历史记录，可接受丢失 |
+
+### 11.2 检测方法
+
+```sql
+-- 检测 memories 中引用的 photo_ids 是否有有效缩略图（最直接的信号）
+SELECT m.id, m.memory_type,
+       COUNT(*) as total_ids,
+       SUM(CASE WHEN pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__' THEN 1 ELSE 0 END) as valid
+FROM memories m, json_each(m.photo_ids) j
+LEFT JOIN photo_metadata pm ON pm.file_id = j.value
+WHERE m.dismissed_at IS NULL
+GROUP BY m.id
+HAVING valid < total_ids;
+```
+
+### 11.3 应对策略
+
+1. **memories 首选删后重建**：回忆发现流程（`memory_discovery.py`）完全无状态，重新运行即可生成等效的回忆。每次 DB 重建后，清空 `memories` 表让发现流程重新填充。
+2. **face_embeddings 等需保留的数据**：通过 `file_path` 交叉匹配新旧 `file_id`，写迁移脚本重映射。
+3. **启动时完整性检查**（规划中）：MainWindow 初始化时运行轻量检测，发现悬空引用自动清理并触发重建。
+
+### 11.4 已记录案例
+
+- **2026-05-17**：DB 重建后 file_id 从 1~1226 漂移至 1227~3286，memories 表中 4 条 folder 回忆引用的旧 ID 全部 `thumbnail_path IS NULL`，导致特殊回忆栏空白。处理：清空 memories 表，依赖发现流程自动重建。
+
+---
+
+## 12. 技术债（P2 延后至 v0.4）
 
 | # | 问题 | 修复方向 |
 |---|------|---------|

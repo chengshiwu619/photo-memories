@@ -13,17 +13,20 @@
 - 不确定就问，别猜
 - 没要求的不写，只改被要求的部分
 - 禁止死代码入库
-- 层间调用走接口表（ARCHITECTURE.md §11）
+- 层间调用走接口表（ARCHITECTURE.md §10）
 - Config 统一走 get_settings()
 
 ## 待验证问题
 - 特殊回忆初期填充逻辑（三层兜底：on_this_day→special_date→folder）需在有实际照片数据后验证效果
-- 缩略图/数据库清空后重建状态待确认
+
+## 已验证问题
+- 缩略图/数据库清空后重建状态：DB 重建后 memories 表引用过期 file_id（thumbnail_path 全 NULL），导致特殊回忆栏空白。处理策略：memories 可安全删后重建（ARCHITECTURE.md §11.1）。
 
 ## v0.4 待修改项
 - 版本更迭缓存清理机制：当缩略图参数（尺寸/质量）变更时，自动检测并清理旧缩略图，触发重新生成；需考虑增量重建（避免一次性全部重生成导致长时间阻塞）
 - 时间线侧边索引拉球：快速定位到某个时间点
 - 特殊回忆创建机制验证：地点聚合、人脸聚合等是否正确运行
+- 启动时 memories/events 等表的 file_id 完整性检查（悬空引用自动清理+重建），参见 ARCHITECTURE.md §11
 
 ## 缩略图参数
 - 当前：600×600，JPEG quality=90（v0.3 之前为 400×400/quality=80，已手动清理旧缓存并重置 thumbnail_path）
