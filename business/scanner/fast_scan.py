@@ -106,18 +106,136 @@ def _run_es(args, timeout=120):
 
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=timeout, creationflags=subprocess.CREATE_NO_WINDOW)
-        text = result.stdout.decode("utf-8", errors="replace").strip()
+        text = result.stdout.decode("gbk", errors="replace").strip()
         return text, result.returncode
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         logger.warning(f"es.exe 调用失败: {e}")
         return "", -1
 
 
+_drive_mappings_cache = None
+
+
+def _resolve_unc_host(unc_path):
+    host = unc_path[2:].split("\\")[0] if unc_path.startswith("\\\\") else ""
+    if not host:
+        return ""
+    try:
+        import socket
+        ip = socket.gethostbyname(host)
+        return ip if ip != host else ""
+    except Exception:
+        return ""
+
+
+def _get_drive_mappings():
+    global _drive_mappings_cache
+    if _drive_mappings_cache is not None:
+        return _drive_mappings_cache
+
+    drive_to_unc = {}
+    unc_to_drive = {}
+
+    try:
+        result = subprocess.run(
+            ["net", "use"],
+            capture_output=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        text = result.stdout.decode("gbk", errors="replace")
+        for line in text.split("\n"):
+            parts = line.split()
+            if len(parts) >= 3 and len(parts[1]) == 2 and parts[1][1] == ':' and parts[2].startswith("\\\\"):
+                drive = parts[1].upper()
+                unc = parts[2].rstrip("\\")
+                drive_to_unc[drive] = unc
+                unc_to_drive[unc.upper()] = drive
+
+                ip = _resolve_unc_host(unc)
+                if ip:
+                    unc_with_ip = "\\\\" + ip + unc[2 + len(unc[2:].split("\\")[0]):]
+                    unc_to_drive[unc_with_ip.upper()] = drive
+    except Exception:
+        pass
+
+    _drive_mappings_cache = (drive_to_unc, unc_to_drive)
+    return _drive_mappings_cache
+
+
+def _expand_source_dir_prefixes(sd):
+    sd_norm = sd.rstrip("\\")
+    prefixes = {sd_norm + "\\"}
+
+    drive_to_unc, unc_to_drive = _get_drive_mappings()
+
+    if len(sd_norm) >= 2 and sd_norm[1] == ':':
+        drive = sd_norm[:2].upper()
+        if drive in drive_to_unc:
+            unc_root = drive_to_unc[drive]
+            remainder = sd_norm[2:]
+            prefixes.add((unc_root + remainder).rstrip("\\") + "\\")
+
+    if sd_norm.startswith("\\\\"):
+        sd_upper = sd_norm.upper()
+        for unc_key, drive in unc_to_drive.items():
+            if sd_upper.startswith(unc_key):
+                remainder = sd_norm[len(unc_key):]
+                prefixes.add((drive + remainder).rstrip("\\") + "\\")
+
+        ip = _resolve_unc_host(sd_norm)
+        if ip:
+            ip_prefix = "\\\\" + ip + sd_norm[2 + len(sd_norm[2:].split("\\")[0]):]
+            ip_prefix = ip_prefix.rstrip("\\") + "\\"
+            prefixes.add(ip_prefix)
+            for unc_key, drive in unc_to_drive.items():
+                if ip_prefix.upper().startswith(unc_key):
+                    remainder = ip_prefix[len(unc_key):].rstrip("\\")
+                    prefixes.add((drive + remainder).rstrip("\\") + "\\")
+
+    return prefixes
+
+
+def _normalize_filepath(filepath, source_dir):
+    sd_norm = source_dir.rstrip("\\")
+    fp_norm = filepath
+
+    drive_to_unc, unc_to_drive = _get_drive_mappings()
+
+    if sd_norm.startswith("\\\\") and len(fp_norm) >= 2 and fp_norm[1] == ':':
+        drive = fp_norm[:2].upper()
+        if drive in drive_to_unc:
+            remainder = fp_norm[2:]
+            return sd_norm + remainder
+
+    if len(sd_norm) >= 2 and sd_norm[1] == ':' and fp_norm.startswith("\\\\"):
+        fp_upper = fp_norm.upper()
+        best_len = 0
+        best_drive = None
+        best_unc_key = None
+        for unc_key, drive in unc_to_drive.items():
+            if fp_upper.startswith(unc_key) and len(unc_key) > best_len:
+                best_len = len(unc_key)
+                best_drive = drive
+                best_unc_key = unc_key
+        if best_drive:
+            remainder = fp_norm[len(best_unc_key):]
+            return best_drive + remainder
+
+    if sd_norm.startswith("\\\\") and fp_norm.startswith("\\\\"):
+        sd_host = sd_norm[2:].split("\\")[0]
+        fp_host = fp_norm[2:].split("\\")[0]
+        if sd_host.lower() != fp_host.lower():
+            remainder = fp_norm[2 + len(fp_host):]
+            return sd_norm + remainder
+
+    return filepath
+
+
 def _match_source_dir(filepath):
     for sd in get_settings().source_dirs:
-        prefix = sd.rstrip("\\") + "\\"
-        if filepath.startswith(prefix) or filepath.startswith(sd.rstrip("\\") + "/"):
-            return sd
+        for prefix in _expand_source_dir_prefixes(sd):
+            if filepath.startswith(prefix) or filepath.startswith(prefix.replace("\\", "/")):
+                return sd
     return None
 
 
@@ -170,8 +288,10 @@ def _parse_es_csv(text):
     for line in text.strip().split("\n"):
         line = line.strip()
         filepath = line.strip("\"")
-        if _match_source_dir(filepath) is None:
+        sd = _match_source_dir(filepath)
+        if sd is None:
             continue
+        filepath = _normalize_filepath(filepath, sd)
         ext = os.path.splitext(filepath)[1].lower()
         if ext in ALL_EXTENSIONS:
             files.append(filepath)
@@ -385,9 +505,13 @@ def fast_scan(num_files=1000, progress_callback=None):
     files = []
     for line in out.strip().split("\n"):
         line = line.strip()
-        if not line or _match_source_dir(line.strip('"')) is None:
+        if not line:
             continue
         filepath = line.strip('"').replace("\\\\", "\\")
+        sd = _match_source_dir(filepath)
+        if sd is None:
+            continue
+        filepath = _normalize_filepath(filepath, sd)
         ext = os.path.splitext(filepath)[1].lower()
         if ext in ALL_EXTENSIONS:
             files.append(filepath)

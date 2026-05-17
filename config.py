@@ -27,7 +27,14 @@ class Settings(BaseSettings):
 
     @property
     def source_dirs(self) -> list[str]:
-        return [p.strip() for p in self.source_drive.split(";") if p.strip()]
+        dirs = []
+        for p in self.source_drive.split(";"):
+            p = p.strip()
+            if p and len(p) >= 2 and p[0] == "\\" and p[1] != "\\":
+                p = "\\" + p
+            if p:
+                dirs.append(p)
+        return dirs
 
     @property
     def db_path(self) -> str:
