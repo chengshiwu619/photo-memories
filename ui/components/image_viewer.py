@@ -1,11 +1,35 @@
+import os
+import tempfile
+
 from PyQt6.QtWidgets import QWidget, QLabel, QPushButton
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QPixmap, QTransform
+from PyQt6.QtCore import Qt, pyqtSignal, QThread
+from PyQt6.QtGui import QPixmap
 
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 register_heif_opener()
 Image.MAX_IMAGE_PIXELS = 500_000_000
+
+
+class _LoadOriginalWorker(QThread):
+    loaded = pyqtSignal(str)
+
+    def __init__(self, file_path):
+        super().__init__()
+        self._file_path = file_path
+
+    def run(self):
+        try:
+            img = Image.open(self._file_path)
+            img = ImageOps.exif_transpose(img)
+            fd, temp_path = tempfile.mkstemp(suffix='.jpg')
+            os.close(fd)
+            if img.mode in ("RGBA", "P"):
+                img = img.convert("RGB")
+            img.save(temp_path, "JPEG", quality=92)
+            self.loaded.emit(temp_path)
+        except Exception:
+            self.loaded.emit("")
 
 
 class ImageViewer(QWidget):
@@ -18,6 +42,9 @@ class ImageViewer(QWidget):
         self.photos = []
         self.current_index = 0
         self.starred_ids = set()
+        self._load_worker = None
+        self._loading_index = -1
+        self._temp_path = ""
         self.setup_ui()
 
     def setup_ui(self):
@@ -110,8 +137,26 @@ class ImageViewer(QWidget):
         self._load_current()
 
     def hide_viewer(self):
+        self._cancel_load()
         self.hide()
         self.closed.emit()
+
+    def _cancel_load(self):
+        if self._load_worker and self._load_worker.isRunning():
+            self._load_worker.loaded.disconnect(self._on_original_loaded)
+            self._load_worker.quit()
+            self._load_worker.wait(500)
+            self._load_worker = None
+        self._loading_index = -1
+        self._cleanup_temp()
+
+    def _cleanup_temp(self):
+        if self._temp_path:
+            try:
+                os.unlink(self._temp_path)
+            except Exception:
+                pass
+            self._temp_path = ""
 
     def _load_current(self):
         if not self.photos or self.current_index < 0:
@@ -119,20 +164,64 @@ class ImageViewer(QWidget):
         if self.current_index >= len(self.photos):
             self.current_index = len(self.photos) - 1
 
-        photo = self.photos[self.current_index]
-        file_path = photo.get("file_path", "")
+        self._cancel_load()
 
-        pixmap = self._load_rotated_pixmap(file_path)
-        if pixmap is None or pixmap.isNull():
-            thumb_path = photo.get("thumbnail_path", "")
-            if thumb_path:
-                pixmap = QPixmap(thumb_path)
-        if pixmap is None or pixmap.isNull():
-            self.image_label.setText("无法加载")
-            self.image_label.setStyleSheet("color: #333; font-size: 18px; background: #000;")
-            self._update_buttons()
+        photo = self.photos[self.current_index]
+
+        thumb_path = photo.get("thumbnail_path", "")
+        if thumb_path:
+            pixmap = QPixmap(thumb_path)
+            if not pixmap.isNull():
+                avail = self.size()
+                scaled = pixmap.scaled(
+                    avail, Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation
+                )
+                self.image_label.setPixmap(scaled)
+                self.image_label.setGeometry(0, 0, avail.width(), avail.height())
+
+        file_path = photo.get("file_path", "")
+        if file_path:
+            self._loading_index = self.current_index
+            self._load_worker = _LoadOriginalWorker(file_path)
+            self._load_worker.loaded.connect(self._on_original_loaded)
+            self._load_worker.start()
+        else:
+            if self.image_label.pixmap() is None:
+                self.image_label.setText("无法加载")
+                self.image_label.setStyleSheet("color: #333; font-size: 18px; background: #000;")
+
+        self._update_buttons()
+
+    def _on_original_loaded(self, temp_path):
+        if self._loading_index != self.current_index:
+            try:
+                if temp_path:
+                    os.unlink(temp_path)
+            except Exception:
+                pass
             return
 
+        self._cleanup_temp()
+
+        if not temp_path:
+            if self.image_label.pixmap() is None:
+                self.image_label.setText("无法加载")
+                self.image_label.setStyleSheet("color: #333; font-size: 18px; background: #000;")
+            return
+
+        pixmap = QPixmap(temp_path)
+        if pixmap.isNull():
+            if self.image_label.pixmap() is None:
+                self.image_label.setText("无法加载")
+                self.image_label.setStyleSheet("color: #333; font-size: 18px; background: #000;")
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+            return
+
+        self._temp_path = temp_path
         avail = self.size()
         scaled = pixmap.scaled(
             avail, Qt.AspectRatioMode.KeepAspectRatio,
@@ -140,27 +229,6 @@ class ImageViewer(QWidget):
         )
         self.image_label.setPixmap(scaled)
         self.image_label.setGeometry(0, 0, avail.width(), avail.height())
-        self._update_buttons()
-
-    def _load_rotated_pixmap(self, file_path):
-        try:
-            img = Image.open(file_path)
-            img = ImageOps.exif_transpose(img)
-            import tempfile
-            import os
-            fd, temp_path = tempfile.mkstemp(suffix='.jpg')
-            os.close(fd)
-            if img.mode in ("RGBA", "P"):
-                img = img.convert("RGB")
-            img.save(temp_path, "JPEG", quality=92)
-            pixmap = QPixmap(temp_path)
-            try:
-                os.unlink(temp_path)
-            except Exception:
-                pass
-            return pixmap
-        except Exception:
-            return QPixmap(file_path)
 
     def _update_buttons(self):
         if not self.photos:
@@ -255,7 +323,6 @@ class ImageViewer(QWidget):
 
     def _open_file(self):
         import subprocess
-        import os
         if not self.photos:
             return
         photo = self.photos[self.current_index]

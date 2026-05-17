@@ -8,10 +8,9 @@ _NAV_BTN_STYLE = """
         color: #a0a0b0;
         border: none;
         border-left: 3px solid transparent;
-        padding: 6px 0;
-        font-size: 11px;
-        text-align: center;
-        line-height: 1.4;
+        padding: 0;
+        font-size: 12px;
+        line-height: 14px;
     }
     QPushButton:hover {
         color: #e0e0e0;
@@ -25,9 +24,9 @@ _NAV_BTN_STYLE = """
 """
 
 _NAV_ITEMS = [
-    ("random", "💡\n回\n忆"),
-    ("timeline", "📅\n时\n间\n线"),
-    ("special", "✨\n特\n殊\n回\n忆"),
+    ("random", "回\n忆"),
+    ("timeline", "时\n间\n线"),
+    ("special", "特\n殊\n回\n忆"),
 ]
 
 
@@ -41,23 +40,20 @@ class Sidebar(QWidget):
         self._setup_ui()
 
     def _setup_ui(self):
-        self.setFixedWidth(48)
+        self.setFixedWidth(56)
         self.setStyleSheet("background: #1a1a2e; border-right: 1px solid #2a2a4e;")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 20, 0, 20)
-        layout.setSpacing(2)
+        layout.setSpacing(0)
 
         for nav_id, label in _NAV_ITEMS:
             btn = QPushButton(label)
             btn.setStyleSheet(_NAV_BTN_STYLE)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setFixedHeight(72)
             btn.clicked.connect(lambda checked, nid=nav_id: self._on_nav(nid))
-            layout.addWidget(btn)
+            layout.addWidget(btn, 1)
             self._buttons[nav_id] = btn
-
-        layout.addStretch()
 
         self._update_active()
 

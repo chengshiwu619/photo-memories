@@ -273,7 +273,7 @@ def rank_search_photos(db, matched_ids):
 
 
 def reshuffle_photos(photos, shown_ids=None):
-    """对照片列表重新洗牌，已显示过的照片降权排到后面"""
+    """对照片列表重新洗牌，已显示过的照片排到后面；fresh 为空时才从 stale 取"""
     if not photos:
         return []
 
@@ -286,7 +286,6 @@ def reshuffle_photos(photos, shown_ids=None):
     random.shuffle(fresh)
     random.shuffle(stale)
 
-    result = []
-    result.extend(fresh)
-    result.extend(stale)
-    return _interleave_by_time(_interleave_small_folders(result))
+    if fresh:
+        return _interleave_by_time(_interleave_small_folders(fresh))
+    return _interleave_by_time(_interleave_small_folders(stale))

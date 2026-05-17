@@ -4,7 +4,7 @@ from PIL import Image, ImageOps
 from collections import OrderedDict
 
 from logger_setup import logger
-from config import THUMBNAIL_SIZE, get_settings
+from config import get_settings
 
 
 class ThumbnailLoader:

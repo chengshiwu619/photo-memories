@@ -12,7 +12,7 @@ register_heif_opener()
 Image.MAX_IMAGE_PIXELS = 500_000_000
 
 from logger_setup import logger
-from config import THUMBNAIL_SIZE, PHASH_THRESHOLD, get_settings
+from config import get_settings
 from db_manager import Database
 from checkpoint_manager import CheckpointManager, CheckpointState
 
@@ -143,9 +143,10 @@ def generate_thumbnail(filepath, thumbnail_name):
     try:
         with Image.open(filepath) as img:
             orig_w, orig_h = img.size
-            img.draft("RGB", THUMBNAIL_SIZE)
+            thumb_size = get_settings().thumbnail_size
+            img.draft("RGB", thumb_size)
             img = _auto_rotate(img)
-            img.thumbnail(THUMBNAIL_SIZE, Image.LANCZOS)
+            img.thumbnail(thumb_size, Image.LANCZOS)
             if img.mode in ("RGBA", "P"):
                 img = img.convert("RGB")
             img.save(thumb_path, "JPEG", quality=80)
@@ -187,7 +188,7 @@ def dedup_by_phash(progress_callback=None):
         h = imagehash.hex_to_hash(phash_str)
         found_dup = False
         for existing_id, existing_hash in phash_map.items():
-            if h - existing_hash <= PHASH_THRESHOLD:
+            if h - existing_hash <= get_settings().phash_threshold:
                 with _db.connect() as conn:
                     conn.execute(
                         "UPDATE photo_metadata SET is_duplicate_of = ? WHERE file_id = ?",

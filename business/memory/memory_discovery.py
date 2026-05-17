@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import datetime, timedelta
 from typing import List, Optional
 
@@ -7,10 +8,7 @@ from db_manager import Database
 from core.models import Memory
 from infra.db.repositories.memories_repo import MemoriesRepository
 from infra.db.repositories.photo_metadata_repo import PhotoMetadataRepository
-from infra.db.repositories.face_clusters_repo import FaceClustersRepository
-from infra.db.repositories.face_embeddings_repo import FaceEmbeddingsRepository
-from infra.db.repositories.events_repo import EventsRepository
-from config import MEMORY_HIGH_FREQ_DAYS
+from config import get_settings
 
 
 def discover_on_this_day(lookback_years: Optional[List[int]] = None) -> List[Memory]:
@@ -75,7 +73,9 @@ def discover_on_this_day(lookback_years: Optional[List[int]] = None) -> List[Mem
     return memories
 
 
-def discover_recent_memories(days: int = MEMORY_HIGH_FREQ_DAYS) -> List[Memory]:
+def discover_recent_memories(days: Optional[int] = None) -> List[Memory]:
+    if days is None:
+        days = get_settings().memory_high_freq_days
     since = (datetime.now() - timedelta(days=days)).isoformat()
 
     db = Database()
@@ -118,145 +118,152 @@ def discover_recent_memories(days: int = MEMORY_HIGH_FREQ_DAYS) -> List[Memory]:
     return memories
 
 
-def discover_person_memories() -> List[Memory]:
-    db = Database()
-    clusters_repo = FaceClustersRepository(db)
-    embeddings_repo = FaceEmbeddingsRepository(db)
-    memories_repo = MemoriesRepository(db)
-
-    clusters = clusters_repo.get_all()
-    if not clusters:
-        return []
-
-    memories = []
-    for cluster in clusters:
-        if cluster.user_corrected and not cluster.person_name:
-            continue
-
-        member_ids = embeddings_repo.get_file_ids_by_cluster(cluster.cluster_id)
-        if len(member_ids) < 3:
-            continue
-
-        photo_ids = member_ids[:20]
-        name = cluster.person_name or f"人物{cluster.cluster_id}"
-        title = f"与{name}的回忆"
-
-        existing = _find_existing_memory(memories_repo, "person", str(cluster.cluster_id))
-        if existing:
-            continue
-
-        m = Memory(
-            category=1,
-            memory_type="person",
-            title=title,
-            photo_ids=json.dumps(photo_ids),
-            cover_file_id=photo_ids[0] if photo_ids else None,
-            payload=json.dumps({"cluster_id": cluster.cluster_id, "person_name": name}),
-        )
-        mid = memories_repo.insert(m)
-        m.id = mid
-        memories.append(m)
-
-    logger.info(f"人物回忆发现 {len(memories)} 组")
-    return memories
-
-
-def discover_event_memories() -> List[Memory]:
-    db = Database()
-    events_repo = EventsRepository(db)
-    memories_repo = MemoriesRepository(db)
-
-    events = events_repo.get_all()
-    if not events:
-        return []
-
-    memories = []
-    for event in events:
-        try:
-            photo_ids = json.loads(event.photo_ids) if event.photo_ids else []
-        except Exception:
-            continue
-
-        if len(photo_ids) < 3:
-            continue
-
-        photo_ids = photo_ids[:20]
-        event_type_label = "旅行" if event.event_type == "trip" else "事件"
-        title = f"{event_type_label} · {event.start_date[:10]}"
-
-        existing = _find_existing_memory(memories_repo, "event", str(event.event_id))
-        if existing:
-            continue
-
-        m = Memory(
-            category=1,
-            memory_type="event",
-            title=title,
-            photo_ids=json.dumps(photo_ids),
-            cover_file_id=photo_ids[0] if photo_ids else None,
-            payload=json.dumps({"event_id": event.event_id, "event_type": event.event_type}),
-        )
-        mid = memories_repo.insert(m)
-        m.id = mid
-        memories.append(m)
-
-    logger.info(f"事件回忆发现 {len(memories)} 组")
-    return memories
-
-
-def discover_scene_memories() -> List[Memory]:
-    from business.image_recognition.scene_cluster import cluster_by_scene
-    from infra.db.repositories.files_repo import FilesRepository
-
-    db = Database()
-    files_repo = FilesRepository(db)
-    memories_repo = MemoriesRepository(db)
-
-    with db.connect() as conn:
-        rows = conn.execute(
-            "SELECT id FROM files WHERE is_image = 1 LIMIT 2000"
-        ).fetchall()
-    file_ids = [r[0] for r in rows]
-
-    if not file_ids:
-        return []
-
-    scene_clusters = cluster_by_scene(file_ids)
-    if not scene_clusters:
-        return []
-
-    memories = []
-    for cluster_idx, cluster_file_ids in scene_clusters.items():
-        if len(cluster_file_ids) < 5:
-            continue
-
-        photo_ids = cluster_file_ids[:20]
-        title = f"场景回忆 · 组{cluster_idx + 1}"
-
-        existing = _find_existing_memory(memories_repo, "scene", str(cluster_idx))
-        if existing:
-            continue
-
-        m = Memory(
-            category=1,
-            memory_type="scene",
-            title=title,
-            photo_ids=json.dumps(photo_ids),
-            cover_file_id=photo_ids[0] if photo_ids else None,
-            payload=json.dumps({"scene_cluster_idx": cluster_idx}),
-        )
-        mid = memories_repo.insert(m)
-        m.id = mid
-        memories.append(m)
-
-    logger.info(f"场景回忆发现 {len(memories)} 组")
-    return memories
-
-
 def get_on_this_day_memories() -> List[Memory]:
     db = Database()
     memories_repo = MemoriesRepository(db)
     return memories_repo.get_undismissed_by_type("on_this_day")
+
+
+_SPECIAL_DATES = {
+    "01-01": "元旦",
+    "02-14": "情人节",
+    "03-08": "妇女节",
+    "05-01": "劳动节",
+    "06-01": "儿童节",
+    "10-01": "国庆节",
+    "12-25": "圣诞节",
+}
+
+
+def discover_special_date_memories() -> List[Memory]:
+    month_days = list(_SPECIAL_DATES.keys())
+    db = Database()
+    pm_repo = PhotoMetadataRepository(db)
+    memories_repo = MemoriesRepository(db)
+
+    rows = pm_repo.get_photos_by_month_day(month_days)
+
+    if not rows:
+        with db.connect() as conn:
+            rows = conn.execute(f"""
+                SELECT f.id, f.folder_path, pm.date_taken, fc.category
+                FROM files f
+                JOIN photo_metadata pm ON f.id = pm.file_id
+                LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
+                WHERE f.is_image = 1
+                  AND pm.date_taken IS NOT NULL
+                  AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
+                  AND ({" OR ".join("substr(pm.date_taken, 6, 5) = ?" for _ in month_days)})
+                ORDER BY pm.date_taken DESC
+            """, month_days).fetchall()
+
+    if not rows:
+        return []
+
+    groups = {}
+    for row in rows:
+        file_id = row[0]
+        folder_path = row[1]
+        date_taken = row[2]
+        category = row[3]
+        month_day = date_taken[5:10]
+        year = date_taken[:4]
+        key = f"{year}-{month_day}"
+        if key not in groups:
+            groups[key] = {"ids": [], "category": category or 1, "month_day": month_day}
+        groups[key]["ids"].append(file_id)
+
+    memories = []
+    for key, group in groups.items():
+        if len(group["ids"]) < 1:
+            continue
+
+        photo_ids = group["ids"][:20]
+        label = _SPECIAL_DATES.get(group["month_day"], group["month_day"])
+        title = f"{label} · {key[:4]}"
+
+        existing = _find_existing_memory(memories_repo, "special_date", key)
+        if existing:
+            continue
+
+        m = Memory(
+            category=group["category"],
+            memory_type="special_date",
+            title=title,
+            photo_ids=json.dumps(photo_ids),
+            cover_file_id=photo_ids[0] if photo_ids else None,
+            payload=json.dumps({"date_key": key}),
+        )
+        mid = memories_repo.insert(m)
+        m.id = mid
+        memories.append(m)
+
+    logger.info(f"特殊日期回忆发现 {len(memories)} 组")
+    return memories
+
+
+def discover_folder_memories(top_n: int = 5) -> List[Memory]:
+    db = Database()
+    memories_repo = MemoriesRepository(db)
+
+    with db.connect() as conn:
+        rows = conn.execute("""
+            SELECT f.folder_path, f.folder_name,
+                   fc.category,
+                   COUNT(*) as cnt,
+                   MIN(pm.date_taken) as first_date
+            FROM files f
+            JOIN photo_metadata pm ON f.id = pm.file_id
+            LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
+            WHERE f.is_image = 1
+              AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
+            GROUP BY f.folder_path
+            HAVING cnt >= 3
+            ORDER BY cnt DESC
+            LIMIT ?
+        """, (top_n,)).fetchall()
+
+    if not rows:
+        return []
+
+    memories = []
+    for folder_path, folder_name, category, cnt, first_date in rows:
+        with db.connect() as conn:
+            file_rows = conn.execute("""
+                SELECT f.id FROM files f
+                JOIN photo_metadata pm ON f.id = pm.file_id
+                WHERE f.folder_path = ?
+                  AND f.is_image = 1
+                  AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
+                ORDER BY pm.date_taken DESC
+                LIMIT 20
+            """, (folder_path,)).fetchall()
+        photo_ids = [r[0] for r in file_rows]
+        if not photo_ids:
+            continue
+
+        display_name = folder_name or os.path.basename(folder_path)
+        date_label = first_date[:10] if first_date else ""
+        title = f"{display_name} · {date_label}" if date_label else display_name
+
+        existing = _find_existing_memory(memories_repo, "folder", folder_path)
+        if existing:
+            continue
+
+        m = Memory(
+            category=category or 1,
+            memory_type="folder",
+            title=title,
+            photo_ids=json.dumps(photo_ids),
+            cover_file_id=photo_ids[0],
+            payload=json.dumps({"folder_path": folder_path}),
+        )
+        mid = memories_repo.insert(m)
+        m.id = mid
+        memories.append(m)
+
+    logger.info(f"文件夹回忆发现 {len(memories)} 组")
+    return memories
 
 
 def _find_existing_memory(memories_repo: MemoriesRepository, memory_type: str, payload_key: str) -> Optional[int]:
@@ -276,6 +283,8 @@ def _find_existing_memory(memories_repo: MemoriesRepository, memory_type: str, p
             if "event_id" in payload and str(payload["event_id"]) == payload_key:
                 return mid
             if "scene_cluster_idx" in payload and str(payload["scene_cluster_idx"]) == payload_key:
+                return mid
+            if "folder_path" in payload and payload["folder_path"] == payload_key:
                 return mid
         except Exception:
             continue

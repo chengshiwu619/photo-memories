@@ -86,6 +86,12 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         logger.info("MainWindow 正在关闭，等待后台线程...")
         BackgroundTaskManager.get_instance().wait_all(5000)
+        try:
+            if self.db:
+                self.db.close()
+                logger.info("持久连接已关闭")
+        except Exception as e:
+            logger.warning(f"关闭持久连接时出错: {e}")
         super().closeEvent(event)
 
     def setup_ui(self):
@@ -260,13 +266,30 @@ class MainWindow(QMainWindow):
         self._timeline_view.load_photos(all_photos)
 
     def _load_special_memories(self):
-        from business.memory.memory_discovery import get_on_this_day_memories
+        from business.memory.memory_discovery import get_on_this_day_memories, discover_special_date_memories, discover_folder_memories
         from infra.db.repositories.memories_repo import MemoriesRepository
 
         repo = MemoriesRepository(Database())
         all_memories = repo.get_undismissed()
         on_this_day = get_on_this_day_memories()
         combined = on_this_day + [m for m in all_memories if m.memory_type != "on_this_day"]
+
+        existing_ids = {m.id for m in combined}
+
+        if len(combined) < 3:
+            special_date = discover_special_date_memories()
+            for m in special_date:
+                if m.id not in existing_ids:
+                    combined.append(m)
+                    existing_ids.add(m.id)
+
+        if len(combined) < 3:
+            folder = discover_folder_memories(top_n=5)
+            for m in folder:
+                if m.id not in existing_ids:
+                    combined.append(m)
+                    existing_ids.add(m.id)
+
         self._special_view.load_memories(combined)
 
     def _on_memory_clicked(self, memory_id: int):
@@ -354,16 +377,21 @@ class MainWindow(QMainWindow):
         all_photos = self._cat_photos.get(cat_id, [])
 
         if self._cat_all_loaded.get(cat_id, False):
-            # 已全部加载过，执行洗牌：已显示照片降权
             reshuffled = reshuffle_photos(all_photos, self._cat_shown_ids.get(cat_id))
+            if not reshuffled:
+                self.pages[page_index].set_all_loaded(has_thumbnails_remaining=True)
+                return
             self._cat_photos[cat_id] = reshuffled
             self._cat_offsets[cat_id] = 0
             self._cat_all_loaded[cat_id] = False
+            self._cat_shown_ids[cat_id] = set()
+            self.pages[page_index].reset_for_shuffle()
             next_page = reshuffled[:PAGE_SIZE]
         else:
             next_page = all_photos[offset:offset + PAGE_SIZE]
             if not next_page:
                 self._cat_all_loaded[cat_id] = True
+                self.pages[page_index].set_all_loaded(has_thumbnails_remaining=True)
                 return
 
         self._cat_offsets[cat_id] = offset + len(next_page) if not self._cat_all_loaded.get(cat_id, False) else len(next_page)

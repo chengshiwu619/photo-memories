@@ -142,6 +142,11 @@ class VirtualCategoryPage(QScrollArea):
         self._empty_label.setStyleSheet("color: #555; font-size: 14px; background: transparent;")
         self._empty_label.hide()
 
+        self._footer_label = QLabel(self._viewport)
+        self._footer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._footer_label.setStyleSheet("color: #555; font-size: 12px; background: transparent; padding: 12px;")
+        self._footer_label.hide()
+
         self.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
         self._resize_timer = QTimer(self)
@@ -181,6 +186,7 @@ class VirtualCategoryPage(QScrollArea):
         self._render_visible()
         if self._photos:
             self._empty_label.hide()
+            self._footer_label.hide()
         else:
             self._empty_label.setGeometry(self.geometry())
             self._empty_label.raise_()
@@ -193,13 +199,6 @@ class VirtualCategoryPage(QScrollArea):
             self._destroy_visible_cards()
             self._recompute_layout()
             self._render_visible()
-            # 防膨胀：超过3000张时裁剪前半部分
-            if len(self._photos) > 3000:
-                cut = len(self._photos) // 2
-                self._photos = self._photos[cut:]
-                self._card_widgets.clear()
-                self._recompute_layout()
-                self._render_visible()
         self._loading_more = False
 
     def _destroy_visible_cards(self):
@@ -212,7 +211,9 @@ class VirtualCategoryPage(QScrollArea):
         card_w = (total_w - GAP * (COL_COUNT + 1)) // COL_COUNT
         card_w = max(80, card_w)
         self._layout = VirtualWaterfallLayout(self._photos, COL_COUNT, card_w)
-        self._viewport.resize(self._layout.total_width, self._layout.total_height)
+        content_h = self._layout.total_height + 50
+        self._viewport.resize(self._layout.total_width, content_h)
+        self._footer_label.setGeometry(0, self._layout.total_height, self._layout.total_width, 40)
 
     def _render_visible(self):
         scroll_y = self.verticalScrollBar().value()
@@ -239,7 +240,7 @@ class VirtualCategoryPage(QScrollArea):
         self._render_visible()
         bar = self.verticalScrollBar()
         if bar.maximum() > 0 and value >= bar.maximum() - 200:
-            if not self._loading_more:
+            if not self._loading_more and not self._all_loaded:
                 self._loading_more = True
                 self.load_more_requested.emit()
 
@@ -257,3 +258,21 @@ class VirtualCategoryPage(QScrollArea):
         self._destroy_visible_cards()
         self._photos = []
         self._all_loaded = False
+
+    def set_all_loaded(self, has_thumbnails_remaining=True):
+        self._all_loaded = True
+        self._loading_more = False
+        if self._photos:
+            if has_thumbnails_remaining:
+                self._footer_label.setText("已加载所有图片")
+            else:
+                self._footer_label.setText("缩略图生成中…")
+            self._footer_label.show()
+            self._footer_label.raise_()
+        else:
+            self._footer_label.hide()
+
+    def reset_for_shuffle(self):
+        self._all_loaded = False
+        self._loading_more = False
+        self._footer_label.hide()

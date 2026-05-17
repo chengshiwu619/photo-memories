@@ -84,6 +84,8 @@ class PokerStack(QWidget):
             "event": "#4d96ff",
             "scene": "#9b59b6",
             "recent": "#ffd93d",
+            "special_date": "#ff9f43",
+            "folder": "#54a0ff",
         }
         color = type_colors.get(self._memory.memory_type, "#667eea")
 
@@ -287,6 +289,8 @@ class SpecialMemoriesView(QWidget):
             "event": "🎯 事件与旅行",
             "scene": "🏞️ 场景回忆",
             "recent": "🕐 近期回忆",
+            "special_date": "🎯 特殊日期",
+            "folder": "📁 文件夹回忆",
         }
 
         for mt in type_order:

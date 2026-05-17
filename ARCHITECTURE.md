@@ -68,8 +68,6 @@
 | 人脸聚类 | `business/image_recognition/face_cluster.py` | 人脸向量聚类、人物分组管理、用户纠偏（标记为他人）、rename_cluster、reassign_face | ✅ 活跃 |
 | 场景聚类 | `business/image_recognition/scene_cluster.py` | CLIP 场景聚类（距离判定） | ✅ 活跃 |
 | 回忆发现 | `business/memory/memory_discovery.py` | 那年今日回忆、近期回忆、数据查询与过滤 | ✅ 活跃 |
-| 事件检测 | `business/memory/event_detector.py` | 时间断裂聚类 + GPS 聚类、事件/旅行发现 | ⚠️ 代码存在，未被 UI 调用 |
-| 回忆叙事 | `business/memory/memory_narrator.py` | LLM 叙事生成 | ⚠️ 代码存在，未被 UI 调用 |
 | 回忆推理 | `business/memory/memory_reasoning.py` | 碎裂回忆反馈记录、负面提示管理 | ✅ 活跃 |
 | 回忆生成 | `memory/memory_generator.py` | LLM 回忆标题/描述生成（v0.2 保留模块，与 memory_discovery 并存：discovery 负责规则发现入口，generator 负责 LLM 叙事能力） | ✅ 活跃 |
 
@@ -78,8 +76,6 @@
 | 模块 | 文件 | 职责 | 状态 |
 |------|------|------|------|
 | 流水线 | `services/background_task_manager.py` | Stage 模式流水线（扫描/分类/索引/回忆）、进度回调、取消机制、交互式分类、批量限制；后台线程统一注册与安全等待退出 | ✅ 活跃 |
-| 识别调度 | `services/recognition_scheduler.py` | 识别任务调度（SigLIP/人脸/YOLO/场景四阶段，断点续传） | ⚠️ 代码存在，功能已部分并入 background_task_manager，待整合或移除 |
-| 数据服务 | `services/data_service.py` | 数据访问门面（封装 Repository 调用） | ❌ 死代码，0引用，待清理 |
 
 ### 2.5 UI 层
 
@@ -174,7 +170,7 @@ background_task_manager.py（Stage 模式流水线）
 | 缩略图统一加载 | ✅ 已实现 | thumbnail_loader.py LRU 缓存 |
 | 人脸聚类 | ✅ 已实现 | face_cluster.py → _clustering.py 向量化贪心聚类 |
 | 场景聚类 | ✅ 已实现 | scene_cluster.py → _clustering.py 向量化贪心聚类 |
-| 回忆发现（5类） | ✅ 已实现 | on_this_day / recent / person / event / scene |
+| 回忆发现（2类） | ✅ 已实现 | on_this_day / recent（person/event/scene 已移除） |
 
 ### 3.6 识别调度模型
 
@@ -189,9 +185,6 @@ background_task_manager.py（Stage 模式流水线）
 memory_discovery.py
   → 那年今日：按月日匹配历史照片 (discover_on_this_day) ✅
   → 近期回忆：近 N 天照片 (discover_recent_memories) ✅
-  → 人物回忆：基于 face_clusters 聚类 (discover_person_memories) ✅
-  → 事件回忆：基于 events 表 (discover_event_memories) ✅
-  → 场景回忆：基于场景聚类输出 (discover_scene_memories) ✅
   → 写入 memories 表（memory_type、payload、dismissed_at 管理）
 
 memory_generator.py
@@ -244,7 +237,7 @@ special_memories.py
 
 - 索引阶段计算 phash
 - `photo_metadata.phash` 存储
-- 距离 < `PHASH_THRESHOLD`（默认 8）判定重复
+- 距离 < `get_settings().phash_threshold`（默认 8）判定重复
 - `photo_metadata.is_duplicate_of` 标记原图 file_id
 - 推荐流程过滤 is_duplicate_of 非空的照片
 - 不物理删除，不拒绝入库
@@ -265,7 +258,7 @@ special_memories.py
 |------|----------|------|
 | A. 缓存目录变更 | 用户修改 `PHOTO_DATA_DIR` | `shutil.copytree` 整体搬迁旧 thumbnails 目录到新路径 |
 | B. DB 重建导致 file_id 变化 | 删库重建、版本迁移 | 读取旧 DB 建立 `file_path → old_file_id` 映射，查新 DB 得 `file_path → new_file_id`，批量 `os.rename({old_id}.jpg, {new_id}.jpg)` |
-| C. 缩略图尺寸变更 | `THUMBNAIL_SIZE` 调整 | 惰性重建：不强制全量重新生成，索引阶段 `generate_thumbnail()` 按需补缺 |
+| C. 缩略图尺寸变更 | `Settings.thumbnail_size` 调整 | 惰性重建：不强制全量重新生成，索引阶段 `generate_thumbnail()` 按需补缺 |
 
 #### 实施步骤（DB 迁移阶段自动执行）
 
@@ -466,9 +459,9 @@ special_memories.py
 | FRESHNESS_WINDOW_DAYS | recommendation.py | 7 | 新鲜度窗口（天） |
 | MAX_SAME_DAY_STREAK | recommendation.py | 12 | 同日最大出现数 |
 | COL_COUNT | virtual_waterfall.py | 3 | 瀑布流列数 |
-| THUMBNAIL_SIZE | config.py | (400,400) | 缩略图尺寸（UI/AI 共用） |
-| MEMORY_HIGH_FREQ_DAYS | config.py | 3 | 回忆高频生成天数 |
-| PHASH_THRESHOLD | config.py | 8 | 感知哈希去重阈值 |
+| thumbnail_size | config.py (Settings) | (400,400) | 缩略图尺寸（UI/AI 共用，通过 get_settings() 读取） |
+| memory_high_freq_days | config.py (Settings) | 3 | 回忆高频生成天数（通过 get_settings() 读取） |
+| phash_threshold | config.py (Settings) | 8 | 感知哈希去重阈值（通过 get_settings() 读取） |
 
 ## 6. 功能清单与实现状态
 
@@ -489,7 +482,7 @@ special_memories.py
 | 13 | 碎裂回忆反馈机制 | memory、LLM | 中 | ✅ 已实现 |
 | 14 | 人物回忆纠偏 | UI层、business | 中 | ✅ 已实现 |
 | 15 | 多照片库支持 | config、scanner、everything、setup_window | 中 | ✅ 已实现 |
-| 16 | 缩略图版本复用 | db_manager、photo_indexer | 高 | 📋 待实现 |
+| 16 | 缩略图版本复用 | db_manager、photo_indexer | 高 | 📋 待实现（v0.4） |
 
 ## 7. 依赖与风险
 
@@ -498,8 +491,8 @@ special_memories.py
 | 依赖 | 用途 | 许可证 | 状态 |
 |------|------|--------|------|
 | imagehash | 感知哈希去重 | BSD-2 | ✅ requirements.txt |
-| open-clip-torch | SigLIP/OpenCLIP 语义标签 | Apache-2.0 | ⚠️ 代码已实现，待添加到 requirements.txt |
-| deepface | 人脸检测与聚类 | MIT | ⚠️ 代码已实现，待添加到 requirements.txt |
+| open-clip-torch | SigLIP/OpenCLIP 语义标签 | Apache-2.0 | ✅ requirements.txt |
+| deepface | 人脸检测与聚类 | MIT | ✅ requirements.txt |
 | onnxruntime | LibreYOLO ONNX 目标检测 | MIT | ✅ requirements.txt（替代 ultralytics，消除 AGPL 风险） |
 | sqlite-vec | 向量近似检索 | MIT | ❌ 暂未集成（当前纯Python） |
 | custom-ui-pyqt6 | 增强卡片视觉效果 | 未确认 | ⏸️ 延后 |
@@ -514,6 +507,9 @@ class LibreYOLOONNXDetector:  # 当前实现，基于 onnxruntime
 ```
 
 模型文件路径：`models/yolov8n.onnx`（需手动下载 YOLOv8n ONNX 权重）
+
+### PyTorch 权重清理
+`yolov8n.pt`（6.3MB PyTorch 权重）已删除，代码已改用 onnxruntime + `models/yolov8n.onnx`。`.gitignore` 已添加 `*.pt` 规则。
 
 ### deepface 后端锁定
 固定使用 ArcFace 后端，512维向量输出。
@@ -600,7 +596,7 @@ AI 侧接受重采样开销（400→224/112），不生成第二套缩略图。�
 | 断点 | `checkpoint_manager.py` | `CheckpointManager` 类 | 长任务断点持久化 |
 | 日志 | `logger_setup.py` | `logger` | 全局 logger 实例 |
 
-**禁止**：其他层禁止 import `config.py` 中的 deprecated 全局变量（`SOURCE_DRIVE`、`THUMBNAIL_DIR` 等），统一使用 `get_settings().xxx`。现有 deprecated 变量按第 12 节计划逐步清理。
+**禁止**：其他层禁止 import `config.py` 中的 deprecated 全局变量（`SOURCE_DRIVE`、`THUMBNAIL_DIR` 等），统一使用 `get_settings().xxx`。`THUMBNAIL_SIZE`、`PHASH_THRESHOLD`、`MEMORY_HIGH_FREQ_DAYS` 已迁移至 Settings 字段，模块级常量已删除。剩余 deprecated 变量按第 12 节计划逐步清理。
 
 **已知层反转**：`config.py` 的 `save_config()` 和 `reload_config()` 内部引用了 `infra.llm.client.LLMClient.reset()`。这是 Core → Infra 的违规，待后续重构时将 reset 逻辑改为事件/回调模式消除。
 
@@ -672,34 +668,35 @@ UI 层不对外暴露接口，仅作为应用入口。
 
 | 文件 | 死代码 | 类型 | 估计行数 |
 |------|--------|------|----------|
-| `services/data_service.py` | 整文件（`DataService`, `get_data_service`） | 整文件 | 41 |
-| `services/recognition_scheduler.py` | 整文件（4 阶段调度逻辑已并入 background_task_manager） | 整文件 | 279 |
-| `business/memory/event_detector.py` | 整文件（`detect_events`, `get_events`） | 整文件 | 130 |
-| `business/memory/memory_narrator.py` | 整文件（`narrate_memory`） | 整文件 | ~50 |
-| `infra/fs/everything.py` | 整文件（`is_available`, `search_images`） | 整文件 | 24 |
-| `infra/db/repositories/folder_categories_repo.py` | 整文件（`FolderCategoriesRepository`） | 整文件 | ~30 |
-| `infra/db/repositories/task_checkpoints_repo.py` | 整文件（`TaskCheckpointsRepository`） | 整文件 | ~30 |
+| `services/data_service.py` | 整文件（`DataService`, `get_data_service`） | 整文件 | 41 | ✅ 已删除
+| `services/recognition_scheduler.py` | 整文件（4 阶段调度逻辑已并入 background_task_manager） | 整文件 | 279 | ✅ 已删除
+| `business/memory/event_detector.py` | 整文件（`detect_events`, `get_events`） | 整文件 | 130 | ✅ 已删除
+| `business/memory/memory_narrator.py` | 整文件（`narrate_memory`） | 整文件 | ~50 | ✅ 已删除
+| `infra/fs/everything.py` | 整文件（`is_available`, `search_images`） | 整文件 | 24 | ✅ 已删除
+| `infra/db/repositories/folder_categories_repo.py` | 整文件（`FolderCategoriesRepository`） | 整文件 | ~30 | ✅ 已删除
+| `infra/db/repositories/task_checkpoints_repo.py` | 整文件（`TaskCheckpointsRepository`） | 整文件 | ~30 | ✅ 已删除
 | `memory/memory_generator.py` | `star_memory()`, `unstar_memory()`, `get_memories()`, `get_photo_thumbnails()` | 4 函数 | ~60 |
-| `business/memory/memory_discovery.py` | `discover_person_memories()`, `discover_event_memories()`, `discover_scene_memories()` | 3 函数 | ~90 |
+| `business/memory/memory_discovery.py` | `discover_person_memories()`, `discover_event_memories()`, `discover_scene_memories()` | 3 函数 | ~90 | ✅ 已删除
 
 **总计约 700+ 行**，清理时直接删除文件/函数，不影响现有功能。
 
 ### 12.2 Deprecated 全局变量迁移计划
 
-`config.py` 中的 deprecated 全局变量应逐步迁移到 `get_settings()` 调用。迁移完成后可移除 `_sync_module_vars_from_settings()` 和所有 deprecated 变量。
+`config.py` 中的模块级常量应逐步迁移到 `Settings` 字段，通过 `get_settings()` 调用读取。
 
-| 全局变量 | 实际调用方 | 迁移动作 | 优先级 |
-|----------|-----------|----------|--------|
-| `DEEPSEEK_API_KEY` | 无（3处死导入） | 直接删除导入 | 高 |
-| `DEEPSEEK_BASE_URL` | 无（3处死导入） | 直接删除导入 | 高 |
-| `DEEPSEEK_MODEL` | `memory_generator.py:156` (1处) | 改为 `get_settings().deepseek_model` | 中 |
-| `DEEPSEEK_CLASSIFY_MODEL` | `folder_classifier.py:350`, `memory_narrator.py:31,60` | 改为 `get_settings().deepseek_classify_model` | 中 |
-| `SOURCE_DRIVE` | `folder_classifier.py:246,686`, `fast_scan.py` (9处) | 改为 `get_settings().source_drive` | 低（改动多） |
-| `SOURCE_DIRS` | `fast_scan.py` (10处) | 改为 `get_settings().source_dirs` | 低（改动多） |
-| `DATA_DIR` | `fast_scan.py:125,153,181,193` | 改为 `get_settings().photo_data_dir` | 低 |
-| `DB_PATH` | 无（1处死导入 `recommendation.py`） | 直接删除导入 | 高 |
-| `THUMBNAIL_DIR` | `photo_indexer.py`, `object_detector.py`, `thumbnail_loader.py`, `person_detail.py` | 改为 `get_settings().thumbnail_dir` | 低（4文件） |
-| `CLASSIFICATION_HISTORY_FILE` | `folder_classifier.py:307,310,315,316` | 改为 `get_settings().classification_history_file` | 低 |
+| 全局变量 | 当前状态 | 迁移动作 | 状态 |
+|----------|---------|----------|------|
+| `THUMBNAIL_SIZE` | `photo_indexer.py`, `thumbnail_loader.py` import | 迁移至 `Settings.thumbnail_size`（已存在 property） | ✅ 已迁移 |
+| `PHASH_THRESHOLD` | `photo_indexer.py` import | 迁移至 `Settings.phash_threshold` | ✅ 已迁移 |
+| `MEMORY_HIGH_FREQ_DAYS` | `memory_discovery.py` import | 迁移至 `Settings.memory_high_freq_days` | ✅ 已迁移 |
+| `DEEPSEEK_API_KEY` | 无功能调用方 | 已无 deprecated 导出 | ✅ 已清理 |
+| `DEEPSEEK_BASE_URL` | 无功能调用方 | 已无 deprecated 导出 | ✅ 已清理 |
+| `DB_PATH` | 无功能调用方 | 已无 deprecated 导出 | ✅ 已清理 |
+| `SOURCE_DRIVE` | `folder_classifier.py`, `fast_scan.py` 多处 | 改为 `get_settings().source_drive` | 低（改动多） |
+| `SOURCE_DIRS` | `fast_scan.py` 多处 | 改为 `get_settings().source_dirs` | 低（改动多） |
+| `DATA_DIR` | `fast_scan.py` 多处 | 改为 `get_settings().photo_data_dir` | 低 |
+| `THUMBNAIL_DIR` | `photo_indexer.py`, `object_detector.py`, `person_detail.py` | 改为 `get_settings().thumbnail_dir` | 低 |
+| `CLASSIFICATION_HISTORY_FILE` | `folder_classifier.py` 多处 | 改为 `get_settings().classification_history_file` | 低 |
 
 ### 12.3 已知层反转
 
@@ -711,13 +708,12 @@ UI 层不对外暴露接口，仅作为应用入口。
 
 | 问题 | 涉及模块 | 改进方向 |
 |------|----------|----------|
-| 业务层一半用 Repository 模式，一半用 raw SQL | `fast_scan.py`, `folder_classifier.py`, `photo_indexer.py`, `memory_generator.py` 用 raw SQL；`face_cluster.py`, `event_detector.py`, `memory_discovery.py`, `memory_reasoning.py` 用 Repository | 逐步迁移至 Repository 模式，新代码必须用 Repository |
+| 业务层一半用 Repository 模式，一半用 raw SQL | `fast_scan.py`, `folder_classifier.py`, `photo_indexer.py`, `memory_generator.py` 用 raw SQL；`face_cluster.py`, `memory_discovery.py`, `memory_reasoning.py` 用 Repository | 逐步迁移至 Repository 模式，新代码必须用 Repository |
 | UI 层直接实例化 Database 和 Repository | `ui/app.py` | 逐步改为通过业务层接口间接访问 |
-| `db_manager.py` 存在重复方法 | `_create_v03_new_tables` vs `_create_v03_new_tables_stmt` | 合并为一个方法 |
 
 ### 12.5 待补充依赖
 
-| 依赖 | 说明 | 优先级 |
-|------|------|--------|
-| `open-clip-torch` | 代码已实现，缺 requirements.txt | 中 |
-| `deepface` | 代码已实现，缺 requirements.txt | 中 |
+| 依赖 | 说明 | 状态 |
+|------|------|------|
+| `open-clip-torch` | 已添加到 requirements.txt | ✅ 已补充 |
+| `deepface` | 已添加到 requirements.txt | ✅ 已补充 |

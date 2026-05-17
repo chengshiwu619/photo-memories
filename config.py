@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     photo_data_dir: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage")
 
     thumbnail_size: tuple[int, int] = (400, 400)
+    phash_threshold: int = 8
+    memory_high_freq_days: int = 3
 
     @property
     def source_dirs(self) -> list[str]:
@@ -55,9 +57,6 @@ def get_settings() -> Settings:
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif", ".heic", ".heif"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".m4v", ".3gp"}
-THUMBNAIL_SIZE = (400, 400)
-PHASH_THRESHOLD = 8
-MEMORY_HIGH_FREQ_DAYS = 3
 
 CATEGORY_LIFE = 1
 CATEGORY_SAMPLE = 2

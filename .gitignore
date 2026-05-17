@@ -22,4 +22,4 @@ classification_history.txt
 debug_*.py
 photos_before_*.db
 
-yolov8n.pt
+*.pt

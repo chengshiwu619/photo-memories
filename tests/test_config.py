@@ -8,8 +8,6 @@ def test_config_imports():
     assert hasattr(config, "get_settings")
     assert hasattr(config, "IMAGE_EXTENSIONS")
     assert hasattr(config, "VIDEO_EXTENSIONS")
-    assert hasattr(config, "PHASH_THRESHOLD")
-    assert hasattr(config, "MEMORY_HIGH_FREQ_DAYS")
 
 
 def test_category_constants():
@@ -123,8 +121,8 @@ def test_source_dirs_multiple_paths():
 
 def test_phash_and_memory_constants():
     import config
-    assert config.PHASH_THRESHOLD == 8
-    assert config.MEMORY_HIGH_FREQ_DAYS == 3
+    assert config.get_settings().phash_threshold == 8
+    assert config.get_settings().memory_high_freq_days == 3
 
 
 def test_get_settings_returns_same_instance():
