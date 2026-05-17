@@ -51,6 +51,7 @@ class MainWindow(QMainWindow):
         self.current_page = 0
         self.pages = []
         self.starred_only = False
+        self._current_nav = "random"
         self._cat_photos = {}
         self._cat_offsets = {}
         self._cat_all_loaded = {}
@@ -58,11 +59,15 @@ class MainWindow(QMainWindow):
         self._folder_viewer_photos = []
         self._folder_view_counts = {}
         self._suppressed_folders = set()
-        self._last_scroll_val = 0
+        self._last_scroll_vals = {}
         self._is_fullscreen = False
         self._window_drag_pos = None
         self._first_load_done = False
         self._is_dragging = False
+        self._timeline_photos = []
+        self._timeline_known_ids = set()
+        self._timeline_loaded = False
+        self._special_loaded = False
 
         self.setStyleSheet("""
             QMainWindow {
@@ -80,6 +85,10 @@ class MainWindow(QMainWindow):
         self.image_viewer.closed.connect(self._on_viewer_closed)
         self.image_viewer.recategorize.connect(self._on_recategorize)
         self.image_viewer.hide()
+
+        self._timeline_refresh_timer = QTimer(self)
+        self._timeline_refresh_timer.setInterval(30000)
+        self._timeline_refresh_timer.timeout.connect(self._refresh_timeline_incremental)
 
         self.load_memories()
 
@@ -229,6 +238,7 @@ class MainWindow(QMainWindow):
         self._special_view = SpecialMemoriesView()
         self._special_view.memory_clicked.connect(self._on_memory_clicked)
         self._special_view.memory_dismissed.connect(self._on_memory_dismissed)
+        self._special_view.photo_clicked.connect(self._on_special_photo_clicked)
 
         self._nav_stack = QStackedWidget()
         self._nav_stack.addWidget(self._random_container)
@@ -244,11 +254,14 @@ class MainWindow(QMainWindow):
         nav_map = {"random": 0, "timeline": 1, "special": 2}
         idx = nav_map.get(nav_id, 0)
         self._nav_stack.setCurrentIndex(idx)
+        self._current_nav = nav_id
 
         if nav_id == "timeline":
-            self._load_timeline()
+            if not self._timeline_loaded:
+                self._load_timeline()
         elif nav_id == "special":
-            self._load_special_memories()
+            if not self._special_loaded:
+                self._load_special_memories()
 
     def _load_timeline(self):
         rows = self.db.execute("""
@@ -257,13 +270,44 @@ class MainWindow(QMainWindow):
                    f.folder_path, f.folder_name as folder_display, f.file_mtime
             FROM photo_metadata pm
             LEFT JOIN files f ON pm.file_id = f.id
-            WHERE pm.thumbnail_path IS NOT NULL
+            WHERE pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
                   AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
             ORDER BY pm.date_taken DESC, f.file_mtime DESC
         """).fetchall()
         from ui.recommendation import _make_photo_dict
-        all_photos = [_make_photo_dict(r) for r in rows]
-        self._timeline_view.load_photos(all_photos)
+        self._timeline_photos = [_make_photo_dict(r) for r in rows]
+        self._timeline_view.load_photos(self._timeline_photos)
+        self._timeline_loaded = True
+        self._timeline_known_ids = {p["id"] for p in self._timeline_photos}
+        self._timeline_refresh_timer.start()
+
+    def _refresh_timeline_incremental(self):
+        if not self._timeline_loaded:
+            return
+        try:
+            rows = self.db.execute("""
+                SELECT pm.file_id as id, pm.thumbnail_path, pm.date_taken,
+                       pm.width, pm.height, f.file_path, f.file_name,
+                       f.folder_path, f.folder_name as folder_display, f.file_mtime
+                FROM photo_metadata pm
+                LEFT JOIN files f ON pm.file_id = f.id
+                WHERE pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
+                      AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
+                ORDER BY pm.date_taken DESC, f.file_mtime DESC
+            """).fetchall()
+            from ui.recommendation import _make_photo_dict
+            new_photos = []
+            for r in rows:
+                pd = _make_photo_dict(r)
+                if pd["id"] not in self._timeline_known_ids:
+                    new_photos.append(pd)
+            if new_photos:
+                self._timeline_photos = [_make_photo_dict(r) for r in rows]
+                self._timeline_known_ids = {p["id"] for p in self._timeline_photos}
+                self._timeline_view.load_photos(self._timeline_photos)
+                logger.info(f"时间线增量刷新: 新增 {len(new_photos)} 张照片")
+        except Exception as e:
+            logger.warning(f"时间线增量刷新失败: {e}")
 
     def _load_special_memories(self):
         from business.memory.memory_discovery import get_on_this_day_memories, discover_special_date_memories, discover_folder_memories
@@ -284,13 +328,14 @@ class MainWindow(QMainWindow):
                     existing_ids.add(m.id)
 
         if len(combined) < 3:
-            folder = discover_folder_memories(top_n=5)
+            folder = discover_folder_memories(top_n=2)
             for m in folder:
                 if m.id not in existing_ids:
                     combined.append(m)
                     existing_ids.add(m.id)
 
         self._special_view.load_memories(combined)
+        self._special_loaded = True
 
     def _on_memory_clicked(self, memory_id: int):
         from infra.db.repositories.memories_repo import MemoriesRepository
@@ -299,6 +344,9 @@ class MainWindow(QMainWindow):
 
     def _on_memory_dismissed(self, memory_id: int):
         logger.info(f"回忆 {memory_id} 已标记不再显示")
+
+    def _on_special_photo_clicked(self, photo_data: dict):
+        self.on_photo_clicked(photo_data)
 
     def switch_page(self, index):
         if self.image_viewer.isVisible():
@@ -311,7 +359,7 @@ class MainWindow(QMainWindow):
 
     def toggle_starred(self):
         self.starred_only = self.star_btn.isChecked()
-        self.load_memories()
+        self._reload_random()
 
     def _open_settings(self):
         from ui.components.setup_window import SetupWindow
@@ -323,6 +371,7 @@ class MainWindow(QMainWindow):
         logger.info("配置已更新，重新加载")
         self._settings_window.close()
         self._settings_window = None
+        self._invalidate_all_caches()
         self.load_memories()
 
     def load_memories(self):
@@ -341,6 +390,27 @@ class MainWindow(QMainWindow):
         for i in range(self.stack.count()):
             self.load_category(i)
         self.stack.setCurrentIndex(self.current_page)
+
+    def _reload_random(self):
+        self._suppressed_folders.clear()
+        self._folder_view_counts.clear()
+        self._cat_offsets = {}
+        self._cat_all_loaded = {}
+        self._cat_shown_ids = {}
+
+        for cat_id, _ in CATEGORIES:
+            memories_repo = MemoriesRepository(Database())
+            title = memories_repo.get_latest_title(cat_id)
+            summary = f"「{title}」" if title else ""
+            self.pages[next(i for i, (c, _) in enumerate(CATEGORIES) if c == cat_id)].set_memory_summary(summary)
+
+        for i in range(self.stack.count()):
+            self.load_category(i)
+        self.stack.setCurrentIndex(self.current_page)
+
+    def _invalidate_all_caches(self):
+        self._timeline_loaded = False
+        self._special_loaded = False
 
     def load_category(self, index):
         if index >= len(CATEGORIES):
@@ -363,7 +433,7 @@ class MainWindow(QMainWindow):
         self._cat_shown_ids[cat_id].update(p["id"] for p in first_page)
         self._cat_all_loaded[cat_id] = len(first_page) >= len(all_photos)
 
-        record_shown_photos(self.db, first_page, cat_id)
+        record_shown_photos(first_page, cat_id)
 
         if not self._first_load_done:
             self._first_load_done = True
@@ -399,14 +469,16 @@ class MainWindow(QMainWindow):
             self._cat_all_loaded[cat_id] = True
 
         self._cat_shown_ids.setdefault(cat_id, set()).update(p["id"] for p in next_page)
-        record_shown_photos(self.db, next_page, cat_id)
+        record_shown_photos(next_page, cat_id)
         self.pages[page_index].append_photos(next_page)
 
     def _on_page_scroll(self, page, value):
         if value > 10:
             page.memory_summary.hide()
 
-        delta = value - self._last_scroll_val
+        page_key = id(page)
+        last_val = self._last_scroll_vals.get(page_key, 0)
+        delta = value - last_val
         if abs(delta) > 5:
             if delta > 0 and value > 40:
                 self.top_bar.hide()
@@ -414,7 +486,7 @@ class MainWindow(QMainWindow):
             elif delta < 0:
                 self.top_bar.show()
                 self.nav_bar.show()
-            self._last_scroll_val = value
+            self._last_scroll_vals[page_key] = value
 
     def on_photo_clicked(self, photo_data):
         if isinstance(photo_data, int):
@@ -441,14 +513,20 @@ class MainWindow(QMainWindow):
                 "date_taken": row["date_taken"] if "date_taken" in row.keys() else None,
                 "file_mtime": row["file_mtime"] if "file_mtime" in row.keys() else None,
             }
-            cat_id = CATEGORIES[self.current_page][0]
-            all_photos = self._cat_photos.get(cat_id, [])
+
+        if self._current_nav == "timeline":
+            cat_id = None
+            all_photos = self._timeline_photos
+        elif self._current_nav == "special":
+            cat_id = None
+            all_photos = []
         else:
             cat_id = CATEGORIES[self.current_page][0]
             all_photos = self._cat_photos.get(cat_id, [])
 
         clicked_id = photo_data.get("id")
-        self._record_click(clicked_id, photo_data.get("folder_path", ""))
+        if cat_id is not None:
+            self._record_click(clicked_id, photo_data.get("folder_path", ""))
 
         clicked_folder = os.path.dirname(photo_data.get("file_path", ""))
         self._folder_view_counts[clicked_folder] = self._folder_view_counts.get(clicked_folder, 0) + 1
@@ -537,7 +615,8 @@ class MainWindow(QMainWindow):
         from business.classifier.folder_classifier import build_classification_history
         build_classification_history()
         dialog.accept()
-        self.load_memories()
+        self._invalidate_all_caches()
+        self._reload_random()
 
     def keyPressEvent(self, event):
         if self.image_viewer.isVisible():

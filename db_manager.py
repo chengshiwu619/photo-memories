@@ -17,6 +17,7 @@ class Database:
     def connect(self):
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.execute("PRAGMA busy_timeout=30000")
+        conn.row_factory = sqlite3.Row
         try:
             yield conn
             conn.commit()

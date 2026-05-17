@@ -1,14 +1,33 @@
 import json
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea, QFrame
 from PyQt6.QtCore import Qt, pyqtSignal, QPropertyAnimation, QRect, QPoint, QTimer
-from PyQt6.QtGui import QFont, QPixmap, QPainter, QColor, QPixmapCache
+from PyQt6.QtGui import QFont, QPixmap, QPainter, QColor
 
 from logger_setup import logger
 from core.models import Memory
 
 
+class _PixmapCache:
+    _cache: dict[str, QPixmap] = {}
+    _max = 500
+
+    @classmethod
+    def find(cls, key: str):
+        return cls._cache.get(key)
+
+    @classmethod
+    def insert(cls, key: str, pm: QPixmap):
+        if len(cls._cache) >= cls._max:
+            oldest = list(cls._cache.keys())[:100]
+            for k in oldest:
+                del cls._cache[k]
+        cls._cache[key] = pm
+
+
+QPixmapCache = _PixmapCache
+
+
 class StackedCard(QFrame):
-    """层叠扑克式单张照片卡片"""
     clicked = pyqtSignal(dict)
 
     def __init__(self, photo_data: dict, parent=None):
@@ -55,9 +74,65 @@ class StackedCard(QFrame):
         super().mousePressEvent(event)
 
 
+class GridCard(QFrame):
+    clicked = pyqtSignal(dict)
+
+    def __init__(self, photo_data: dict, size: int, parent=None):
+        super().__init__(parent)
+        self.photo_data = photo_data
+        self._size = size
+        self.setFixedSize(size, size)
+        self.setStyleSheet("""
+            GridCard {
+                background: #222;
+                border-radius: 4px;
+                border: 1px solid #3a3a5e;
+            }
+            GridCard:hover {
+                border-color: #667eea;
+            }
+        """)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        self._thumb = QLabel(self)
+        self._thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._thumb.setFixedSize(size, size)
+        self._thumb.setText("...")
+        self._thumb.setStyleSheet("color: #444; font-size: 10px; background: transparent;")
+
+    def load_thumbnail(self):
+        thumb = self.photo_data.get("thumbnail_path", "")
+        if not thumb:
+            return
+        pixmap = QPixmapCache.find(thumb)
+        if not pixmap:
+            pixmap = QPixmap(thumb)
+            if not pixmap.isNull():
+                QPixmapCache.insert(thumb, pixmap)
+        if not pixmap.isNull():
+            scaled = pixmap.scaled(self._size, self._size,
+                                   Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                   Qt.TransformationMode.SmoothTransformation)
+            crop_x = (scaled.width() - self._size) // 2
+            crop_y = (scaled.height() - self._size) // 2
+            cropped = scaled.copy(crop_x, crop_y, self._size, self._size)
+            self._thumb.setPixmap(cropped)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.photo_data)
+        super().mousePressEvent(event)
+
+
+_EXPAND_COLS = 5
+_EXPAND_CARD_SIZE = 80
+_EXPAND_GAP = 4
+
+
 class PokerStack(QWidget):
-    """层叠扑克式布局容器 - 照片像扑克牌一样重叠排列"""
-    expanded = pyqtSignal(int)  # memory_id
+    expanded = pyqtSignal(int)
+    photo_clicked = pyqtSignal(dict)
+    collapse_others = pyqtSignal(object)
 
     def __init__(self, memory: Memory, parent=None):
         super().__init__(parent)
@@ -74,7 +149,6 @@ class PokerStack(QWidget):
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(4)
 
-        # 标题行
         header_layout = QHBoxLayout()
         header_layout.setSpacing(6)
 
@@ -106,15 +180,12 @@ class PokerStack(QWidget):
         header_layout.addStretch()
         layout.addLayout(header_layout)
 
-        # 堆叠区域（用容器+绝对定位）
         self._stack_container = QWidget()
         self._stack_container.setStyleSheet("background: transparent;")
         self._stack_container.setMinimumHeight(110)
         layout.addWidget(self._stack_container)
 
     def load_photos(self, photos: list):
-        """加载照片到扑克堆叠中"""
-        # 清理旧卡片
         for card in self._cards:
             card.setParent(None)
             card.deleteLater()
@@ -124,59 +195,66 @@ class PokerStack(QWidget):
         if not self._photos:
             return
 
-        max_visible = 6 if not self._expanded else min(len(self._photos), 20)
+        if self._expanded:
+            self._layout_expanded()
+        else:
+            self._layout_collapsed()
+
+    def _layout_collapsed(self):
+        max_visible = 6
         visible_photos = self._photos[:max_visible]
+        x_offset = 0
+        for i, photo in enumerate(visible_photos):
+            card = StackedCard(photo, self._stack_container)
+            card.move(x_offset, 6)
+            card.raise_()
+            card.clicked.connect(lambda p: self._on_card_clicked(p))
+            card.show()
+            card.load_thumbnail()
+            self._cards.append(card)
+            x_offset += 30
 
-        if self._expanded:
-            # 展开态：正常间距排列
-            x_offset = 0
-            for i, photo in enumerate(visible_photos):
-                card = StackedCard(photo, self._stack_container)
-                card.move(x_offset, 6)
-                card.load_thumbnail()
-                card.clicked.connect(lambda p, mid=self._memory.id: self._on_card_clicked(p, mid))
-                card.show()
-                self._cards.append(card)
-                x_offset += 86  # 展开间距
-        else:
-            # 折叠态：重叠排列，每张露出30px
-            x_offset = 0
-            for i, photo in enumerate(visible_photos):
-                card = StackedCard(photo, self._stack_container)
-                card.move(x_offset, 6)
-                card.raise_()  # 后面的卡片覆盖前面的
-                card.load_thumbnail()
-                card.clicked.connect(lambda p, mid=self._memory.id: self._on_card_clicked(p, mid))
-                card.show()
-                self._cards.append(card)
-                x_offset += 30  # 重叠间距
+        if len(self._photos) > max_visible:
+            more = QLabel(f"+{len(self._photos) - max_visible}", self._stack_container)
+            more.setFont(QFont("Microsoft YaHei", 9))
+            more.setStyleSheet("color: #888; background: transparent;")
+            more.move(x_offset + 4, 40)
+            more.show()
+            self._cards.append(more)
 
-            # 额外照片计数
-            if len(self._photos) > max_visible:
-                more = QLabel(f"+{len(self._photos) - max_visible}", self._stack_container)
-                more.setFont(QFont("Microsoft YaHei", 9))
-                more.setStyleSheet("color: #888; background: transparent;")
-                more.move(x_offset + 4, 40)
-                more.show()
-                self._cards.append(more)  # 复用列表方便清理
-
-        # 更新容器尺寸
-        if self._expanded:
-            total_w = max_visible * 86 + 10
-        else:
-            total_w = min(max_visible, len(self._photos)) * 30 + 60
+        total_w = min(max_visible, len(self._photos)) * 30 + 60
         self._stack_container.setFixedWidth(max(total_w, 200))
         self._stack_container.setFixedHeight(112)
 
-    def _on_card_clicked(self, photo_data, memory_id):
+    def _layout_expanded(self):
+        max_visible = min(len(self._photos), 20)
+        visible_photos = self._photos[:max_visible]
+        rows = (len(visible_photos) + _EXPAND_COLS - 1) // _EXPAND_COLS
+
+        for i, photo in enumerate(visible_photos):
+            row = i // _EXPAND_COLS
+            col = i % _EXPAND_COLS
+            card = GridCard(photo, _EXPAND_CARD_SIZE, self._stack_container)
+            x = col * (_EXPAND_CARD_SIZE + _EXPAND_GAP)
+            y = row * (_EXPAND_CARD_SIZE + _EXPAND_GAP)
+            card.move(x, y)
+            card.clicked.connect(self.photo_clicked.emit)
+            card.show()
+            card.load_thumbnail()
+            self._cards.append(card)
+
+        total_w = _EXPAND_COLS * (_EXPAND_CARD_SIZE + _EXPAND_GAP) - _EXPAND_GAP
+        total_h = rows * (_EXPAND_CARD_SIZE + _EXPAND_GAP) - _EXPAND_GAP
+        self._stack_container.setFixedWidth(max(total_w, 200))
+        self._stack_container.setFixedHeight(total_h + 12)
+
+    def _on_card_clicked(self, photo_data):
         if not self._expanded:
             self._expanded = True
-            self.load_photos(self._photos)  # 重新布局为展开态
-        else:
-            self.expanded.emit(memory_id)
+            self.collapse_others.emit(self)
+            self.load_photos(self._photos)
 
     def toggle_collapse(self):
-        """折叠回扑克堆叠"""
         if self._expanded:
             self._expanded = False
             self.load_photos(self._photos)
@@ -238,6 +316,7 @@ class ShatterWidget(QWidget):
 class SpecialMemoriesView(QWidget):
     memory_clicked = pyqtSignal(int)
     memory_dismissed = pyqtSignal(int)
+    photo_clicked = pyqtSignal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -303,6 +382,8 @@ class SpecialMemoriesView(QWidget):
             for m in type_groups[mt][:6]:
                 stack = PokerStack(m)
                 stack.expanded.connect(self.memory_clicked.emit)
+                stack.photo_clicked.connect(self.photo_clicked.emit)
+                stack.collapse_others.connect(self._on_collapse_others)
                 stack.setStyleSheet("""
                     PokerStack {
                         background: #222240;
@@ -316,7 +397,6 @@ class SpecialMemoriesView(QWidget):
                 self._layout.insertWidget(self._layout.count() - 1, stack)
                 self._stacks.append(stack)
 
-                # 异步加载照片
                 QTimer.singleShot(0, lambda s=stack, mem=m: self._load_stack_photos(s, mem))
 
     def _load_stack_photos(self, stack, memory):
@@ -327,13 +407,17 @@ class SpecialMemoriesView(QWidget):
         if not photo_ids:
             return
 
-        db = Database()
-        conn = db.get_persistent_connection()
-        try:
-            photos = load_photos_from_ids(conn, photo_ids)
-            stack.load_photos(photos)
-        except Exception as e:
-            logger.error(f"加载回忆照片失败 memory_id={memory.id}: {e}")
+        with Database().connect() as conn:
+            try:
+                photos = load_photos_from_ids(conn, photo_ids)
+                stack.load_photos(photos)
+            except Exception as e:
+                logger.error(f"加载回忆照片失败 memory_id={memory.id}: {e}")
+
+    def _on_collapse_others(self, expanded_stack):
+        for s in self._stacks:
+            if s is not expanded_stack and s._expanded:
+                s.toggle_collapse()
 
     def _on_dismiss(self, memory_id: int):
         from business.memory.memory_reasoning import record_feedback

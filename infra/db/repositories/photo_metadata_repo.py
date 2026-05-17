@@ -63,7 +63,7 @@ class PhotoMetadataRepository:
             rows = conn.execute("""
                 SELECT f.id FROM files f
                 JOIN photo_metadata pm ON f.id = pm.file_id
-                WHERE f.is_image = 1 AND pm.thumbnail_path IS NOT NULL
+                WHERE f.is_image = 1 AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
                 AND f.id NOT IN (SELECT DISTINCT file_id FROM photo_tags WHERE source = 'siglip')
                 LIMIT ?
             """, (limit,)).fetchall()
@@ -82,7 +82,7 @@ class PhotoMetadataRepository:
                 WHERE f.is_image = 1
                   AND pm.date_taken IS NOT NULL
                   AND pm.is_duplicate_of IS NULL
-                  AND pm.thumbnail_path IS NOT NULL
+                  AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
                   AND ({conditions})
                 ORDER BY pm.date_taken DESC
             """, month_days).fetchall()
@@ -98,7 +98,7 @@ class PhotoMetadataRepository:
                 WHERE f.is_image = 1
                   AND pm.date_taken IS NOT NULL
                   AND pm.is_duplicate_of IS NULL
-                  AND pm.thumbnail_path IS NOT NULL
+                  AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
                   AND pm.date_taken >= ?
                 ORDER BY pm.date_taken DESC
                 LIMIT ?

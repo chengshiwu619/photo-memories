@@ -38,6 +38,60 @@
 - 修复 .env SOURCE_DRIVE 配置
 - 验证结果：296,475 条 → 68,175 个媒体文件（之前为 0）
 
+### 数据库写锁冲突修复
+- 根因：后台线程（扫描/索引）持久连接长时间持有写锁，与主线程写操作冲突
+- photo_indexer.py：index_photos() 拆分为 _index_single_photo()（纯 I/O）+ pending_writes 缓冲 + _db.connect() 短事务 executemany 批量写入；dedup_by_phash() 同样改为批量短事务
+- fast_scan.py：full_scan() 移除持久连接，改为 pending_writes 缓冲 + _db.connect() 短事务批量写入；_cleanup_removed_source_dirs() 移除 conn 参数改用短连接
+- recommendation.py：record_shown_photos() 移除 db 参数，改用 Database().connect() 短连接 + executemany 批量写入
+- app.py：record_shown_photos 调用去掉 self.db 参数；self.db 持久连接仅用于 SELECT 只读查询
+
+### 编码损坏路径过滤
+- fast_scan.py：_parse_es_csv() 跳过含 \ufffd 替换字符的文件路径，避免 os.stat() 重复报错和 filelist.txt 缓存污染
+
+### 三栏目隔离保护
+- app.py：新增 _current_nav 追踪当前主栏目（random/timeline/special），on_photo_clicked() 根据来源栏目取正确的分类和照片列表，时间线/特殊回忆点击不再误用随机回忆的分类
+- app.py：load_memories() 拆分，收藏切换/重分类只调 _reload_random() 重载随机回忆栏，不影响时间线/特殊回忆；设置保存等全量重载场景调 _invalidate_all_caches() + load_memories()
+- app.py：_last_scroll_val 改为 _last_scroll_vals（按页面 id 独立存储），各栏目滚动互不影响顶栏显隐
+- app.py：时间线/特殊回忆增加 _timeline_loaded/_special_loaded 缓存标记，切换栏目时不重复查询
+- special_memories.py：_load_stack_photos() 改用 Database().connect() 短连接，修复每个 PokerStack 泄漏一个持久连接的问题
+
+### 时间线分栏优化
+- 时间线查询已有 thumbnail_path IS NOT NULL 过滤（确认无需修改）
+- app.py：新增 _timeline_refresh_timer（30秒间隔），增量刷新新索引完成的照片，无需手动切换
+
+### 特殊回忆分栏优化
+- special_memories.py：新增 GridCard 组件（方形缩略图），展开态改为5列网格布局
+- special_memories.py：PokerStack 新增 photo_clicked/collapse_others 信号，实现手风琴模式（同时只展开一个回忆堆叠）
+- special_memories.py：展开态点击缩略图通过 photo_clicked 信号 → app.py _on_special_photo_clicked → on_photo_clicked 打开图片查看器
+- app.py：discover_folder_memories top_n 从 5 降为 2，减少文件夹回忆
+
+### 时间线黑屏修复 + 缩略图增强
+- timeline_view.py：_PhotoCard 缺少 QLabel 子控件导致 load_thumbnail 无法显示 → 添加 self._thumb QLabel，直接 setPixmap
+- config.py：thumbnail_size 从 (400,400) 提升到 (600,600)
+- photo_indexer.py：JPEG quality 从 80 提升到 90
+- 手动清理：删除 1021 个旧缩略图、filelist.txt、5 个文件夹回忆记录，重置 photo_metadata.thumbnail_path 为 NULL（下次索引自动按新参数重新生成）
+
+### 编码损坏路径 + 不可识别图片修复
+- fast_scan.py：filelist.txt 缓存读取增加 \ufffd 过滤，防止损坏路径从缓存进入扫描
+- photo_indexer.py：_index_single_photo 新增 Image.open 预检，无法识别的图片标记 thumbnail_path='__FAILED__'，避免重复尝试
+- 全局：所有 thumbnail_path IS NOT NULL 查询增加 AND thumbnail_path != '__FAILED__' 过滤（10 处）
+- 手动清理：删除 211 个缩略图、filelist.txt、5 个回忆、4 条点击历史、390 条展示历史、2 个断点、1 条迁移日志，重置 1220 张照片的 thumbnail_path
+
+### row_factory + LLM 分类修复
+- db_manager.py：connect() 添加 conn.row_factory = sqlite3.Row，修复短连接查询返回 tuple 导致 _make_photo_dict(r) 用 r["id"] 访问报错（特殊回忆卡片堆叠不出现）
+- folder_classifier.py：LLM 分类增加 parsed 类型保护，非 dict 类型（如 int）时跳过当次尝试，避免 'int' object has no attribute 'get'
+
+### 特殊回忆交互修复 + 侧边栏标签
+- special_memories.py：StackedCard 添加 mousePressEvent，点击折叠态卡片发射 clicked 信号触发展开
+- special_memories.py：_layout_collapsed() 创建 StackedCard 后调用 load_thumbnail()，修复折叠态缩略图不显示
+- sidebar.py：第一栏标签从"回忆"改回"随机回忆"
+- background_task_manager.py：IndexStage 跳过检查 SQL 修复 pm.thumbnail_path → thumbnail_path（去掉不存在的表别名），>=100 缩略图跳过逻辑生效
+
+### 时间线 header 位置 + 特殊回忆缩略图黑色修复
+- timeline_view.py：日期 header 从独立 _draw_headers() 合并到 _render_visible() 统一管理（_visible_headers dict），header 设不透明背景 #111 + setFixedHeight，解决时间标签与缩略图重叠
+- timeline_view.py：删除 _draw_headers() 方法，_clear_all() 同步清理 _visible_headers
+- special_memories.py：替换 PyQt6 内置 QPixmapCache 为自定义 _PixmapCache（dict 实现），PyQt6 已移除字符串 key 的 find/insert API 导致缩略图无法缓存和加载
+
 ### 其他
 - 缓存清空（storage/thumbnails/ 和 photos.db）
 - Git 提交推送，创建 V0.3 release

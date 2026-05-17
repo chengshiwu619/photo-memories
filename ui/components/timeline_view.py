@@ -36,28 +36,26 @@ class _PhotoCard(QFrame):
         self.setStyleSheet("background: #222; border-radius: 2px;")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
+        self._thumb = QLabel(self)
+        self._thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._thumb.setFixedSize(size, size)
+        self._thumb.setText("…")
+        self._thumb.setStyleSheet("color: #444; font-size: 10px; background: transparent;")
+
     def load_thumbnail(self, thumbnail_path: str):
         if not thumbnail_path:
             return
         pm = QPixmapCache.find(thumbnail_path)
-        if pm and not pm.isNull():
-            scaled = pm.scaled(self._size, self._size, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-            self._set_pixmap(scaled)
-            return
-        from PyQt6.QtGui import QPixmap
-        pm = QPixmap(thumbnail_path)
+        if not pm:
+            pm = QPixmap(thumbnail_path)
+            if not pm.isNull():
+                QPixmapCache.insert(thumbnail_path, pm)
         if not pm.isNull():
-            QPixmapCache.insert(thumbnail_path, pm)
             scaled = pm.scaled(self._size, self._size, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-            self._set_pixmap(scaled)
-
-    def _set_pixmap(self, pm: QPixmap):
-        child = self.findChild(QLabel)
-        if child:
-            crop_x = (pm.width() - self._size) // 2
-            crop_y = (pm.height() - self._size) // 2
-            cropped = pm.copy(crop_x, crop_y, self._size, self._size)
-            child.setPixmap(cropped)
+            crop_x = (scaled.width() - self._size) // 2
+            crop_y = (scaled.height() - self._size) // 2
+            cropped = scaled.copy(crop_x, crop_y, self._size, self._size)
+            self._thumb.setPixmap(cropped)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -94,6 +92,7 @@ class TimelineView(QWidget):
         self._groups: list[dict] = []
         self._card_size = 80
         self._visible_cards: dict[tuple, _PhotoCard] = {}
+        self._visible_headers: dict[int, QLabel] = {}
         self._setup_ui()
 
     def _setup_ui(self):
@@ -177,10 +176,8 @@ class TimelineView(QWidget):
         visible_top = scroll_y - _SCROLL_BUFFER
         visible_bottom = scroll_y + view_h + _SCROLL_BUFFER
 
-        total_w = self._container.width()
-        content_x = _GAP
-
-        needed: set[tuple] = set()
+        needed_cards: set[tuple] = set()
+        needed_headers: set[int] = set()
         y = 0
         for gi, group in enumerate(self._groups):
             header_y = y
@@ -192,6 +189,18 @@ class TimelineView(QWidget):
             group_bottom = y + rows * row_h
 
             if header_y <= visible_bottom and group_bottom >= visible_top:
+                needed_headers.add(gi)
+                if gi not in self._visible_headers:
+                    lbl = QLabel(_format_date(group["date_key"]))
+                    lbl.setParent(self._container)
+                    lbl.setFixedHeight(_HEADER_H)
+                    lbl.setFixedWidth(self._container.width() - _GAP * 2)
+                    lbl.move(_GAP, header_y)
+                    lbl.setStyleSheet("color: #c0c0c0; font-size: 13px; font-weight: bold; background: #111; padding-left: 4px;")
+                    lbl.setFont(QFont("Microsoft YaHei", 9, QFont.Weight.Bold))
+                    lbl.show()
+                    self._visible_headers[gi] = lbl
+
                 for ri in range(rows):
                     row_y = y + ri * row_h
                     if row_y + row_h < visible_top or row_y > visible_bottom:
@@ -201,7 +210,7 @@ class TimelineView(QWidget):
                         if idx >= n:
                             break
                         key = (gi, ri, ci)
-                        needed.add(key)
+                        needed_cards.add(key)
                         if key not in self._visible_cards:
                             photo = group["photos"][idx]
                             card = _PhotoCard(photo.get("file_id", 0), self._card_size)
@@ -218,38 +227,15 @@ class TimelineView(QWidget):
 
             y = group_bottom + 8
 
-        to_remove = [k for k in self._visible_cards if k not in needed]
+        to_remove = [k for k in self._visible_cards if k not in needed_cards]
         for k in to_remove:
             card = self._visible_cards.pop(k)
             card.deleteLater()
 
-        self._draw_headers(visible_top, visible_bottom)
-
-    def _draw_headers(self, top, bottom):
-        for child in self._container.findChildren(QLabel):
-            if child.property("is_header"):
-                child.deleteLater()
-
-        y = 0
-        for gi, group in enumerate(self._groups):
-            header_y = y
-            y += _HEADER_H
-            n = len(group["photos"])
-            rows = (n + _COLS - 1) // _COLS
-            row_h = self._card_size + _GAP
-            group_bottom = y + rows * row_h
-
-            if header_y <= bottom and header_y + _HEADER_H >= top:
-                lbl = QLabel(_format_date(group["date_key"]))
-                lbl.setProperty("is_header", True)
-                lbl.setParent(self._container)
-                lbl.move(_GAP, header_y + 6)
-                lbl.setFixedWidth(self._container.width() - _GAP * 2)
-                lbl.setStyleSheet("color: #c0c0c0; font-size: 13px; font-weight: bold; background: transparent;")
-                lbl.setFont(QFont("Microsoft YaHei", 9, QFont.Weight.Bold))
-                lbl.show()
-
-            y = group_bottom + 8
+        to_remove_h = [k for k in self._visible_headers if k not in needed_headers]
+        for k in to_remove_h:
+            lbl = self._visible_headers.pop(k)
+            lbl.deleteLater()
 
     def _on_scroll(self, value):
         self._render_visible()
@@ -258,9 +244,9 @@ class TimelineView(QWidget):
         for card in self._visible_cards.values():
             card.deleteLater()
         self._visible_cards.clear()
-        for child in self._container.findChildren(QLabel):
-            if child.property("is_header"):
-                child.deleteLater()
+        for lbl in self._visible_headers.values():
+            lbl.deleteLater()
+        self._visible_headers.clear()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

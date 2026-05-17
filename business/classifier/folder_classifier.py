@@ -357,6 +357,9 @@ def classify_branches_with_llm(branch_info):
             parsed = json.loads(result_text)
             if isinstance(parsed, list):
                 parsed = parsed[0] if parsed else {}
+            if not isinstance(parsed, dict):
+                logger.warning(f"LLM 返回非dict类型({type(parsed).__name__}), 尝试 {attempt+1}/2")
+                continue
             categories = parsed.get("c", [])
             result = {}
             for i, (name, _) in enumerate(branch_info):

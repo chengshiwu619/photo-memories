@@ -246,7 +246,18 @@ def _list_all_image_files():
         with open(list_file, "r", encoding="utf-8") as f:
             lines = f.readlines()
         if lines and lines[0].strip() == f"# SOURCE_DRIVE={os.path.normpath(_s.source_drive)}":
-            paths = [os.path.normpath(l.rstrip("\n")) for l in lines[1:] if l.strip()]
+            paths = []
+            skipped = 0
+            for l in lines[1:]:
+                p = os.path.normpath(l.rstrip("\n"))
+                if not p.strip():
+                    continue
+                if "\ufffd" in p or "?" in p:
+                    skipped += 1
+                    continue
+                paths.append(p)
+            if skipped:
+                logger.warning(f"缓存文件列表跳过 {skipped} 个编码损坏路径")
             if paths:
                 logger.info("使用缓存文件列表: %s 个文件" % len(paths))
                 return paths
@@ -285,9 +296,13 @@ def _list_all_image_files():
 
 def _parse_es_csv(text):
     files = []
+    skipped = 0
     for line in text.strip().split("\n"):
         line = line.strip()
         filepath = line.strip("\"")
+        if "\ufffd" in filepath or "?" in filepath:
+            skipped += 1
+            continue
         sd = _match_source_dir(filepath)
         if sd is None:
             continue
@@ -295,6 +310,8 @@ def _parse_es_csv(text):
         ext = os.path.splitext(filepath)[1].lower()
         if ext in ALL_EXTENSIONS:
             files.append(filepath)
+    if skipped:
+        logger.warning(f"跳过 {skipped} 个编码损坏的文件路径")
     return files
 
 
@@ -347,8 +364,11 @@ def full_scan(progress_callback=None, batch_limit=None):
     logger.info(f"磁盘发现 {len(file_list)} 个媒体文件")
 
     _db.init_tables()
-    conn = _db.get_persistent_connection()
-    conn.execute("PRAGMA busy_timeout=60000")
+
+    with _db.connect() as conn:
+        existing = set(r[0] for r in conn.execute("SELECT file_path FROM files"))
+    logger.info(f"数据库中已有 {len(existing)} 条文件记录")
+    total = len(file_list)
 
     cp = _cp.load()
     if cp and "current_index" not in cp:
@@ -358,10 +378,6 @@ def full_scan(progress_callback=None, batch_limit=None):
     start_idx = cp["current_index"] if cp else 0
     new_added = cp["new_added"] if cp else 0
     batch_count = 0
-
-    existing = set(r[0] for r in conn.execute("SELECT file_path FROM files"))
-    logger.info(f"数据库中已有 {len(existing)} 条文件记录")
-    total = len(file_list)
 
     is_new = not cp
     if is_new and total > 0:
@@ -373,6 +389,8 @@ def full_scan(progress_callback=None, batch_limit=None):
     remove_set = set(existing)
     for fp in file_list:
         remove_set.discard(fp)
+
+    pending_writes = []
 
     for i in range(start_idx, total):
         filepath = os.path.normpath(file_list[i])
@@ -389,28 +407,30 @@ def full_scan(progress_callback=None, batch_limit=None):
 
             folder = os.path.normpath(os.path.dirname(filepath))
             source_dir = _match_source_dir(filepath) or _s.source_dirs[0] if _s.source_dirs else None
-            conn.execute(
-                """INSERT OR IGNORE INTO files
-                   (file_path, file_name, folder_path, folder_name, file_size, file_mtime, file_hash, is_image, scanned_at, source_dir)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    filepath,
-                    os.path.basename(filepath),
-                    folder,
-                    os.path.basename(folder),
-                    stat.st_size,
-                    datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                    file_hash,
-                    1 if is_image else 0,
-                    datetime.now().isoformat(),
-                    source_dir,
-                ),
-            )
+            pending_writes.append((
+                filepath,
+                os.path.basename(filepath),
+                folder,
+                os.path.basename(folder),
+                stat.st_size,
+                datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                file_hash,
+                1 if is_image else 0,
+                datetime.now().isoformat(),
+                source_dir,
+            ))
             new_added += 1
             batch_count += 1
 
-            if new_added % 50 == 0:
-                conn.commit()
+            if len(pending_writes) >= 50:
+                with _db.connect() as conn:
+                    conn.executemany(
+                        """INSERT OR IGNORE INTO files
+                           (file_path, file_name, folder_path, folder_name, file_size, file_mtime, file_hash, is_image, scanned_at, source_dir)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        pending_writes,
+                    )
+                pending_writes.clear()
         except Exception as e:
             logger.error(f"扫描文件失败 {filepath}: {e}")
 
@@ -418,61 +438,90 @@ def full_scan(progress_callback=None, batch_limit=None):
             progress_callback(i + 1, total)
 
         if batch_limit and batch_count >= batch_limit:
+            if pending_writes:
+                with _db.connect() as conn:
+                    conn.executemany(
+                        """INSERT OR IGNORE INTO files
+                           (file_path, file_name, folder_path, folder_name, file_size, file_mtime, file_hash, is_image, scanned_at, source_dir)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        pending_writes,
+                    )
+                pending_writes.clear()
             _cp.save(CheckpointState.PAUSED, current_index=i + 1, total=total, new_added=new_added)
             logger.info(f"扫描热身: {new_added} 条, 剩余 {total - i - 1} 条后台继续")
-            conn.commit()
-            conn.close()
             return {"paused": True, "batch_limit_reached": True, "total": total, "new": new_added, "removed": 0}
 
         if (i + 1) % 100 == 0:
             if _cp.is_pause_or_stop_requested():
+                if pending_writes:
+                    with _db.connect() as conn:
+                        conn.executemany(
+                            """INSERT OR IGNORE INTO files
+                               (file_path, file_name, folder_path, folder_name, file_size, file_mtime, file_hash, is_image, scanned_at, source_dir)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            pending_writes,
+                        )
+                    pending_writes.clear()
                 _cp.save(CheckpointState.PAUSED, current_index=i + 1, total=total, new_added=new_added)
                 logger.info(f"扫描暂停: idx={i + 1}, 新增 {new_added}")
-                conn.commit()
 
                 if remove_set:
                     logger.info(f"清理 {len(remove_set)} 个已移除文件...")
-                    for path in remove_set:
-                        conn.execute("DELETE FROM files WHERE file_path = ?", (path,))
-                    conn.commit()
+                    with _db.connect() as conn:
+                        conn.executemany(
+                            "DELETE FROM files WHERE file_path = ?",
+                            [(p,) for p in remove_set],
+                        )
 
-                conn.close()
                 return {"paused": True, "total": total, "new": new_added, "removed": len(remove_set)}
 
             _cp.save(CheckpointState.RUNNING, current_index=i + 1, total=total, new_added=new_added)
 
+    if pending_writes:
+        with _db.connect() as conn:
+            conn.executemany(
+                """INSERT OR IGNORE INTO files
+                   (file_path, file_name, folder_path, folder_name, file_size, file_mtime, file_hash, is_image, scanned_at, source_dir)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                pending_writes,
+            )
+        pending_writes.clear()
+
     if remove_set:
         logger.info(f"清理 {len(remove_set)} 个已移除文件...")
-        for path in remove_set:
-            conn.execute("DELETE FROM files WHERE file_path = ?", (path,))
-        conn.commit()
+        with _db.connect() as conn:
+            conn.executemany(
+                "DELETE FROM files WHERE file_path = ?",
+                [(p,) for p in remove_set],
+            )
 
-    _cleanup_removed_source_dirs(conn)
+    _cleanup_removed_source_dirs()
 
-    final = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-    conn.commit()
-    conn.close()
+    with _db.connect() as conn:
+        final = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+
     _cp.clear()
 
     logger.info(f"扫描完成: 总计 {final} 文件, 新增 {new_added}, 移除 {len(remove_set)}")
     return {"total": final, "new": new_added, "removed": len(remove_set)}
 
 
-def _cleanup_removed_source_dirs(conn):
+def _cleanup_removed_source_dirs():
     _dirs = get_settings().source_dirs
     if not _dirs:
         return
     placeholders = ",".join("?" * len(_dirs))
-    removed = conn.execute(
-        f"SELECT COUNT(*) FROM files WHERE source_dir IS NOT NULL AND source_dir NOT IN ({placeholders})",
-        _dirs
-    ).fetchone()[0]
-    if removed > 0:
-        conn.execute(
-            f"DELETE FROM files WHERE source_dir IS NOT NULL AND source_dir NOT IN ({placeholders})",
+    with _db.connect() as conn:
+        removed = conn.execute(
+            f"SELECT COUNT(*) FROM files WHERE source_dir IS NOT NULL AND source_dir NOT IN ({placeholders})",
             _dirs
-        )
-        logger.info(f"清理 {removed} 个不在配置中的照片库文件")
+        ).fetchone()[0]
+        if removed > 0:
+            conn.execute(
+                f"DELETE FROM files WHERE source_dir IS NOT NULL AND source_dir NOT IN ({placeholders})",
+                _dirs
+            )
+            logger.info(f"清理 {removed} 个不在配置中的照片库文件")
 
 
 def fast_scan(num_files=1000, progress_callback=None):

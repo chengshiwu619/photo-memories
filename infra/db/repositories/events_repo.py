@@ -19,7 +19,7 @@ class EventsRepository:
                 WHERE f.is_image = 1
                   AND pm.date_taken IS NOT NULL
                   AND pm.is_duplicate_of IS NULL
-                  AND pm.thumbnail_path IS NOT NULL
+                  AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
                 ORDER BY pm.date_taken ASC
             """).fetchall()
         return rows

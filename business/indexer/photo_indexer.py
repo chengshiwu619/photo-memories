@@ -149,7 +149,7 @@ def generate_thumbnail(filepath, thumbnail_name):
             img.thumbnail(thumb_size, Image.LANCZOS)
             if img.mode in ("RGBA", "P"):
                 img = img.convert("RGB")
-            img.save(thumb_path, "JPEG", quality=80)
+            img.save(thumb_path, "JPEG", quality=90)
         return thumb_path, orig_w, orig_h
     except Exception as e:
         logger.error(f"缩略图生成失败 {filepath}: {e}")
@@ -183,28 +183,84 @@ def dedup_by_phash(progress_callback=None):
 
     phash_map = {}
     duplicate_count = 0
+    pending_dup_updates = []
 
     for i, (file_id, phash_str) in enumerate(rows):
         h = imagehash.hex_to_hash(phash_str)
         found_dup = False
         for existing_id, existing_hash in phash_map.items():
             if h - existing_hash <= get_settings().phash_threshold:
-                with _db.connect() as conn:
-                    conn.execute(
-                        "UPDATE photo_metadata SET is_duplicate_of = ? WHERE file_id = ?",
-                        (existing_id, file_id)
-                    )
+                pending_dup_updates.append((existing_id, file_id))
                 duplicate_count += 1
                 found_dup = True
                 break
         if not found_dup:
             phash_map[file_id] = h
 
+        if len(pending_dup_updates) >= 50:
+            with _db.connect() as conn:
+                conn.executemany(
+                    "UPDATE photo_metadata SET is_duplicate_of = ? WHERE file_id = ?",
+                    pending_dup_updates,
+                )
+            pending_dup_updates.clear()
+
         if progress_callback and (i + 1) % 100 == 0:
             progress_callback(i + 1, len(rows))
 
+    if pending_dup_updates:
+        with _db.connect() as conn:
+            conn.executemany(
+                "UPDATE photo_metadata SET is_duplicate_of = ? WHERE file_id = ?",
+                pending_dup_updates,
+            )
+
     logger.info(f"去重完成: 检查 {len(rows)} 张, 发现 {duplicate_count} 张重复")
     return {"checked": len(rows), "duplicates": duplicate_count}
+
+
+def _index_single_photo(file_id, file_path):
+    if not os.path.exists(file_path):
+        logger.warning(f"文件不存在, 跳过: {file_path}")
+        return None
+
+    try:
+        with Image.open(file_path) as _test:
+            pass
+    except Exception as e:
+        logger.warning(f"无法识别图片, 标记跳过: {file_path}: {e}")
+        return (
+            file_id, None, None, None, None,
+            None, None, "__FAILED__", None,
+            datetime.now().isoformat(), None,
+        )
+
+    exif_data = extract_exif(file_path)
+    thumbnail_name = f"{file_id}.jpg"
+    thumb_path, orig_w, orig_h = generate_thumbnail(file_path, thumbnail_name)
+
+    import json as json_mod
+    exif_json = (
+        json_mod.dumps(exif_data["raw"], ensure_ascii=False)
+        if exif_data["raw"]
+        else None
+    )
+
+    phash = compute_phash(file_path)
+
+    return (
+        file_id,
+        exif_data["date_taken"],
+        exif_data["camera_model"],
+        exif_data["gps_lat"],
+        exif_data["gps_lon"],
+        orig_w,
+        orig_h,
+        thumb_path,
+        exif_json,
+        datetime.now().isoformat(),
+        phash,
+    )
 
 
 def index_photos(progress_callback=None, batch_limit=None):
@@ -224,56 +280,29 @@ def index_photos(progress_callback=None, batch_limit=None):
     elif cp:
         logger.info(f"从断点恢复: idx={start_idx}, total={total}, indexed={indexed}")
 
-    conn = _db.get_persistent_connection()
-
     batch_count = 0
+    pending_writes = []
 
     for i in range(start_idx, total):
         file_id, file_path = photos[i]
 
         try:
-            if not os.path.exists(file_path):
-                logger.warning(f"文件不存在, 跳过: {file_path}")
-                continue
+            row = _index_single_photo(file_id, file_path)
+            if row is not None:
+                pending_writes.append(row)
+                indexed += 1
+                batch_count += 1
 
-            exif_data = extract_exif(file_path)
-
-            thumbnail_name = f"{file_id}.jpg"
-            thumb_path, orig_w, orig_h = generate_thumbnail(file_path, thumbnail_name)
-
-            import json as json_mod
-            exif_json = (
-                json_mod.dumps(exif_data["raw"], ensure_ascii=False)
-                if exif_data["raw"]
-                else None
-            )
-
-            phash = compute_phash(file_path)
-
-            conn.execute(
-                """INSERT OR REPLACE INTO photo_metadata
-                   (file_id, date_taken, camera_model, gps_lat, gps_lon,
-                    width, height, thumbnail_path, exif_json, indexed_at, phash)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    file_id,
-                    exif_data["date_taken"],
-                    exif_data["camera_model"],
-                    exif_data["gps_lat"],
-                    exif_data["gps_lon"],
-                    orig_w,
-                    orig_h,
-                    thumb_path,
-                    exif_json,
-                    datetime.now().isoformat(),
-                    phash,
-                ),
-            )
-            indexed += 1
-            batch_count += 1
-
-            if indexed % INDEX_COMMIT_EVERY == 0:
-                conn.commit()
+                if len(pending_writes) >= INDEX_COMMIT_EVERY:
+                    with _db.connect() as conn:
+                        conn.executemany(
+                            """INSERT OR REPLACE INTO photo_metadata
+                               (file_id, date_taken, camera_model, gps_lat, gps_lon,
+                                width, height, thumbnail_path, exif_json, indexed_at, phash)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            pending_writes,
+                        )
+                    pending_writes.clear()
         except Exception as e:
             logger.error(f"索引照片失败 {file_path}: {e}")
 
@@ -281,24 +310,49 @@ def index_photos(progress_callback=None, batch_limit=None):
             progress_callback(i + 1, total)
 
         if batch_limit and batch_count >= batch_limit:
+            if pending_writes:
+                with _db.connect() as conn:
+                    conn.executemany(
+                        """INSERT OR REPLACE INTO photo_metadata
+                           (file_id, date_taken, camera_model, gps_lat, gps_lon,
+                            width, height, thumbnail_path, exif_json, indexed_at, phash)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        pending_writes,
+                    )
+                pending_writes.clear()
             _cp.save(CheckpointState.PAUSED, current_index=i + 1, total=total, indexed=indexed)
             logger.info(f"索引热身完成: {indexed}/{total}, 剩余 {total - i - 1} 张后台继续")
-            conn.commit()
-            conn.close()
             return {"paused": True, "batch_limit_reached": True, "total": total, "indexed": indexed}
 
         if (i + 1) % 20 == 0:
             if _cp.is_pause_or_stop_requested():
+                if pending_writes:
+                    with _db.connect() as conn:
+                        conn.executemany(
+                            """INSERT OR REPLACE INTO photo_metadata
+                               (file_id, date_taken, camera_model, gps_lat, gps_lon,
+                                width, height, thumbnail_path, exif_json, indexed_at, phash)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            pending_writes,
+                        )
+                    pending_writes.clear()
                 _cp.save(CheckpointState.PAUSED, current_index=i + 1, total=total, indexed=indexed)
                 logger.info(f"索引暂停: {indexed}/{total}")
-                conn.commit()
-                conn.close()
                 return {"paused": True, "total": total, "indexed": indexed}
 
             _cp.save(CheckpointState.RUNNING, current_index=i + 1, total=total, indexed=indexed)
 
-    conn.commit()
-    conn.close()
+    if pending_writes:
+        with _db.connect() as conn:
+            conn.executemany(
+                """INSERT OR REPLACE INTO photo_metadata
+                   (file_id, date_taken, camera_model, gps_lat, gps_lon,
+                    width, height, thumbnail_path, exif_json, indexed_at, phash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                pending_writes,
+            )
+        pending_writes.clear()
+
     _cp.clear()
     logger.info(f"索引完成: 总计 {total}, 已索引 {indexed}")
 

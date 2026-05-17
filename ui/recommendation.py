@@ -1,6 +1,8 @@
 import os
 import random
 
+from db_manager import Database
+
 CATEGORY_COLORS = {
     1: "#27ae60", 2: "#2980b9",
 }
@@ -138,15 +140,15 @@ def _get_recently_shown_ids(db, cat_id, days=FRESHNESS_WINDOW_DAYS):
     return {r["file_id"] for r in rows}
 
 
-def record_shown_photos(db, photos, cat_id):
+def record_shown_photos(photos, cat_id):
     if not photos:
         return
-    for p in photos:
-        db.execute(
+    rows = [(p["id"], cat_id) for p in photos]
+    with Database().connect() as conn:
+        conn.executemany(
             "INSERT INTO photo_shown_history (file_id, category, shown_at) VALUES (?, ?, datetime('now'))",
-            (p["id"], cat_id),
+            rows,
         )
-    db.commit()
 
 
 def load_photos_from_ids(db, all_ids):
@@ -179,7 +181,7 @@ def load_category_photos_batch(db, cat_id, offset, limit=PAGE_SIZE):
         FROM files f
         JOIN folder_categories fc ON f.folder_path = fc.folder_path
         LEFT JOIN photo_metadata pm ON f.id = pm.file_id
-        WHERE fc.category = ? AND f.is_image = 1 AND pm.thumbnail_path IS NOT NULL
+        WHERE fc.category = ? AND f.is_image = 1 AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
               AND pm.is_duplicate_of IS NULL
         ORDER BY pm.date_taken DESC
         LIMIT ? OFFSET ?
@@ -193,7 +195,7 @@ def load_category_photos_batch(db, cat_id, offset, limit=PAGE_SIZE):
                        pm.width, pm.height, pm.date_taken
                 FROM files f
                 LEFT JOIN photo_metadata pm ON f.id = pm.file_id
-                WHERE f.is_image = 1 AND pm.thumbnail_path IS NOT NULL
+                WHERE f.is_image = 1 AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
                       AND pm.is_duplicate_of IS NULL
                 ORDER BY pm.date_taken DESC
                 LIMIT ?
@@ -209,7 +211,7 @@ def load_starred_photos(db, cat_id):
         FROM files f
         JOIN photo_metadata pm ON f.id = pm.file_id
         JOIN folder_categories fc ON f.folder_path = fc.folder_path
-        WHERE pm.is_starred = 1 AND f.is_image = 1 AND fc.category = ? AND pm.thumbnail_path IS NOT NULL
+        WHERE pm.is_starred = 1 AND f.is_image = 1 AND fc.category = ? AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
         ORDER BY pm.date_taken DESC
     """, (cat_id,)).fetchall()
     return _interleave_small_folders([_make_photo_dict(r) for r in rows])

@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     source_drive: str = "D:\\测试"
     photo_data_dir: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage")
 
-    thumbnail_size: tuple[int, int] = (400, 400)
+    thumbnail_size: tuple[int, int] = (600, 600)
     phash_threshold: int = 8
     memory_high_freq_days: int = 3
 

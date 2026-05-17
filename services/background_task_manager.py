@@ -61,7 +61,7 @@ class IndexStage(Stage):
             db = Database()
             with db.connect() as conn:
                 n = conn.execute(
-                    "SELECT COUNT(*) FROM photo_metadata WHERE thumbnail_path IS NOT NULL"
+                    "SELECT COUNT(*) FROM photo_metadata WHERE thumbnail_path IS NOT NULL AND thumbnail_path != '__FAILED__'"
                 ).fetchone()[0]
             if n >= 100:
                 return {"total": 0, "indexed": 0, "batch_limit_reached": True}

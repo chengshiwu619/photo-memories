@@ -24,7 +24,7 @@ _NAV_BTN_STYLE = """
 """
 
 _NAV_ITEMS = [
-    ("random", "回\n忆"),
+    ("random", "随\n机\n回\n忆"),
     ("timeline", "时\n间\n线"),
     ("special", "特\n殊\n回\n忆"),
 ]
