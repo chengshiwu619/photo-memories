@@ -22,4 +22,28 @@ classification_history.txt
 debug_*.py
 photos_before_*.db
 
+# Local databases and SQLite sidecar files
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+
+# Local caches, thumbnails, and temp directories
+thumbs/
+thumb/
+thumbnails/
+thumbnail/
+cache/
+caches/
+tmp/
+temp/
+
 *.pt
+*.onnx
+*.bin
+*.safetensors
