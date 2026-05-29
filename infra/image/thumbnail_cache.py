@@ -1,5 +1,5 @@
 import os
-from typing import Any
+from typing import Any, Tuple
 
 
 THUMBNAIL_CACHE_VERSION = "v2"
@@ -17,3 +17,23 @@ def build_thumbnail_path(thumbnail_dir: str, file_id: int) -> str:
 def build_thumbnail_cache_signature(settings: Any) -> str:
     width, height = getattr(settings, "thumbnail_size", (600, 600))
     return f"{THUMBNAIL_CACHE_VERSION}:{width}x{height}:q{THUMBNAIL_JPEG_QUALITY}"
+
+
+def create_thumbnail_file(
+    source_path: str,
+    target_path: str,
+    thumbnail_size: Tuple[int, int],
+    quality: int = THUMBNAIL_JPEG_QUALITY,
+) -> Tuple[int, int]:
+    from PIL import Image, ImageOps
+
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    with Image.open(source_path) as img:
+        orig_w, orig_h = img.size
+        img.draft("RGB", thumbnail_size)
+        img = ImageOps.exif_transpose(img)
+        img.thumbnail(thumbnail_size, Image.LANCZOS)
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        img.save(target_path, "JPEG", quality=quality)
+    return orig_w, orig_h

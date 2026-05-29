@@ -115,6 +115,18 @@ python scripts/check_integrity.py --db-path D:\photo-memories-cache\photos.db --
 该命令默认是 dry-run，只输出完整性报告，并隐藏 `count=0` 的文本检查项；`--show-zero` 可查看完整检查项。`--with-repair-plan` 只生成建议动作，不会自动修复或修改照片、缓存、数据库。
 如果怀疑还在使用旧缩略图缓存，可查看报告中的 `thumbnail_cache_version_missing`、`thumbnail_cache_version_stale`、`thumbnail_file_missing` 等检查项。
 
+## 维护：缩略图维护工具
+
+```bash
+python scripts/maintain_thumbnails.py
+python scripts/maintain_thumbnails.py --db-path D:\photo-memories-cache\photos.db --retry-failed
+python scripts/maintain_thumbnails.py --db-path D:\photo-memories-cache\photos.db --retry-failed --apply
+python scripts/maintain_thumbnails.py --db-path D:\photo-memories-cache\photos.db --migrate-signature
+python scripts/maintain_thumbnails.py --db-path D:\photo-memories-cache\photos.db --migrate-signature --apply
+```
+
+该命令默认是 dry-run，只输出缩略图状态、重试计划或签名迁移计划，不会修改数据库或缓存。只有显式传入 `--apply` 时，才会对少量 `__FAILED__` 记录尝试重试，或仅更新 `thumbnail_params.thumbnail_sig`。
+
 ## License
 
 [MIT](LICENSE)
