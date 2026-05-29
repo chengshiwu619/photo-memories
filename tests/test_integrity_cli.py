@@ -5,7 +5,13 @@ import subprocess
 import sys
 
 
-def _create_minimal_integrity_db(db_path, valid_thumb_path, duplicate_thumb_path, broken_thumb_path):
+def _create_minimal_integrity_db(
+    db_path,
+    valid_thumb_path,
+    duplicate_thumb_path,
+    broken_thumb_path,
+    thumbnail_sig="v2:600x600:q90",
+):
     conn = sqlite3.connect(db_path)
     try:
         conn.executescript(
@@ -29,7 +35,16 @@ def _create_minimal_integrity_db(db_path, valid_thumb_path, duplicate_thumb_path
                 cover_file_id INTEGER,
                 dismissed_at TEXT
             );
+
+            CREATE TABLE thumbnail_params (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
+        )
+        conn.execute(
+            "INSERT INTO thumbnail_params (key, value) VALUES (?, ?)",
+            ("thumbnail_sig", thumbnail_sig),
         )
 
         conn.executemany(
@@ -93,11 +108,14 @@ def test_integrity_cli_text_output_contains_check_details(tmp_path):
 
     assert "Startup Integrity Report" in result.stdout
     assert "db_path:" in result.stdout
+    assert "thumbnail_cache_signature:" in result.stdout
     assert "errors:" in result.stdout
     assert "warnings:" in result.stdout
     assert "memories_missing_file_refs | severity=error | count=2" in result.stdout
+    assert "thumbnail_file_missing | severity=warning | count=1" in result.stdout
     assert "sample_ids:" in result.stdout
     assert "suggested_action:" in result.stdout
+    assert "Suggested Repair Plan" not in result.stdout
 
 
 def test_integrity_cli_json_output_is_valid_json_and_respects_max_samples(tmp_path):
@@ -124,5 +142,41 @@ def test_integrity_cli_json_output_is_valid_json_and_respects_max_samples(tmp_pa
 
     assert report["dry_run"] is True
     assert report["db_path"] == os.path.abspath(db_path)
+    assert "repair_plan" not in report
+    assert report["thumbnail_cache_signature"] == "v2:600x600:q90"
     assert len(checks["memories_missing_file_refs"]["sample_ids"]) == 1
-    assert len(checks["photo_metadata_broken_thumbnail_files"]["sample_paths"]) == 1
+    assert len(checks["thumbnail_file_missing"]["sample_paths"]) == 1
+
+
+def test_integrity_cli_outputs_repair_plan_in_text_and_json(tmp_path):
+    photo_data_dir = tmp_path / "cache"
+    thumb_dir = photo_data_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+
+    valid_thumb = thumb_dir / "1.jpg"
+    valid_thumb.write_bytes(b"ok")
+    duplicate_thumb = thumb_dir / "4.jpg"
+    duplicate_thumb.write_bytes(b"dup")
+    broken_thumb = thumb_dir / "3.jpg"
+
+    db_path = photo_data_dir / "photos.db"
+    _create_minimal_integrity_db(str(db_path), str(valid_thumb), str(duplicate_thumb), str(broken_thumb))
+
+    text_result = _run_cli(
+        ["--db-path", str(db_path), "--with-repair-plan", "--max-samples", "1"],
+        "d:\\photo-memories-source",
+    )
+    assert "Suggested Repair Plan" in text_result.stdout
+    assert "memories_missing_file_refs" in text_result.stdout
+    assert "thumbnail_file_missing" in text_result.stdout
+    assert "action:" in text_result.stdout
+
+    json_result = _run_cli(
+        ["--db-path", str(db_path), "--json", "--with-repair-plan", "--max-samples", "1"],
+        "d:\\photo-memories-source",
+    )
+    report = json.loads(json_result.stdout)
+    assert "repair_plan" in report
+    assert len(report["repair_plan"]) > 0
+    assert len(report["repair_plan"][0]["sample_ids"]) <= 1
+    assert any(step["check_name"] == "thumbnail_file_missing" for step in report["repair_plan"])

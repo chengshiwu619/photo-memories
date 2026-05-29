@@ -27,6 +27,11 @@ def parse_args(argv=None):
     parser.add_argument("--db-path", help="Optional path to the SQLite database to inspect.")
     parser.add_argument("--json", action="store_true", dest="json_output", help="Print the full JSON report.")
     parser.add_argument(
+        "--with-repair-plan",
+        action="store_true",
+        help="Include a suggested repair plan in the output. Suggestions only; no fixes are executed.",
+    )
+    parser.add_argument(
         "--max-samples",
         type=int,
         default=5,
@@ -43,6 +48,7 @@ def main(argv=None):
         db_path=args.db_path,
         settings=settings,
         max_samples=max(args.max_samples, 0),
+        with_repair_plan=args.with_repair_plan,
     )
     if args.json_output:
         print(json.dumps(report, ensure_ascii=False, indent=2))

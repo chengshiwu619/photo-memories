@@ -3,12 +3,28 @@ import sqlite3
 from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
+from infra.image.thumbnail_cache import THUMBNAIL_CACHE_VERSION, build_thumbnail_cache_signature
 from logger_setup import logger
 
 
 IntegrityCheck = Dict[str, Any]
 IntegrityReport = Dict[str, Any]
 DEFAULT_MAX_SAMPLES = 5
+
+_REPAIR_ACTIONS = {
+    "photo_data_dir_exists": "Create the configured photo_data_dir or correct the cache directory setting before startup tasks run.",
+    "thumbnail_dir_exists": "Create the configured thumbnail_dir or fix the thumbnail cache path in settings before indexing.",
+    "database_file_exists": "Initialize or restore the SQLite database file before relying on memory and thumbnail integrity checks.",
+    "thumbnail_cache_version_missing": "Persist the current thumbnail cache signature after validating settings, then schedule thumbnail regeneration in small batches by file_id/path.",
+    "thumbnail_cache_version_stale": "Regenerate thumbnails in batches by file_id/path for entries created under the old cache signature before relying on cached thumbnails.",
+    "memories_missing_file_refs": "Rebuild the affected memory rows from discovery logic or manually inspect stale file_id references before displaying them.",
+    "memories_unrenderable_in_ui": "Rebuild these memories so every displayed memory has at least one currently renderable photo reference.",
+    "memories_partially_unrenderable": "Review these memories and rebuild or trim stale photo references so visible content matches stored references.",
+    "memories_invalid_cover_file": "Choose a new cover_file_id from a valid referenced photo when the stored cover file is missing.",
+    "thumbnail_path_empty": "Regenerate thumbnails for these photos so UI and memory views have a usable thumbnail reference.",
+    "thumbnail_failed": "Retry thumbnail generation for failed entries after confirming the source files are still readable.",
+    "thumbnail_file_missing": "Rebuild thumbnail files or reset broken thumbnail_path values so cache references point to real files.",
+}
 
 
 def _make_check(
@@ -177,6 +193,23 @@ def _query_broken_thumbnail_files(conn: sqlite3.Connection) -> List[sqlite3.Row]
     return [row for row in rows if not os.path.exists(row["thumbnail_path"])]
 
 
+def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _get_thumbnail_signature_value(conn: sqlite3.Connection) -> Optional[str]:
+    if not _table_exists(conn, "thumbnail_params"):
+        return None
+    row = conn.execute(
+        "SELECT value FROM thumbnail_params WHERE key = 'thumbnail_sig'"
+    ).fetchone()
+    return row[0] if row else None
+
+
 def summarize_integrity_report(report: IntegrityReport) -> Dict[str, int]:
     checks = report.get("checks", [])
     error_count = sum(check["count"] for check in checks if check["severity"] == "error")
@@ -219,6 +252,8 @@ def format_integrity_report_text(report: IntegrityReport) -> str:
         "Startup Integrity Report",
         f"db_path: {report.get('db_path', '')}",
         f"dry_run: {report.get('dry_run', True)}",
+        f"thumbnail_cache_version: {report.get('thumbnail_cache_version', '')}",
+        f"thumbnail_cache_signature: {report.get('thumbnail_cache_signature', '')}",
         f"errors: {summary['error_count']}",
         f"warnings: {summary['warning_count']}",
         f"info: {summary['info_count']}",
@@ -233,7 +268,41 @@ def format_integrity_report_text(report: IntegrityReport) -> str:
             lines.append(f"  sample_paths: {check['sample_paths']}")
         if check.get("suggested_action"):
             lines.append(f"  suggested_action: {check['suggested_action']}")
+    repair_plan = report.get("repair_plan") or []
+    if repair_plan:
+        lines.append("Suggested Repair Plan")
+        for step in repair_plan:
+            lines.append(
+                f"- {step['check_name']} | priority={step['priority']} | affected_count={step['affected_count']}"
+            )
+            lines.append(f"  action: {step['action']}")
+            if step.get("sample_ids"):
+                lines.append(f"  sample_ids: {step['sample_ids']}")
+            if step.get("sample_paths"):
+                lines.append(f"  sample_paths: {step['sample_paths']}")
     return "\n".join(lines)
+
+
+def build_repair_plan(report: IntegrityReport, max_samples: int = DEFAULT_MAX_SAMPLES) -> List[Dict[str, Any]]:
+    plan: List[Dict[str, Any]] = []
+    for check in report.get("checks", []):
+        if check.get("count", 0) <= 0:
+            continue
+        action = _REPAIR_ACTIONS.get(check["check_name"])
+        if not action:
+            continue
+        priority = "high" if check["severity"] == "error" else "medium" if check["severity"] == "warning" else "low"
+        plan.append(
+            {
+                "check_name": check["check_name"],
+                "priority": priority,
+                "affected_count": check["count"],
+                "action": action,
+                "sample_ids": _limit_list(check.get("sample_ids"), max_samples),
+                "sample_paths": _limit_list(check.get("sample_paths"), max_samples),
+            }
+        )
+    return plan
 
 
 def build_startup_integrity_report(
@@ -241,12 +310,15 @@ def build_startup_integrity_report(
     db_path: Optional[str] = None,
     settings: Any = None,
     max_samples: int = DEFAULT_MAX_SAMPLES,
+    with_repair_plan: bool = False,
 ) -> IntegrityReport:
     settings = _resolve_settings(settings)
     resolved_db_path = _resolve_db_path(db_path, settings)
     report: IntegrityReport = {
         "dry_run": dry_run,
         "db_path": resolved_db_path,
+        "thumbnail_cache_version": THUMBNAIL_CACHE_VERSION,
+        "thumbnail_cache_signature": build_thumbnail_cache_signature(settings),
         "checks": [],
     }
 
@@ -285,11 +357,51 @@ def build_startup_integrity_report(
                 max_samples=max_samples,
             )
         )
-        return finalize_integrity_report(report)
+        report = finalize_integrity_report(report)
+        if with_repair_plan:
+            report["repair_plan"] = build_repair_plan(report, max_samples=max_samples)
+        return report
 
     conn = sqlite3.connect(resolved_db_path, timeout=30)
     conn.row_factory = sqlite3.Row
     try:
+        stored_thumbnail_signature = _get_thumbnail_signature_value(conn)
+        report["stored_thumbnail_cache_signature"] = stored_thumbnail_signature
+
+        report["checks"].append(
+            _sample_check(
+                "thumbnail_cache_version_missing",
+                "warning" if not stored_thumbnail_signature else "info",
+                1 if not stored_thumbnail_signature else 0,
+                sample_ids=(
+                    [{"current_signature": report["thumbnail_cache_signature"]}]
+                    if not stored_thumbnail_signature
+                    else []
+                ),
+                suggested_action="Thumbnail cache metadata is missing; review cache provenance before trusting existing thumbnails.",
+                max_samples=max_samples,
+            )
+        )
+        report["checks"].append(
+            _sample_check(
+                "thumbnail_cache_version_stale",
+                "warning"
+                if stored_thumbnail_signature and stored_thumbnail_signature != report["thumbnail_cache_signature"]
+                else "info",
+                1 if stored_thumbnail_signature and stored_thumbnail_signature != report["thumbnail_cache_signature"] else 0,
+                sample_ids=(
+                    [{
+                        "stored_signature": stored_thumbnail_signature,
+                        "current_signature": report["thumbnail_cache_signature"],
+                    }]
+                    if stored_thumbnail_signature and stored_thumbnail_signature != report["thumbnail_cache_signature"]
+                    else []
+                ),
+                suggested_action="Existing thumbnails appear to come from an older cache signature and may need staged regeneration.",
+                max_samples=max_samples,
+            )
+        )
+
         missing_file_refs = _query_memory_reference_issues(conn)
         report["checks"].append(
             _sample_check(
@@ -364,7 +476,7 @@ def build_startup_integrity_report(
         missing_thumbs = _query_missing_thumbnail_refs(conn)
         report["checks"].append(
             _sample_check(
-                "photo_metadata_missing_thumbnail_ref",
+                "thumbnail_path_empty",
                 "warning" if missing_thumbs else "info",
                 len(missing_thumbs),
                 sample_ids=[row["file_id"] for row in missing_thumbs],
@@ -376,7 +488,7 @@ def build_startup_integrity_report(
         failed_thumbs = _query_failed_thumbnail_refs(conn)
         report["checks"].append(
             _sample_check(
-                "photo_metadata_failed_thumbnail_ref",
+                "thumbnail_failed",
                 "warning" if failed_thumbs else "info",
                 len(failed_thumbs),
                 sample_ids=[row["file_id"] for row in failed_thumbs],
@@ -388,7 +500,7 @@ def build_startup_integrity_report(
         broken_thumb_files = _query_broken_thumbnail_files(conn)
         report["checks"].append(
             _sample_check(
-                "photo_metadata_broken_thumbnail_files",
+                "thumbnail_file_missing",
                 "warning" if broken_thumb_files else "info",
                 len(broken_thumb_files),
                 sample_ids=[row["file_id"] for row in broken_thumb_files],
@@ -400,7 +512,10 @@ def build_startup_integrity_report(
     finally:
         conn.close()
 
-    return finalize_integrity_report(report)
+    report = finalize_integrity_report(report)
+    if with_repair_plan:
+        report["repair_plan"] = build_repair_plan(report, max_samples=max_samples)
+    return report
 
 
 def run_startup_integrity_check(
@@ -413,6 +528,7 @@ def run_startup_integrity_check(
         db_path=db_path,
         settings=settings,
         max_samples=DEFAULT_MAX_SAMPLES,
+        with_repair_plan=False,
     )
 
 

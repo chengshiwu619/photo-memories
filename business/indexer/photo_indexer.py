@@ -15,6 +15,11 @@ from logger_setup import logger
 from config import get_settings
 from db_manager import Database
 from checkpoint_manager import CheckpointManager, CheckpointState
+from infra.image.thumbnail_cache import (
+    THUMBNAIL_JPEG_QUALITY,
+    build_thumbnail_filename,
+    build_thumbnail_path,
+)
 
 _db = Database()
 _cp = CheckpointManager(_db, "index")
@@ -136,7 +141,11 @@ def _convert_gps(value):
 def generate_thumbnail(filepath, thumbnail_name):
     _thumb_dir = get_settings().thumbnail_dir
     os.makedirs(_thumb_dir, exist_ok=True)
-    thumb_path = os.path.join(_thumb_dir, thumbnail_name)
+    try:
+        file_id = int(os.path.splitext(thumbnail_name)[0])
+        thumb_path = build_thumbnail_path(_thumb_dir, file_id)
+    except ValueError:
+        thumb_path = os.path.join(_thumb_dir, thumbnail_name)
 
     if os.path.exists(thumb_path):
         return thumb_path, None, None
@@ -150,7 +159,7 @@ def generate_thumbnail(filepath, thumbnail_name):
             img.thumbnail(thumb_size, Image.LANCZOS)
             if img.mode in ("RGBA", "P"):
                 img = img.convert("RGB")
-            img.save(thumb_path, "JPEG", quality=90)
+            img.save(thumb_path, "JPEG", quality=THUMBNAIL_JPEG_QUALITY)
         return thumb_path, orig_w, orig_h
     except Exception as e:
         logger.error(f"缩略图生成失败 {filepath}: {e}")
@@ -237,7 +246,7 @@ def _index_single_photo(file_id, file_path):
         )
 
     exif_data = extract_exif(file_path)
-    thumbnail_name = f"{file_id}.jpg"
+    thumbnail_name = build_thumbnail_filename(file_id)
     thumb_path, orig_w, orig_h = generate_thumbnail(file_path, thumbnail_name)
 
     import json as json_mod

@@ -108,9 +108,11 @@ python -m pytest tests/test_config.py
 ```bash
 python scripts/check_integrity.py
 python scripts/check_integrity.py --db-path D:\photo-memories-cache\photos.db --json
+python scripts/check_integrity.py --db-path D:\photo-memories-cache\photos.db --with-repair-plan
 ```
 
-该命令默认是 dry-run，只输出完整性报告，不会自动修复或修改照片、缓存、数据库。
+该命令默认是 dry-run，只输出完整性报告；`--with-repair-plan` 也只生成建议动作，不会自动修复或修改照片、缓存、数据库。
+如果怀疑还在使用旧缩略图缓存，可查看报告中的 `thumbnail_cache_version_missing`、`thumbnail_cache_version_stale`、`thumbnail_file_missing` 等检查项。
 
 ## License
 

@@ -5,6 +5,7 @@ from collections import OrderedDict
 
 from logger_setup import logger
 from config import get_settings
+from infra.image.thumbnail_cache import build_thumbnail_path
 
 
 class ThumbnailLoader:
@@ -17,7 +18,7 @@ class ThumbnailLoader:
             self._cache.move_to_end(file_id)
             return self._cache[file_id].copy()
 
-        thumb_path = os.path.join(get_settings().thumbnail_dir, f"{file_id}.jpg")
+        thumb_path = build_thumbnail_path(get_settings().thumbnail_dir, file_id)
         if not os.path.exists(thumb_path):
             return None
 
