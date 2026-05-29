@@ -116,6 +116,7 @@ def test_integrity_cli_text_output_contains_check_details(tmp_path):
     assert "sample_ids:" in result.stdout
     assert "suggested_action:" in result.stdout
     assert "Suggested Repair Plan" not in result.stdout
+    assert "thumbnail_cache_version_stale | severity=info | count=0" not in result.stdout
 
 
 def test_integrity_cli_json_output_is_valid_json_and_respects_max_samples(tmp_path):
@@ -144,8 +145,27 @@ def test_integrity_cli_json_output_is_valid_json_and_respects_max_samples(tmp_pa
     assert report["db_path"] == os.path.abspath(db_path)
     assert "repair_plan" not in report
     assert report["thumbnail_cache_signature"] == "v2:600x600:q90"
+    assert "thumbnail_cache_version_stale" in checks
     assert len(checks["memories_missing_file_refs"]["sample_ids"]) == 1
     assert len(checks["thumbnail_file_missing"]["sample_paths"]) == 1
+
+
+def test_integrity_cli_show_zero_displays_zero_count_checks(tmp_path):
+    photo_data_dir = tmp_path / "cache"
+    thumb_dir = photo_data_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+
+    valid_thumb = thumb_dir / "1.jpg"
+    valid_thumb.write_bytes(b"ok")
+    duplicate_thumb = thumb_dir / "4.jpg"
+    duplicate_thumb.write_bytes(b"dup")
+    broken_thumb = thumb_dir / "3.jpg"
+
+    db_path = photo_data_dir / "photos.db"
+    _create_minimal_integrity_db(str(db_path), str(valid_thumb), str(duplicate_thumb), str(broken_thumb))
+
+    result = _run_cli(["--db-path", str(db_path), "--show-zero"], "d:\\photo-memories-source")
+    assert "thumbnail_cache_version_stale | severity=info | count=0" in result.stdout
 
 
 def test_integrity_cli_outputs_repair_plan_in_text_and_json(tmp_path):
@@ -169,6 +189,7 @@ def test_integrity_cli_outputs_repair_plan_in_text_and_json(tmp_path):
     assert "Suggested Repair Plan" in text_result.stdout
     assert "memories_missing_file_refs" in text_result.stdout
     assert "thumbnail_file_missing" in text_result.stdout
+    assert "thumbnail_failed" in text_result.stdout
     assert "action:" in text_result.stdout
 
     json_result = _run_cli(
@@ -180,3 +201,4 @@ def test_integrity_cli_outputs_repair_plan_in_text_and_json(tmp_path):
     assert len(report["repair_plan"]) > 0
     assert len(report["repair_plan"][0]["sample_ids"]) <= 1
     assert any(step["check_name"] == "thumbnail_file_missing" for step in report["repair_plan"])
+    assert any(step["plan_type"] == "thumbnail_failed_retry" for step in report["repair_plan"])

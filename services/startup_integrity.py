@@ -11,21 +11,6 @@ IntegrityCheck = Dict[str, Any]
 IntegrityReport = Dict[str, Any]
 DEFAULT_MAX_SAMPLES = 5
 
-_REPAIR_ACTIONS = {
-    "photo_data_dir_exists": "Create the configured photo_data_dir or correct the cache directory setting before startup tasks run.",
-    "thumbnail_dir_exists": "Create the configured thumbnail_dir or fix the thumbnail cache path in settings before indexing.",
-    "database_file_exists": "Initialize or restore the SQLite database file before relying on memory and thumbnail integrity checks.",
-    "thumbnail_cache_version_missing": "Persist the current thumbnail cache signature after validating settings, then schedule thumbnail regeneration in small batches by file_id/path.",
-    "thumbnail_cache_version_stale": "Regenerate thumbnails in batches by file_id/path for entries created under the old cache signature before relying on cached thumbnails.",
-    "memories_missing_file_refs": "Rebuild the affected memory rows from discovery logic or manually inspect stale file_id references before displaying them.",
-    "memories_unrenderable_in_ui": "Rebuild these memories so every displayed memory has at least one currently renderable photo reference.",
-    "memories_partially_unrenderable": "Review these memories and rebuild or trim stale photo references so visible content matches stored references.",
-    "memories_invalid_cover_file": "Choose a new cover_file_id from a valid referenced photo when the stored cover file is missing.",
-    "thumbnail_path_empty": "Regenerate thumbnails for these photos so UI and memory views have a usable thumbnail reference.",
-    "thumbnail_failed": "Retry thumbnail generation for failed entries after confirming the source files are still readable.",
-    "thumbnail_file_missing": "Rebuild thumbnail files or reset broken thumbnail_path values so cache references point to real files.",
-}
-
 
 def _make_check(
     check_name: str,
@@ -245,7 +230,7 @@ def limit_integrity_report_samples(report: IntegrityReport, max_samples: int = D
     return finalize_integrity_report(trimmed)
 
 
-def format_integrity_report_text(report: IntegrityReport) -> str:
+def format_integrity_report_text(report: IntegrityReport, show_zero: bool = False) -> str:
     report = finalize_integrity_report(deepcopy(report))
     summary = report["summary"]
     lines = [
@@ -259,6 +244,8 @@ def format_integrity_report_text(report: IntegrityReport) -> str:
         f"info: {summary['info_count']}",
     ]
     for check in report.get("checks", []):
+        if not show_zero and check["severity"] == "info" and check["count"] == 0:
+            continue
         lines.append(
             f"- {check['check_name']} | severity={check['severity']} | count={check['count']}"
         )
@@ -283,24 +270,120 @@ def format_integrity_report_text(report: IntegrityReport) -> str:
     return "\n".join(lines)
 
 
+def _check_lookup(report: IntegrityReport) -> Dict[str, IntegrityCheck]:
+    return {check["check_name"]: check for check in report.get("checks", [])}
+
+
+def _append_repair_step(
+    plan: List[Dict[str, Any]],
+    plan_type: str,
+    check_name: str,
+    priority: str,
+    affected_count: int,
+    action: str,
+    sample_ids: Optional[List[Any]] = None,
+    sample_paths: Optional[List[str]] = None,
+    max_samples: int = DEFAULT_MAX_SAMPLES,
+) -> None:
+    plan.append(
+        {
+            "plan_type": plan_type,
+            "check_name": check_name,
+            "priority": priority,
+            "affected_count": affected_count,
+            "action": action,
+            "sample_ids": _limit_list(sample_ids, max_samples),
+            "sample_paths": _limit_list(sample_paths, max_samples),
+        }
+    )
+
+
 def build_repair_plan(report: IntegrityReport, max_samples: int = DEFAULT_MAX_SAMPLES) -> List[Dict[str, Any]]:
     plan: List[Dict[str, Any]] = []
-    for check in report.get("checks", []):
-        if check.get("count", 0) <= 0:
-            continue
-        action = _REPAIR_ACTIONS.get(check["check_name"])
-        if not action:
+    checks = _check_lookup(report)
+
+    for simple_check_name, plan_type, action in [
+        ("photo_data_dir_exists", "config_dir_create", "Create the configured photo_data_dir or correct the cache directory setting before startup tasks run."),
+        ("thumbnail_dir_exists", "config_dir_create", "Create the configured thumbnail_dir or fix the thumbnail cache path in settings before indexing."),
+        ("database_file_exists", "database_restore", "Initialize or restore the SQLite database file before relying on memory and thumbnail integrity checks."),
+        ("memories_missing_file_refs", "memory_rebuild", "Rebuild the affected memory rows from discovery logic or manually inspect stale file_id references before displaying them."),
+        ("memories_unrenderable_in_ui", "memory_rebuild", "Rebuild these memories so every displayed memory has at least one currently renderable photo reference."),
+        ("memories_partially_unrenderable", "memory_review", "Review these memories and rebuild or trim stale photo references so visible content matches stored references."),
+        ("memories_invalid_cover_file", "memory_cover_reselect", "Choose a new cover_file_id from a valid referenced photo when the stored cover file is missing."),
+        ("thumbnail_path_empty", "thumbnail_regenerate", "Regenerate thumbnails for these file_ids in small batches so UI and memory views regain a usable thumbnail reference."),
+        ("thumbnail_file_missing", "thumbnail_regenerate", "Rebuild missing thumbnail files in small batches by file_id/path while keeping existing valid cache files untouched."),
+    ]:
+        check = checks.get(simple_check_name)
+        if not check or check.get("count", 0) <= 0:
             continue
         priority = "high" if check["severity"] == "error" else "medium" if check["severity"] == "warning" else "low"
-        plan.append(
-            {
-                "check_name": check["check_name"],
-                "priority": priority,
-                "affected_count": check["count"],
-                "action": action,
-                "sample_ids": _limit_list(check.get("sample_ids"), max_samples),
-                "sample_paths": _limit_list(check.get("sample_paths"), max_samples),
-            }
+        _append_repair_step(
+            plan,
+            plan_type=plan_type,
+            check_name=simple_check_name,
+            priority=priority,
+            affected_count=check["count"],
+            action=action,
+            sample_ids=check.get("sample_ids"),
+            sample_paths=check.get("sample_paths"),
+            max_samples=max_samples,
+        )
+
+    stale_check = checks.get("thumbnail_cache_version_stale")
+    missing_thumb_files = checks.get("thumbnail_file_missing", {})
+    if stale_check and stale_check.get("count", 0) > 0:
+        action = (
+            "The stored thumbnail cache signature is older than the current format, but cached files still appear present. "
+            "Plan a signature migration and, if desired, a staged thumbnail refresh in small batches by file_id/path."
+            if missing_thumb_files.get("count", 0) == 0
+            else
+            "The stored thumbnail cache signature is older than the current format and some thumbnail files are missing. "
+            "Migrate the cache signature and prioritize rebuilding only the missing thumbnails before any broader batch refresh."
+        )
+        _append_repair_step(
+            plan,
+            plan_type="cache_signature_migration",
+            check_name="thumbnail_cache_version_stale",
+            priority="medium",
+            affected_count=stale_check["count"],
+            action=action,
+            sample_ids=stale_check.get("sample_ids"),
+            sample_paths=stale_check.get("sample_paths"),
+            max_samples=max_samples,
+        )
+
+    missing_sig_check = checks.get("thumbnail_cache_version_missing")
+    if missing_sig_check and missing_sig_check.get("count", 0) > 0:
+        _append_repair_step(
+            plan,
+            plan_type="cache_signature_migration",
+            check_name="thumbnail_cache_version_missing",
+            priority="medium",
+            affected_count=missing_sig_check["count"],
+            action=(
+                "Thumbnail cache metadata is missing. Record the current cache signature after validating settings, "
+                "then schedule thumbnail regeneration in small batches by file_id/path only where needed."
+            ),
+            sample_ids=missing_sig_check.get("sample_ids"),
+            sample_paths=missing_sig_check.get("sample_paths"),
+            max_samples=max_samples,
+        )
+
+    failed_check = checks.get("thumbnail_failed")
+    if failed_check and failed_check.get("count", 0) > 0:
+        _append_repair_step(
+            plan,
+            plan_type="thumbnail_failed_retry",
+            check_name="thumbnail_failed",
+            priority="medium",
+            affected_count=failed_check["count"],
+            action=(
+                "Retry thumbnail generation only for __FAILED__ file_ids after first confirming the source files are still readable "
+                "and that the image decoder can open them."
+            ),
+            sample_ids=failed_check.get("sample_ids"),
+            sample_paths=failed_check.get("sample_paths"),
+            max_samples=max_samples,
         )
     return plan
 
@@ -397,7 +480,10 @@ def build_startup_integrity_report(
                     if stored_thumbnail_signature and stored_thumbnail_signature != report["thumbnail_cache_signature"]
                     else []
                 ),
-                suggested_action="Existing thumbnails appear to come from an older cache signature and may need staged regeneration.",
+                suggested_action=(
+                    "Existing thumbnails appear to come from an older cache signature. "
+                    "If files are still present, plan a signature migration or staged refresh rather than treating the cache as broken."
+                ),
                 max_samples=max_samples,
             )
         )

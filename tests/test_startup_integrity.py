@@ -2,7 +2,11 @@ import os
 import sqlite3
 
 from infra.image.thumbnail_cache import build_thumbnail_cache_signature
-from services.startup_integrity import build_startup_integrity_report, run_startup_integrity_check
+from services.startup_integrity import (
+    build_startup_integrity_report,
+    format_integrity_report_text,
+    run_startup_integrity_check,
+)
 
 
 class _FakeSettings:
@@ -158,6 +162,8 @@ def test_build_startup_integrity_report_with_repair_plan_is_read_only(tmp_path):
     duplicate_thumb = thumb_dir / "4.jpg"
     duplicate_thumb.write_bytes(b"dup")
     broken_thumb = thumb_dir / "3.jpg"
+    broken_thumb.write_bytes(b"old-but-present")
+    broken_thumb.write_bytes(b"old-but-present")
 
     db_path = tmp_path / "photos.db"
     settings = _FakeSettings(str(photo_data_dir), str(thumb_dir), str(db_path))
@@ -182,6 +188,7 @@ def test_build_startup_integrity_report_with_repair_plan_is_read_only(tmp_path):
     assert "repair_plan" in report
     assert any(step["check_name"] == "memories_missing_file_refs" for step in report["repair_plan"])
     assert any("Rebuild" in step["action"] or "Regenerate" in step["action"] or "Create" in step["action"] for step in report["repair_plan"])
+    assert any(step["plan_type"] == "thumbnail_failed_retry" for step in report["repair_plan"])
     assert before_count == after_count
 
 
@@ -231,6 +238,7 @@ def test_build_startup_integrity_report_reports_stale_thumbnail_cache_signature(
     duplicate_thumb = thumb_dir / "4.jpg"
     duplicate_thumb.write_bytes(b"dup")
     broken_thumb = thumb_dir / "3.jpg"
+    broken_thumb.write_bytes(b"old-but-present")
 
     db_path = tmp_path / "photos.db"
     settings = _FakeSettings(str(photo_data_dir), str(thumb_dir), str(db_path))
@@ -252,7 +260,10 @@ def test_build_startup_integrity_report_reports_stale_thumbnail_cache_signature(
 
     assert checks["thumbnail_cache_version_stale"]["count"] == 1
     assert checks["thumbnail_cache_version_stale"]["severity"] == "warning"
-    assert any(step["check_name"] == "thumbnail_cache_version_stale" for step in report["repair_plan"])
+    stale_step = next(step for step in report["repair_plan"] if step["check_name"] == "thumbnail_cache_version_stale")
+    assert stale_step["plan_type"] == "cache_signature_migration"
+    assert "still appear present" in stale_step["action"]
+    assert "missing" not in stale_step["action"].lower()
 
 
 def test_build_startup_integrity_report_reports_missing_thumbnail_cache_signature(tmp_path):
@@ -287,7 +298,39 @@ def test_build_startup_integrity_report_reports_missing_thumbnail_cache_signatur
 
     assert checks["thumbnail_cache_version_missing"]["count"] == 1
     assert checks["thumbnail_cache_version_missing"]["severity"] == "warning"
-    assert any(step["check_name"] == "thumbnail_cache_version_missing" for step in report["repair_plan"])
+    missing_step = next(step for step in report["repair_plan"] if step["check_name"] == "thumbnail_cache_version_missing")
+    assert missing_step["plan_type"] == "cache_signature_migration"
+
+
+def test_format_integrity_report_text_hides_zero_info_by_default(tmp_path):
+    photo_data_dir = tmp_path / "cache"
+    thumb_dir = tmp_path / "thumbs"
+    photo_data_dir.mkdir()
+    thumb_dir.mkdir()
+
+    valid_thumb = thumb_dir / "1.jpg"
+    valid_thumb.write_bytes(b"ok")
+    duplicate_thumb = thumb_dir / "4.jpg"
+    duplicate_thumb.write_bytes(b"dup")
+    broken_thumb = thumb_dir / "3.jpg"
+
+    db_path = tmp_path / "photos.db"
+    settings = _FakeSettings(str(photo_data_dir), str(thumb_dir), str(db_path))
+    current_sig = build_thumbnail_cache_signature(settings)
+    _create_minimal_integrity_db(
+        str(db_path),
+        str(valid_thumb),
+        str(duplicate_thumb),
+        str(broken_thumb),
+        thumbnail_sig=current_sig,
+    )
+
+    report = build_startup_integrity_report(dry_run=True, db_path=str(db_path), settings=settings)
+    text = format_integrity_report_text(report)
+    text_with_zero = format_integrity_report_text(report, show_zero=True)
+
+    assert "thumbnail_cache_version_missing | severity=info | count=0" not in text
+    assert "thumbnail_cache_version_missing | severity=info | count=0" in text_with_zero
 
 
 def test_run_startup_integrity_check_reports_missing_config_dirs(tmp_path):

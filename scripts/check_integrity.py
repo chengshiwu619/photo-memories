@@ -37,6 +37,11 @@ def parse_args(argv=None):
         default=5,
         help="Maximum number of sample ids / paths to include per check.",
     )
+    parser.add_argument(
+        "--show-zero",
+        action="store_true",
+        help="Show count=0 checks in text output as well.",
+    )
     return parser.parse_args(argv)
 
 
@@ -53,7 +58,7 @@ def main(argv=None):
     if args.json_output:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
-        print(format_integrity_report_text(report))
+        print(format_integrity_report_text(report, show_zero=args.show_zero))
     return 0
 
 
