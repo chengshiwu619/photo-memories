@@ -1,7 +1,7 @@
 import os
 import sqlite3
 
-from services.startup_integrity import run_startup_integrity_check
+from services.startup_integrity import build_startup_integrity_report, run_startup_integrity_check
 
 
 class _FakeSettings:
@@ -99,6 +99,8 @@ def test_run_startup_integrity_check_reports_expected_issues(tmp_path):
 
     assert report["dry_run"] is True
     assert report["has_errors"] is True
+    assert report["summary"]["error_count"] == 4
+    assert report["summary"]["warning_count"] == 5
     assert checks["photo_data_dir_exists"]["severity"] == "info"
     assert checks["thumbnail_dir_exists"]["severity"] == "info"
     assert checks["memories_missing_file_refs"]["count"] == 2
@@ -111,6 +113,34 @@ def test_run_startup_integrity_check_reports_expected_issues(tmp_path):
 
     after_count = sqlite3.connect(db_path).execute("SELECT COUNT(*) FROM memories").fetchone()[0]
     assert after_count == before_count
+
+
+def test_build_startup_integrity_report_respects_max_samples(tmp_path):
+    photo_data_dir = tmp_path / "cache"
+    thumb_dir = tmp_path / "thumbs"
+    photo_data_dir.mkdir()
+    thumb_dir.mkdir()
+
+    valid_thumb = thumb_dir / "1.jpg"
+    valid_thumb.write_bytes(b"ok")
+    duplicate_thumb = thumb_dir / "4.jpg"
+    duplicate_thumb.write_bytes(b"dup")
+    broken_thumb = thumb_dir / "3.jpg"
+
+    db_path = tmp_path / "photos.db"
+    _create_minimal_integrity_db(str(db_path), str(valid_thumb), str(duplicate_thumb), str(broken_thumb))
+    settings = _FakeSettings(str(photo_data_dir), str(thumb_dir), str(db_path))
+
+    report = build_startup_integrity_report(
+        dry_run=True,
+        db_path=str(db_path),
+        settings=settings,
+        max_samples=1,
+    )
+    checks = _check_by_name(report)
+
+    assert len(checks["memories_missing_file_refs"]["sample_ids"]) == 1
+    assert len(checks["photo_metadata_broken_thumbnail_files"]["sample_paths"]) == 1
 
 
 def test_run_startup_integrity_check_reports_missing_config_dirs(tmp_path):

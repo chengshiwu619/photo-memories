@@ -103,6 +103,15 @@ python main.py ui
 python -m pytest tests/test_config.py
 ```
 
+## 维护：手动完整性检查
+
+```bash
+python scripts/check_integrity.py
+python scripts/check_integrity.py --db-path D:\photo-memories-cache\photos.db --json
+```
+
+该命令默认是 dry-run，只输出完整性报告，不会自动修复或修改照片、缓存、数据库。
+
 ## License
 
 [MIT](LICENSE)
