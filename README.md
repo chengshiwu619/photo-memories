@@ -126,6 +126,7 @@ python scripts/maintain_thumbnails.py --db-path D:\photo-memories-cache\photos.d
 ```
 
 该命令默认是 dry-run，只输出缩略图状态、重试计划或签名迁移计划，不会修改数据库或缓存。只有显式传入 `--apply` 时，才会对少量 `__FAILED__` 记录尝试重试，或仅更新 `thumbnail_params.thumbnail_sig`。
+历史签名如 `600x600_q90` 会被识别为旧缓存签名并提示迁移，但启动时不会仅因为旧签名就自动删除缩略图文件或清空 `photo_metadata.thumbnail_path`。
 
 ## License
 

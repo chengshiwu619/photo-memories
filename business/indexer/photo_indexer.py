@@ -19,6 +19,7 @@ from infra.image.thumbnail_cache import (
     THUMBNAIL_JPEG_QUALITY,
     build_thumbnail_filename,
     build_thumbnail_path,
+    create_thumbnail_file,
 )
 
 _db = Database()
@@ -151,15 +152,13 @@ def generate_thumbnail(filepath, thumbnail_name):
         return thumb_path, None, None
 
     try:
-        with Image.open(filepath) as img:
-            orig_w, orig_h = img.size
-            thumb_size = get_settings().thumbnail_size
-            img.draft("RGB", thumb_size)
-            img = _auto_rotate(img)
-            img.thumbnail(thumb_size, Image.LANCZOS)
-            if img.mode in ("RGBA", "P"):
-                img = img.convert("RGB")
-            img.save(thumb_path, "JPEG", quality=THUMBNAIL_JPEG_QUALITY)
+        thumb_size = get_settings().thumbnail_size
+        orig_w, orig_h = create_thumbnail_file(
+            filepath,
+            thumb_path,
+            thumbnail_size=thumb_size,
+            quality=THUMBNAIL_JPEG_QUALITY,
+        )
         return thumb_path, orig_w, orig_h
     except Exception as e:
         logger.error(f"缩略图生成失败 {filepath}: {e}")

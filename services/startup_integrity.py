@@ -3,7 +3,11 @@ import sqlite3
 from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
-from infra.image.thumbnail_cache import THUMBNAIL_CACHE_VERSION, build_thumbnail_cache_signature
+from infra.image.thumbnail_cache import (
+    THUMBNAIL_CACHE_VERSION,
+    build_thumbnail_cache_signature,
+    classify_thumbnail_cache_signature,
+)
 from logger_setup import logger
 
 
@@ -449,16 +453,20 @@ def build_startup_integrity_report(
     conn.row_factory = sqlite3.Row
     try:
         stored_thumbnail_signature = _get_thumbnail_signature_value(conn)
+        signature_status = classify_thumbnail_cache_signature(
+            stored_thumbnail_signature,
+            settings,
+        )
         report["stored_thumbnail_cache_signature"] = stored_thumbnail_signature
 
         report["checks"].append(
             _sample_check(
                 "thumbnail_cache_version_missing",
-                "warning" if not stored_thumbnail_signature else "info",
-                1 if not stored_thumbnail_signature else 0,
+                "warning" if signature_status == "missing" else "info",
+                1 if signature_status == "missing" else 0,
                 sample_ids=(
                     [{"current_signature": report["thumbnail_cache_signature"]}]
-                    if not stored_thumbnail_signature
+                    if signature_status == "missing"
                     else []
                 ),
                 suggested_action="Thumbnail cache metadata is missing; review cache provenance before trusting existing thumbnails.",
@@ -468,16 +476,15 @@ def build_startup_integrity_report(
         report["checks"].append(
             _sample_check(
                 "thumbnail_cache_version_stale",
-                "warning"
-                if stored_thumbnail_signature and stored_thumbnail_signature != report["thumbnail_cache_signature"]
-                else "info",
-                1 if stored_thumbnail_signature and stored_thumbnail_signature != report["thumbnail_cache_signature"] else 0,
+                "warning" if signature_status in {"legacy", "stale"} else "info",
+                1 if signature_status in {"legacy", "stale"} else 0,
                 sample_ids=(
                     [{
                         "stored_signature": stored_thumbnail_signature,
                         "current_signature": report["thumbnail_cache_signature"],
+                        "signature_status": signature_status,
                     }]
-                    if stored_thumbnail_signature and stored_thumbnail_signature != report["thumbnail_cache_signature"]
+                    if signature_status in {"legacy", "stale"}
                     else []
                 ),
                 suggested_action=(

@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import shutil
 from datetime import datetime
@@ -426,12 +427,15 @@ class Database:
         conn.commit()
 
     def _check_and_clear_thumbnails(self, conn):
-        """检测缩略图参数版本变化，自动清理旧缓存并标记重建"""
+        """Check thumbnail signature drift without deleting cache files on startup."""
         from config import get_settings
-        import os
+        from infra.image.thumbnail_cache import (
+            build_thumbnail_cache_signature,
+            classify_thumbnail_cache_signature,
+        )
 
-        current_size = get_settings().thumbnail_size
-        current_sig = f"{current_size[0]}x{current_size[1]}_q90"
+        settings = get_settings()
+        current_sig = build_thumbnail_cache_signature(settings)
 
         row = conn.execute("SELECT value FROM thumbnail_params WHERE key = 'thumbnail_sig'").fetchone()
         if row is None:
@@ -439,36 +443,33 @@ class Database:
             conn.commit()
             return
 
-        if row[0] == current_sig:
+        stored_sig = row[0]
+        signature_status = classify_thumbnail_cache_signature(stored_sig, settings)
+        if signature_status == "current":
             return
 
-        logger.warning(f"缩略图参数变更: {row[0]} -> {current_sig}，开始清理旧缓存")
+        rows = conn.execute(
+            """
+            SELECT thumbnail_path FROM photo_metadata
+            WHERE thumbnail_path IS NOT NULL
+              AND thumbnail_path != ''
+              AND thumbnail_path != '__FAILED__'
+            """
+        ).fetchall()
+        missing_count = 0
+        for row in rows:
+            thumb_path = row[0]
+            if thumb_path and not os.path.exists(thumb_path):
+                missing_count += 1
 
-        rows = conn.execute("""
-            SELECT file_id, thumbnail_path FROM photo_metadata
-            WHERE thumbnail_path IS NOT NULL AND thumbnail_path != '__FAILED__'
-        """).fetchall()
-
-        deleted_count = 0
-        for file_id, thumb_path in rows:
-            if thumb_path and os.path.exists(thumb_path):
-                try:
-                    os.remove(thumb_path)
-                    deleted_count += 1
-                except Exception as e:
-                    logger.warning(f"删除旧缩略图失败 {thumb_path}: {e}")
-
-        if rows:
-            conn.execute("""
-                UPDATE photo_metadata
-                SET thumbnail_path = NULL
-                WHERE thumbnail_path IS NOT NULL AND thumbnail_path != '__FAILED__'
-            """)
-
-        conn.execute("UPDATE thumbnail_params SET value = ? WHERE key = ?", (current_sig, "thumbnail_sig"))
-        conn.commit()
-
-        logger.info(f"缩略图缓存清理完成: 删除 {deleted_count} 个文件, 重置 {len(rows)} 条记录")
+        logger.warning(
+            "Thumbnail cache signature is not current on startup: stored=%s current=%s status=%s missing_thumbnail_files=%s. "
+            "Startup will not delete cache files or clear photo_metadata.thumbnail_path automatically; use integrity or maintenance tools to review or migrate.",
+            stored_sig,
+            current_sig,
+            signature_status,
+            missing_count,
+        )
 
 
 def get_database():

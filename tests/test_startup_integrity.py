@@ -1,7 +1,10 @@
 import os
 import sqlite3
 
-from infra.image.thumbnail_cache import build_thumbnail_cache_signature
+from infra.image.thumbnail_cache import (
+    build_legacy_thumbnail_cache_signature,
+    build_thumbnail_cache_signature,
+)
 from services.startup_integrity import (
     build_startup_integrity_report,
     format_integrity_report_text,
@@ -247,7 +250,7 @@ def test_build_startup_integrity_report_reports_stale_thumbnail_cache_signature(
         str(valid_thumb),
         str(duplicate_thumb),
         str(broken_thumb),
-        thumbnail_sig="legacy:400x400:q80",
+        thumbnail_sig=build_legacy_thumbnail_cache_signature(settings),
     )
 
     report = build_startup_integrity_report(
@@ -260,6 +263,8 @@ def test_build_startup_integrity_report_reports_stale_thumbnail_cache_signature(
 
     assert checks["thumbnail_cache_version_stale"]["count"] == 1
     assert checks["thumbnail_cache_version_stale"]["severity"] == "warning"
+    assert checks["thumbnail_cache_version_stale"]["sample_ids"][0]["signature_status"] == "legacy"
+    assert checks["thumbnail_file_missing"]["count"] == 0
     stale_step = next(step for step in report["repair_plan"] if step["check_name"] == "thumbnail_cache_version_stale")
     assert stale_step["plan_type"] == "cache_signature_migration"
     assert "still appear present" in stale_step["action"]

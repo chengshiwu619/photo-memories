@@ -38,7 +38,7 @@ def _create_thumbnail_maintenance_db(
     db_path,
     source_dir,
     thumbnail_dir,
-    thumbnail_sig="legacy:400x400:q80",
+    thumbnail_sig="600x600_q90",
     failed_file_ids=None,
     broken_file_ids=None,
 ):
@@ -254,7 +254,12 @@ def test_migrate_signature_dry_run_does_not_write_database(tmp_path):
     source_dir.mkdir()
 
     db_path = cache_dir / "photos.db"
-    _create_thumbnail_maintenance_db(str(db_path), str(source_dir), str(thumb_dir), thumbnail_sig="legacy:400x400:q80")
+    _create_thumbnail_maintenance_db(
+        str(db_path),
+        str(source_dir),
+        str(thumb_dir),
+        thumbnail_sig="600x600_q90",
+    )
 
     result = run_thumbnail_maintenance(db_path=str(db_path), migrate_signature=True)
     conn = sqlite3.connect(db_path)
@@ -265,7 +270,7 @@ def test_migrate_signature_dry_run_does_not_write_database(tmp_path):
 
     assert result["dry_run"] is True
     assert result["db_updated"] == 0
-    assert sig == "legacy:400x400:q80"
+    assert sig == "600x600_q90"
 
 
 def test_migrate_signature_apply_only_updates_signature(tmp_path):
@@ -279,7 +284,7 @@ def test_migrate_signature_apply_only_updates_signature(tmp_path):
     existing_thumb = thumb_dir / "2.jpg"
     _write_test_image(existing_thumb)
     db_path = cache_dir / "photos.db"
-    _create_thumbnail_maintenance_db(str(db_path), str(source_dir), str(thumb_dir), thumbnail_sig="legacy:400x400:q80")
+    _create_thumbnail_maintenance_db(str(db_path), str(source_dir), str(thumb_dir), thumbnail_sig="600x600_q90")
 
     result = run_thumbnail_maintenance(db_path=str(db_path), migrate_signature=True, apply=True)
     conn = sqlite3.connect(db_path)
@@ -307,7 +312,7 @@ def test_migrate_signature_refuses_when_missing_thumbnail_files_exist(tmp_path):
         str(db_path),
         str(source_dir),
         str(thumb_dir),
-        thumbnail_sig="legacy:400x400:q80",
+        thumbnail_sig="600x600_q90",
         broken_file_ids={3},
     )
 
@@ -320,7 +325,7 @@ def test_migrate_signature_refuses_when_missing_thumbnail_files_exist(tmp_path):
 
     assert result["skipped"] == 1
     assert result["db_updated"] == 0
-    assert sig == "legacy:400x400:q80"
+    assert sig == "600x600_q90"
     assert any("blocked" in warning or "missing thumbnail files" in warning for warning in result["warnings"])
 
 

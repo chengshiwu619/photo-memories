@@ -19,6 +19,26 @@ def build_thumbnail_cache_signature(settings: Any) -> str:
     return f"{THUMBNAIL_CACHE_VERSION}:{width}x{height}:q{THUMBNAIL_JPEG_QUALITY}"
 
 
+def build_legacy_thumbnail_cache_signature(settings: Any) -> str:
+    width, height = getattr(settings, "thumbnail_size", (600, 600))
+    return f"{width}x{height}_q{THUMBNAIL_JPEG_QUALITY}"
+
+
+def classify_thumbnail_cache_signature(stored_signature: str | None, settings: Any) -> str:
+    if not stored_signature:
+        return "missing"
+
+    current_signature = build_thumbnail_cache_signature(settings)
+    if stored_signature == current_signature:
+        return "current"
+
+    legacy_signature = build_legacy_thumbnail_cache_signature(settings)
+    if stored_signature == legacy_signature:
+        return "legacy"
+
+    return "stale"
+
+
 def create_thumbnail_file(
     source_path: str,
     target_path: str,
