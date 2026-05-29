@@ -1,6 +1,7 @@
 import os
 import tempfile
 import shutil
+import importlib
 
 
 def test_config_imports():
@@ -76,7 +77,7 @@ def test_settings_defaults():
     s = config.Settings()
     assert s.deepseek_base_url == "https://api.deepseek.com"
     assert s.deepseek_model == "deepseek-chat"
-    assert s.thumbnail_size == (400, 400)
+    assert s.thumbnail_size == (600, 600)
 
 
 def test_settings_computed_properties():
@@ -132,6 +133,41 @@ def test_get_settings_returns_same_instance():
     s2 = config.get_settings()
     assert s1 is s2
     config._settings = None
+
+
+def test_import_does_not_create_config_dirs():
+    import config
+    tmp = tempfile.mkdtemp()
+    photo_data_dir = os.path.join(tmp, "cache")
+    thumb_dir = os.path.join(photo_data_dir, "thumbnails")
+    orig_data = os.environ.get("PHOTO_DATA_DIR")
+    try:
+        os.environ["PHOTO_DATA_DIR"] = photo_data_dir
+        reloaded = importlib.reload(config)
+        reloaded._settings = None
+        assert not os.path.exists(photo_data_dir)
+        assert not os.path.exists(thumb_dir)
+    finally:
+        if orig_data is None:
+            os.environ.pop("PHOTO_DATA_DIR", None)
+        else:
+            os.environ["PHOTO_DATA_DIR"] = orig_data
+        config._settings = None
+        shutil.rmtree(tmp)
+
+
+def test_ensure_config_dirs_creates_config_dirs_explicitly():
+    import config
+    tmp = tempfile.mkdtemp()
+    photo_data_dir = os.path.join(tmp, "cache")
+    thumb_dir = os.path.join(photo_data_dir, "thumbnails")
+    try:
+        settings = config.Settings(photo_data_dir=photo_data_dir)
+        config.ensure_config_dirs(settings)
+        assert os.path.isdir(photo_data_dir)
+        assert os.path.isdir(thumb_dir)
+    finally:
+        shutil.rmtree(tmp)
 
 
 def test_save_config_updates_settings():

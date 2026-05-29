@@ -62,6 +62,13 @@ def get_settings() -> Settings:
     return _settings
 
 
+def ensure_config_dirs(settings: Settings | None = None) -> Settings:
+    s = settings or get_settings()
+    os.makedirs(s.photo_data_dir, exist_ok=True)
+    os.makedirs(s.thumbnail_dir, exist_ok=True)
+    return s
+
+
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif", ".heic", ".heif"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".m4v", ".3gp"}
 
@@ -74,6 +81,7 @@ CATEGORY_NAMES = {
 }
 
 def is_configured():
+    # Keep the module-level helper for existing callers.
     if not os.path.isfile(ENV_FILE):
         return False
     return get_settings().is_configured()
@@ -95,9 +103,7 @@ def save_config(source_drive, data_dir, api_key, base_url="https://api.deepseek.
     global _settings
     _settings = Settings()
 
-    s = get_settings()
-    os.makedirs(s.photo_data_dir, exist_ok=True)
-    os.makedirs(s.thumbnail_dir, exist_ok=True)
+    ensure_config_dirs(_settings)
 
     from infra.llm.client import LLMClient
     LLMClient.reset()
@@ -109,14 +115,7 @@ def reload_config():
     load_dotenv(ENV_FILE, override=True)
     _settings = Settings()
 
-    s = get_settings()
-    os.makedirs(s.photo_data_dir, exist_ok=True)
-    os.makedirs(s.thumbnail_dir, exist_ok=True)
+    ensure_config_dirs(_settings)
 
     from infra.llm.client import LLMClient
     LLMClient.reset()
-
-
-_s = get_settings()
-os.makedirs(_s.photo_data_dir, exist_ok=True)
-os.makedirs(_s.thumbnail_dir, exist_ok=True)
