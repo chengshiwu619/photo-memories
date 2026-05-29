@@ -29,6 +29,7 @@ from ui.recommendation import CATEGORY_COLORS, PAGE_SIZE, record_shown_photos
 
 
 from services.background_task_manager import BackgroundTaskManager
+from services.startup_integrity import run_startup_integrity_check, log_startup_integrity_report
 
 CATEGORIES = [
     (CATEGORY_LIFE, CATEGORY_NAMES[CATEGORY_LIFE]),
@@ -107,32 +108,12 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _check_file_id_integrity(self):
-        """启动时检查 memories 表的 file_id 悬空引用，自动清理过期记录"""
+        """启动时执行只读完整性检查，记录潜在脏状态但不自动修复。"""
         try:
-            rows = self.db.execute("""
-                SELECT m.id
-                FROM memories m, json_each(m.photo_ids) j
-                LEFT JOIN photo_metadata pm ON pm.file_id = j.value
-                WHERE m.dismissed_at IS NULL AND m.photo_ids LIKE '[%'
-                GROUP BY m.id
-                HAVING SUM(CASE WHEN pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__' THEN 1 ELSE 0 END) < COUNT(*)
-            """).fetchall()
-
-            if not rows:
-                return
-
-            stale_ids = [r["id"] for r in rows]
-            logger.warning(f"启动检查发现 {len(stale_ids)} 条 memories 记录存在悬空 file_id 引用，将自动清理")
-
-            with Database().connect() as conn:
-                placeholders = ",".join("?" * len(stale_ids))
-                conn.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", stale_ids)
-
-            logger.info(f"已清理 {len(stale_ids)} 条过期 memories 记录，特殊回忆将在下次切换时重新加载")
-            self._special_loaded = False
-
+            report = run_startup_integrity_check(dry_run=True)
+            log_startup_integrity_report(report)
         except Exception as e:
-            logger.warning(f"启动时 file_id 完整性检查失败: {e}")
+            logger.warning(f"启动时完整性检查失败: {e}")
 
     def setup_ui(self):
         central = QWidget()
