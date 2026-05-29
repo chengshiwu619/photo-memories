@@ -2,6 +2,23 @@ import os
 import tempfile
 import shutil
 import importlib
+import sys
+import types
+from unittest.mock import patch
+
+
+def _install_fake_llm_client():
+    fake_module = types.ModuleType("infra.llm.client")
+
+    class FakeLLMClient:
+        reset_calls = 0
+
+        @classmethod
+        def reset(cls):
+            cls.reset_calls += 1
+
+    fake_module.LLMClient = FakeLLMClient
+    return fake_module, FakeLLMClient
 
 
 def test_config_imports():
@@ -170,30 +187,76 @@ def test_ensure_config_dirs_creates_config_dirs_explicitly():
         shutil.rmtree(tmp)
 
 
+def test_reload_config_keeps_directory_preparation_behavior():
+    import config
+    tmp = tempfile.mkdtemp()
+    fake_module, fake_llm = _install_fake_llm_client()
+    orig_env_file = config.ENV_FILE
+    orig_data = os.environ.get("PHOTO_DATA_DIR")
+    try:
+        photo_data_dir = os.path.join(tmp, "cache")
+        thumb_dir = os.path.join(photo_data_dir, "thumbnails")
+        fake_env = os.path.join(tmp, ".env")
+        with open(fake_env, "w", encoding="utf-8") as f:
+            f.write(f"PHOTO_DATA_DIR={photo_data_dir}\n")
+
+        config.ENV_FILE = fake_env
+        os.environ["PHOTO_DATA_DIR"] = photo_data_dir
+        config._settings = None
+
+        with patch.dict(sys.modules, {"infra.llm.client": fake_module}):
+            config.reload_config()
+
+        assert os.path.isdir(photo_data_dir)
+        assert os.path.isdir(thumb_dir)
+        assert fake_llm.reset_calls == 1
+    finally:
+        config.ENV_FILE = orig_env_file
+        if orig_data is None:
+            os.environ.pop("PHOTO_DATA_DIR", None)
+        else:
+            os.environ["PHOTO_DATA_DIR"] = orig_data
+        config._settings = None
+        shutil.rmtree(tmp)
+
+
 def test_save_config_updates_settings():
     import config
     tmp = tempfile.mkdtemp()
+    fake_module, fake_llm = _install_fake_llm_client()
     try:
         orig_env_file = config.ENV_FILE
+        orig_data = os.environ.get("PHOTO_DATA_DIR")
         fake_env = os.path.join(tmp, ".env")
-        with open(fake_env, "w") as f:
+        new_data_dir = os.path.join(tmp, "newdata")
+        new_thumb_dir = os.path.join(new_data_dir, "thumbnails")
+        with open(fake_env, "w", encoding="utf-8") as f:
             f.write("DEEPSEEK_API_KEY=sk-old\n")
             f.write("SOURCE_DRIVE=D:\\old\n")
-            f.write("PHOTO_DATA_DIR=D:\\olddata\n")
+            f.write(f"PHOTO_DATA_DIR={os.path.join(tmp, 'olddata')}\n")
         config.ENV_FILE = fake_env
         config._settings = None
-        config.reload_config()
+        with patch.dict(sys.modules, {"infra.llm.client": fake_module}):
+            config.reload_config()
         s = config.get_settings()
         assert s.source_drive == "D:\\old"
-        assert s.photo_data_dir == "D:\\olddata"
+        assert s.photo_data_dir == os.path.join(tmp, "olddata")
 
-        config.save_config("D:\\new", "D:\\newdata", "sk-new")
+        with patch.dict(sys.modules, {"infra.llm.client": fake_module}):
+            config.save_config("D:\\new", new_data_dir, "sk-new")
         s = config.get_settings()
         assert s.source_drive == "D:\\new"
-        assert s.photo_data_dir == "D:\\newdata"
+        assert s.photo_data_dir == new_data_dir
         assert s.deepseek_api_key == "sk-new"
+        assert os.path.isdir(new_data_dir)
+        assert os.path.isdir(new_thumb_dir)
+        assert fake_llm.reset_calls == 2
 
     finally:
-        shutil.rmtree(tmp)
         config.ENV_FILE = orig_env_file
-        config.reload_config()
+        if orig_data is None:
+            os.environ.pop("PHOTO_DATA_DIR", None)
+        else:
+            os.environ["PHOTO_DATA_DIR"] = orig_data
+        config._settings = None
+        shutil.rmtree(tmp)

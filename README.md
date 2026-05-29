@@ -97,6 +97,12 @@ python main.py ui
 - **缩略图**: Pillow + EXIF 自动旋转 + 感知哈希去重
 - **配置**: Pydantic Settings + .env
 
+## 测试
+
+```bash
+python -m pytest tests/test_config.py
+```
+
 ## License
 
 [MIT](LICENSE)
