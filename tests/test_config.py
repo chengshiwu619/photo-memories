@@ -7,6 +7,114 @@ import types
 from unittest.mock import patch
 
 
+def _install_fake_dotenv_module():
+    fake_module = types.ModuleType("dotenv")
+
+    def _normalize_raw_value(value):
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            return value[1:-1]
+        return value
+
+    def find_dotenv():
+        return ""
+
+    def load_dotenv(path, override=False):
+        if not path or not os.path.isfile(path):
+            return False
+        with open(path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                if override or key not in os.environ:
+                    os.environ[key] = _normalize_raw_value(value)
+        return True
+
+    def set_key(path, key, value):
+        lines = []
+        found = False
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+        updated = []
+        for raw_line in lines:
+            if raw_line.strip().startswith(f"{key}="):
+                updated.append(f"{key}={value}\n")
+                found = True
+            else:
+                updated.append(raw_line)
+
+        if not found:
+            updated.append(f"{key}={value}\n")
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(updated)
+
+        return key, value
+
+    fake_module.find_dotenv = find_dotenv
+    fake_module.load_dotenv = load_dotenv
+    fake_module.set_key = set_key
+    return fake_module
+
+
+def _install_fake_pydantic_settings_module():
+    fake_module = types.ModuleType("pydantic_settings")
+
+    def _coerce_value(value, default):
+        if isinstance(default, int):
+            return int(value)
+        return value
+
+    def _normalize_raw_value(value):
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            return value[1:-1]
+        return value
+
+    class BaseSettings:
+        model_config = {}
+
+        def __init__(self, **overrides):
+            values = {}
+            env_file = getattr(self.__class__, "model_config", {}).get("env_file")
+            if env_file and os.path.isfile(env_file):
+                with open(env_file, "r", encoding="utf-8") as f:
+                    for raw_line in f:
+                        line = raw_line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        key, value = line.split("=", 1)
+                        values[key.lower()] = _normalize_raw_value(value)
+
+            for field_name in getattr(self.__class__, "__annotations__", {}):
+                default = getattr(self.__class__, field_name)
+                env_value = os.environ.get(field_name.upper(), values.get(field_name))
+                if env_value is None:
+                    env_value = default
+                else:
+                    env_value = _normalize_raw_value(env_value)
+                    env_value = _coerce_value(env_value, default)
+                setattr(self, field_name, overrides.get(field_name, env_value))
+
+    class SettingsConfigDict(dict):
+        pass
+
+    fake_module.BaseSettings = BaseSettings
+    fake_module.SettingsConfigDict = SettingsConfigDict
+    return fake_module
+
+
+if "dotenv" not in sys.modules:
+    sys.modules["dotenv"] = _install_fake_dotenv_module()
+
+if "pydantic_settings" not in sys.modules:
+    sys.modules["pydantic_settings"] = _install_fake_pydantic_settings_module()
+
+
 def _install_fake_llm_client():
     fake_module = types.ModuleType("infra.llm.client")
 
@@ -57,6 +165,7 @@ def test_is_configured_without_api_key():
 
 def test_is_configured_with_all():
     import config, os
+    fake_module, fake_llm = _install_fake_llm_client()
     orig_key = os.environ.get("DEEPSEEK_API_KEY", "")
     orig_src = os.environ.get("SOURCE_DRIVE", "")
     orig_data = os.environ.get("PHOTO_DATA_DIR", "")
@@ -65,8 +174,10 @@ def test_is_configured_with_all():
         os.environ["SOURCE_DRIVE"] = "D:\\test"
         os.environ["PHOTO_DATA_DIR"] = "D:\\testdata"
         config._settings = None
-        config.reload_config()
+        with patch.dict(sys.modules, {"infra.llm.client": fake_module}):
+            config.reload_config()
         assert config.is_configured() is True
+        assert fake_llm.reset_calls == 1
     finally:
         if orig_key:
             os.environ["DEEPSEEK_API_KEY"] = orig_key
@@ -81,7 +192,8 @@ def test_is_configured_with_all():
         else:
             os.environ.pop("PHOTO_DATA_DIR", None)
         config._settings = None
-        config.reload_config()
+        with patch.dict(sys.modules, {"infra.llm.client": fake_module}):
+            config.reload_config()
 
 
 def test_settings_class_exists():
