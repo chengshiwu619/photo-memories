@@ -4,7 +4,7 @@ import sqlite3
 import subprocess
 import sys
 
-from scripts.run_ai_labeling import run_ai_labeling
+from scripts.run_ai_labeling import _extract_path_tags, run_ai_labeling
 
 
 def _create_ai_label_db(db_path, thumb_dir):
@@ -231,3 +231,127 @@ def test_json_output_contains_summary_and_per_file_results(tmp_path):
     assert payload["source"] == "path"
     assert payload["selected"] > 0
     assert isinstance(payload["file_results"], list)
+
+
+def test_path_label_cleaning_filters_capacity_and_generic_noise():
+    payload = _extract_path_tags(
+        {
+            "source_path": r"D:/photos/2.79GB/2050P+28V/p-3/no/希威社/私房写真未流出/photo.jpg",
+            "source_folder": r"D:/photos/2.79GB/2050P+28V/p-3/no/希威社/私房写真未流出",
+            "folder_category": 2,
+        }
+    )
+
+    assert "category:sample" in payload["cleaned_tags"]
+    assert "希威社" in payload["cleaned_tags"]
+    assert "私房写真未流出" in payload["cleaned_tags"]
+    assert "2.79GB" in payload["filtered_tags"]
+    assert "2050P+28V" in payload["filtered_tags"]
+    assert "p-3" in payload["filtered_tags"]
+    assert "no" in payload["filtered_tags"]
+    assert "photos" in payload["filtered_tags"]
+
+
+def test_path_label_cleaning_filters_numbered_series_and_count_size_fragments():
+    payload = _extract_path_tags(
+        {
+            "source_path": r"D:/photos/希威社/NO.041 其他 [2050P+28V 6.6GB]/私房写真未流出 [490P-3.86 GB]/希威摄影 Vol.004 私房写真未流出合集 [76P-553MB]/photo.jpg",
+            "source_folder": r"D:/photos/希威社/NO.041 其他 [2050P+28V 6.6GB]/私房写真未流出 [490P-3.86 GB]/希威摄影 Vol.004 私房写真未流出合集 [76P-553MB]",
+            "folder_category": 2,
+        }
+    )
+
+    assert "希威摄影" in payload["cleaned_tags"]
+    assert "vol.004" in payload["cleaned_tags"]
+    assert "私房写真未流出合集" in payload["cleaned_tags"]
+    assert "NO.041" in payload["filtered_tags"]
+    assert "490P-3.86" in payload["filtered_tags"]
+    assert "76P-553MB" in payload["filtered_tags"]
+
+
+def test_path_label_cleaning_keeps_chinese_semantic_tags_and_category():
+    payload = _extract_path_tags(
+        {
+            "source_path": r"D:/photos/screenshots/成人/写真/欣欣/无水印/photo.jpg",
+            "source_folder": r"D:/photos/screenshots/成人/写真/欣欣/无水印",
+            "folder_category": 1,
+        }
+    )
+
+    assert "category:life" in payload["cleaned_tags"]
+    assert "screenshots" in payload["cleaned_tags"]
+    assert "成人" in payload["cleaned_tags"]
+    assert "写真" in payload["cleaned_tags"]
+    assert "欣欣" in payload["cleaned_tags"]
+    assert "无水印" in payload["cleaned_tags"]
+
+
+def test_dry_run_exposes_raw_cleaned_and_filtered_tags(tmp_path):
+    cache_dir = tmp_path / "cache"
+    thumb_dir = cache_dir / "thumbnails"
+    cache_dir.mkdir()
+    thumb_dir.mkdir()
+    db_path = cache_dir / "photos.db"
+    _create_ai_label_db(str(db_path), str(thumb_dir))
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DELETE FROM photo_tags WHERE source = 'path'")
+        conn.execute("UPDATE files SET file_path = ? WHERE id = 2", (r"D:/photos/2.79GB/2050P+28V/p+28v/希威社/无水印/photo-2.jpg",))
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = run_ai_labeling(
+        db_path=str(db_path),
+        source="path",
+        limit=10,
+        dry_run=True,
+        sample_mode="sequential",
+    )
+
+    file_result = next(item for item in result["file_results"] if item["file_id"] == 2)
+    assert "raw_tags" in file_result
+    assert "cleaned_tags" in file_result
+    assert "filtered_tags" in file_result
+    assert "希威社" in file_result["cleaned_tags"]
+    assert "无水印" in file_result["cleaned_tags"]
+    assert "2050P+28V" in file_result["filtered_tags"]
+    assert "p+28v" in file_result["filtered_tags"]
+
+
+def test_apply_writes_only_cleaned_tags(tmp_path):
+    cache_dir = tmp_path / "cache"
+    thumb_dir = cache_dir / "thumbnails"
+    cache_dir.mkdir()
+    thumb_dir.mkdir()
+    db_path = cache_dir / "photos.db"
+    _create_ai_label_db(str(db_path), str(thumb_dir))
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DELETE FROM photo_tags WHERE source = 'path'")
+        conn.execute("UPDATE files SET file_path = ? WHERE id = 2", (r"D:/photos/2.79GB/2050P+28V/p-7/希威社/无水印/photo-2.jpg",))
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = run_ai_labeling(db_path=str(db_path), source="path", limit=10, dry_run=False)
+    assert result["tags_inserted"] > 0
+
+    conn = sqlite3.connect(db_path)
+    try:
+        tags = {
+            row[0]
+            for row in conn.execute(
+                "SELECT tag FROM photo_tags WHERE source = 'path' AND file_id = 2"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+
+    assert "希威社" in tags
+    assert "无水印" in tags
+    assert "2.79GB" not in tags
+    assert "2050P+28V" not in tags
+    assert "p-7" not in tags

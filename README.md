@@ -178,6 +178,8 @@ python scripts/run_ai_labeling.py --db-path D:\photo-memories-cache\photos.db --
 
 SigLIP 鏄彲閫夌殑澧炲己鏍囩鏉ユ簮锛屼笉搴旈樆濉炲熀纭€ path 鏍囩娴佺▼銆?涓嶈涓€寮€濮嬪氨鍏ㄩ噺璺戙€?
 
+path 閺嶅洨顒峰厛浠ヤ欢澶广€佺洰褰曘€佹潵婧愮洰褰曚綔涓虹矖绮掑害鏍囩鏉ユ簮锛屼絾浼氳繃婊ゅ閲忚瘝銆佺紪鍙锋畫鐗囥€侀€氱敤鏍圭洰褰曡瘝锛堝 `2.79GB`銆乣2050P+28V`銆乣p-3`銆乣photos`锛夛紝apply 鍙啓鍏?`cleaned_tags`銆俤ry-run 浼氬悓鏃惰緭鍑?`raw_tags`銆乣cleaned_tags` 鍜?`filtered_tags`锛屾柟渚夸汉宸ユ鏌ユ爣绛捐川閲忋€?
+
 ## License
 
 [MIT](LICENSE)

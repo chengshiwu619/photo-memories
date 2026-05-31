@@ -18,8 +18,35 @@ DEFAULT_LIMIT = 50
 DEFAULT_SAMPLE_MODE = "sequential"
 VALID_SOURCES = {"path", "siglip", "all"}
 DATE_PATTERN = re.compile(r"(20\d{2})[._-]?([01]\d)[._-]?([0-3]\d)")
-TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z0-9_+-]{1,}")
-ASCII_NOISE = {"jpg", "jpeg", "png", "gif", "bmp", "webp", "mov", "mp4", "avi"}
+TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9][A-Za-z0-9._+-]*")
+ASCII_NOISE = {
+    "jpg",
+    "jpeg",
+    "png",
+    "gif",
+    "bmp",
+    "webp",
+    "mov",
+    "mp4",
+    "avi",
+    "no",
+    "gb",
+    "mb",
+    "kb",
+    "tb",
+    "p",
+    "v",
+    "photos",
+}
+CAPACITY_TOKEN_PATTERN = re.compile(r"^\d+(?:\.\d+)?(?:gb|mb|kb|tb)$", re.IGNORECASE)
+COUNT_TOKEN_PATTERN = re.compile(r"^\d+[pv](?:\+\d+[pv])*$", re.IGNORECASE)
+BROKEN_COUNT_FRAGMENT_PATTERN = re.compile(r"^p[-+]?\d+[a-z0-9]*$", re.IGNORECASE)
+PURE_NUMBER_PATTERN = re.compile(r"^\d+$")
+NO_INDEX_PATTERN = re.compile(r"^no[._-]?\d+[a-z0-9]*$", re.IGNORECASE)
+COUNT_SIZE_FRAGMENT_PATTERN = re.compile(
+    r"^\d+(?:p|v)(?:\d*(?:p|v))?(?:[-+]\d+(?:\.\d+)?[a-z]*)+$",
+    re.IGNORECASE,
+)
 
 
 class _CliSettings:
@@ -166,42 +193,63 @@ def _select_candidates(
     }
 
 
-def _add_tag(tags: List[str], seen: set[str], value: Optional[str]) -> None:
-    if not value:
-        return
-    normalized = value.strip()
-    if not normalized or normalized in seen:
-        return
-    seen.add(normalized)
-    tags.append(normalized)
-
-
-def _normalize_ascii_token(token: str) -> Optional[str]:
-    lowered = token.lower()
-    if lowered in ASCII_NOISE or lowered.isdigit():
+def _clean_path_token(token: str) -> Optional[str]:
+    normalized = token.strip()
+    if not normalized:
         return None
-    return lowered
+    if normalized.startswith("category:"):
+        return normalized
+    if PURE_NUMBER_PATTERN.match(normalized):
+        return None
+    if normalized.isascii():
+        lowered = normalized.lower()
+        if lowered in ASCII_NOISE:
+            return None
+        if CAPACITY_TOKEN_PATTERN.match(lowered):
+            return None
+        if COUNT_TOKEN_PATTERN.match(lowered):
+            return None
+        if BROKEN_COUNT_FRAGMENT_PATTERN.match(lowered):
+            return None
+        if NO_INDEX_PATTERN.match(lowered):
+            return None
+        if COUNT_SIZE_FRAGMENT_PATTERN.match(lowered):
+            return None
+        return lowered
+    return normalized
 
 
-def _extract_path_tags(item: Dict[str, Any]) -> List[str]:
+def _extract_path_tags(item: Dict[str, Any]) -> Dict[str, List[str]]:
     source_path = item["source_path"]
-    tags: List[str] = []
-    seen: set[str] = set()
+    raw_tags: List[str] = []
+    cleaned_tags: List[str] = []
+    filtered_tags: List[str] = []
+    raw_seen: set[str] = set()
+    cleaned_seen: set[str] = set()
+
+    def add_raw(value: Optional[str]) -> None:
+        if not value:
+            return
+        normalized = value.strip()
+        if not normalized or normalized in raw_seen:
+            return
+        raw_seen.add(normalized)
+        raw_tags.append(normalized)
 
     if item.get("folder_category") == 1:
-        _add_tag(tags, seen, "category:life")
+        add_raw("category:life")
     elif item.get("folder_category") == 2:
-        _add_tag(tags, seen, "category:sample")
+        add_raw("category:sample")
 
     date_match = DATE_PATTERN.search(source_path)
     if date_match:
         year, month, day = date_match.groups()
-        _add_tag(tags, seen, f"date:{year}-{month}-{day}")
-        _add_tag(tags, seen, f"year:{year}")
+        add_raw(f"date:{year}-{month}-{day}")
+        add_raw(f"year:{year}")
 
     folder_parts: List[str] = []
     current = os.path.dirname(source_path)
-    for _ in range(3):
+    for _ in range(7):
         if not current:
             break
         folder_parts.append(os.path.basename(current))
@@ -212,12 +260,22 @@ def _extract_path_tags(item: Dict[str, Any]) -> List[str]:
 
     for segment in folder_parts:
         for token in TOKEN_PATTERN.findall(segment):
-            if token.isascii():
-                token = _normalize_ascii_token(token)
-            if token:
-                _add_tag(tags, seen, token)
+            add_raw(token)
 
-    return tags[:12]
+    for token in raw_tags:
+        cleaned = _clean_path_token(token)
+        if cleaned is None:
+            filtered_tags.append(token)
+            continue
+        if cleaned not in cleaned_seen:
+            cleaned_seen.add(cleaned)
+            cleaned_tags.append(cleaned)
+
+    return {
+        "raw_tags": raw_tags[:20],
+        "cleaned_tags": cleaned_tags[:12],
+        "filtered_tags": filtered_tags[:20],
+    }
 
 
 def _build_file_result(
@@ -227,6 +285,9 @@ def _build_file_result(
     reason: Optional[str] = None,
     tags: Optional[List[str]] = None,
     error: Optional[str] = None,
+    raw_tags: Optional[List[str]] = None,
+    cleaned_tags: Optional[List[str]] = None,
+    filtered_tags: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     payload = {
         "file_id": item["file_id"],
@@ -242,6 +303,12 @@ def _build_file_result(
         payload["tags"] = tags
     if error is not None:
         payload["error"] = error
+    if raw_tags is not None:
+        payload["raw_tags"] = raw_tags
+    if cleaned_tags is not None:
+        payload["cleaned_tags"] = cleaned_tags
+    if filtered_tags is not None:
+        payload["filtered_tags"] = filtered_tags
     return payload
 
 
@@ -258,17 +325,40 @@ def _apply_path_labels(
 
     for item in selected:
         processed += 1
-        tags = _extract_path_tags(item)
+        tag_payload = _extract_path_tags(item)
+        tags = tag_payload["cleaned_tags"]
         if not tags:
             succeeded += 1
             files_without_tags += 1
             no_tags_count += 1
-            results.append(_build_file_result(item, "path", "succeeded_no_tags", reason="no_path_tags", tags=[]))
+            results.append(
+                _build_file_result(
+                    item,
+                    "path",
+                    "succeeded_no_tags",
+                    reason="no_path_tags",
+                    tags=[],
+                    raw_tags=tag_payload["raw_tags"],
+                    cleaned_tags=tag_payload["cleaned_tags"],
+                    filtered_tags=tag_payload["filtered_tags"],
+                )
+            )
             continue
 
         succeeded += 1
         files_with_tags += 1
-        results.append(_build_file_result(item, "path", "succeeded_with_tags", reason="path_tags_generated", tags=tags))
+        results.append(
+            _build_file_result(
+                item,
+                "path",
+                "succeeded_with_tags",
+                reason="path_tags_generated",
+                tags=tags,
+                raw_tags=tag_payload["raw_tags"],
+                cleaned_tags=tag_payload["cleaned_tags"],
+                filtered_tags=tag_payload["filtered_tags"],
+            )
+        )
         for tag in tags:
             pending_rows.append((item["file_id"], tag, "path"))
             tag_counter[tag] += 1
@@ -566,6 +656,12 @@ def format_ai_labeling_text(result: Dict[str, Any]) -> str:
                 lines.append(f"  reason: {item['reason']}")
             if item.get("tags") is not None:
                 lines.append(f"  tags: {item['tags']}")
+            if item.get("raw_tags") is not None:
+                lines.append(f"  raw_tags: {item['raw_tags']}")
+            if item.get("cleaned_tags") is not None:
+                lines.append(f"  cleaned_tags: {item['cleaned_tags']}")
+            if item.get("filtered_tags") is not None:
+                lines.append(f"  filtered_tags: {item['filtered_tags']}")
             if item.get("error") is not None:
                 lines.append(f"  error: {item['error']}")
     return "\n".join(lines)
