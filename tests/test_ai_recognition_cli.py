@@ -115,7 +115,7 @@ def test_ai_recognition_apply_writes_siglip_tags_for_small_batch(tmp_path, monke
     monkeypatch.setattr("scripts.run_ai_recognition._siglip_dependency_available", lambda: True)
     monkeypatch.setattr(
         "scripts.run_ai_recognition._generate_siglip_tags",
-        lambda file_ids: {file_ids[0]: ["beach", "sunset"]},
+        lambda file_ids, settings=None: {"tags_by_file": {file_ids[0]: ["beach", "sunset"]}, "encoded_count": 1, "encode_failed_count": 0, "encode_errors": []},
     )
 
     result = run_ai_recognition_validation(db_path=str(db_path), limit=10, dry_run=False)
@@ -134,6 +134,8 @@ def test_ai_recognition_apply_writes_siglip_tags_for_small_batch(tmp_path, monke
     assert result["failed"] == 0
     assert result["model_loaded"] is True
     assert result["db_updated"] == 2
+    assert result["encoded_count"] == 1
+    assert result["encode_failed_count"] == 0
     assert result["file_results"][0]["labels"] == ["beach", "sunset"]
     assert result["file_results"][0]["status"] == "succeeded_with_tags"
     assert rows == [("beach", "siglip"), ("sunset", "siglip")]
@@ -151,7 +153,7 @@ def test_ai_recognition_apply_maps_thumbnail_path_keys_to_file_ids(tmp_path, mon
     thumb_path = os.path.join(str(thumb_dir), "1.jpg")
     monkeypatch.setattr(
         "scripts.run_ai_recognition._generate_siglip_tags",
-        lambda _file_ids: {thumb_path: ["mountain"]},
+        lambda _file_ids, settings=None: {"tags_by_file": {thumb_path: ["mountain"]}, "encoded_count": 1, "encode_failed_count": 0, "encode_errors": []},
     )
 
     result = run_ai_recognition_validation(db_path=str(db_path), limit=10, dry_run=False)
@@ -183,7 +185,7 @@ def test_ai_recognition_apply_maps_numeric_string_keys_to_file_ids(tmp_path, mon
     monkeypatch.setattr("scripts.run_ai_recognition._siglip_dependency_available", lambda: True)
     monkeypatch.setattr(
         "scripts.run_ai_recognition._generate_siglip_tags",
-        lambda _file_ids: {"1": ["river"]},
+        lambda _file_ids, settings=None: {"tags_by_file": {"1": ["river"]}, "encoded_count": 1, "encode_failed_count": 0, "encode_errors": []},
     )
 
     result = run_ai_recognition_validation(db_path=str(db_path), limit=10, dry_run=False)
@@ -204,7 +206,7 @@ def test_ai_recognition_apply_maps_list_of_dict_results(tmp_path, monkeypatch):
     monkeypatch.setattr("scripts.run_ai_recognition._siglip_dependency_available", lambda: True)
     monkeypatch.setattr(
         "scripts.run_ai_recognition._generate_siglip_tags",
-        lambda _file_ids: [{"file_id": 1, "tags": ["forest", "lake"]}],
+        lambda _file_ids, settings=None: {"tags_by_file": [{"file_id": 1, "tags": ["forest", "lake"]}], "encoded_count": 1, "encode_failed_count": 0, "encode_errors": []},
     )
 
     result = run_ai_recognition_validation(db_path=str(db_path), limit=10, dry_run=False)
@@ -223,7 +225,7 @@ def test_ai_recognition_apply_records_no_tags_without_failing(tmp_path, monkeypa
     _create_ai_recognition_db(str(db_path), str(thumb_dir))
 
     monkeypatch.setattr("scripts.run_ai_recognition._siglip_dependency_available", lambda: True)
-    monkeypatch.setattr("scripts.run_ai_recognition._generate_siglip_tags", lambda _file_ids: {1: []})
+    monkeypatch.setattr("scripts.run_ai_recognition._generate_siglip_tags", lambda _file_ids, settings=None: {"tags_by_file": {1: []}, "encoded_count": 1, "encode_failed_count": 0, "encode_errors": []})
 
     result = run_ai_recognition_validation(db_path=str(db_path), limit=10, dry_run=False)
     conn = sqlite3.connect(db_path)
@@ -250,7 +252,7 @@ def test_ai_recognition_apply_marks_missing_result_as_mapping_failure(tmp_path, 
     _create_ai_recognition_db(str(db_path), str(thumb_dir))
 
     monkeypatch.setattr("scripts.run_ai_recognition._siglip_dependency_available", lambda: True)
-    monkeypatch.setattr("scripts.run_ai_recognition._generate_siglip_tags", lambda _file_ids: {})
+    monkeypatch.setattr("scripts.run_ai_recognition._generate_siglip_tags", lambda _file_ids, settings=None: {"tags_by_file": {}, "encoded_count": 0, "encode_failed_count": 1, "encode_errors": [{"file_id": 1, "reason": "thumbnail_not_found"}]})
 
     result = run_ai_recognition_validation(db_path=str(db_path), limit=10, dry_run=False)
     conn = sqlite3.connect(db_path)
@@ -266,11 +268,14 @@ def test_ai_recognition_apply_marks_missing_result_as_mapping_failure(tmp_path, 
     assert result["file_results"][0]["status"] == "failed_result_mapping"
     assert result["file_results"][0]["reason"] == "no_encoded_images_or_empty_result"
     assert result["result_type"] == "dict"
-    assert result["result_len"] == 0
+    assert result["result_len"] == 4
     assert result["result_key_sample"] == []
     assert result["candidate_file_id_sample"] == [1]
     assert len(result["candidate_thumbnail_path_sample"]) == 1
     assert len(result["candidate_source_path_sample"]) == 1
+    assert result["encoded_count"] == 0
+    assert result["encode_failed_count"] == 1
+    assert result["encode_error_sample"][0]["reason"] == "thumbnail_not_found"
     assert tag_count == 0
 
 
@@ -285,7 +290,7 @@ def test_ai_recognition_apply_reports_unmapped_keys_with_samples(tmp_path, monke
     monkeypatch.setattr("scripts.run_ai_recognition._siglip_dependency_available", lambda: True)
     monkeypatch.setattr(
         "scripts.run_ai_recognition._generate_siglip_tags",
-        lambda _file_ids: [("Z:/mismatch/thumb.jpg", ["clouds"])],
+        lambda _file_ids, settings=None: {"tags_by_file": [("Z:/mismatch/thumb.jpg", ["clouds"])], "encoded_count": 1, "encode_failed_count": 0, "encode_errors": []},
     )
 
     result = run_ai_recognition_validation(db_path=str(db_path), limit=10, dry_run=False)
@@ -294,8 +299,8 @@ def test_ai_recognition_apply_reports_unmapped_keys_with_samples(tmp_path, monke
     assert result["failed"] == 1
     assert result["file_results"][0]["status"] == "failed_result_mapping"
     assert result["file_results"][0]["reason"] == "result_mapping_missing"
-    assert result["result_type"] == "list"
-    assert result["result_len"] == 1
+    assert result["result_type"] == "dict"
+    assert result["result_len"] == 4
     assert result["result_key_sample"] == ["Z:/mismatch/thumb.jpg"]
     assert "result_key_sample" in result["file_results"][0]["error"]
     assert "candidate_file_id_sample" in result["file_results"][0]["error"]

@@ -1,8 +1,12 @@
+import os
+import sys
 import numpy as np
-from typing import List, Dict, Tuple
+from typing import Any, List, Dict, Tuple, Optional
+from PIL import Image, ImageOps
 
 from logger_setup import logger
 from infra.image.clip_encoder import encode_image, encode_text, compute_similarity, is_available
+from infra.image.thumbnail_cache import build_thumbnail_path
 
 TAG_CANDIDATES_ZH = [
     "日落", "日出", "海滩", "山脉", "森林", "湖泊", "河流", "天空", "云",
@@ -34,6 +38,7 @@ TAG_CANDIDATES_EN = [
 
 DEFAULT_TOP_K = 5
 DEFAULT_THRESHOLD = 0.25
+THUMBNAIL_MODEL_SIZE = (384, 384)
 
 _text_embeddings_cache: Dict[str, np.ndarray] = {}
 
@@ -47,6 +52,123 @@ def _get_text_embeddings(candidates: List[str]) -> np.ndarray:
         else:
             return np.array([])
     return _text_embeddings_cache[key]
+
+
+def _resolve_settings(settings: Any = None):
+    if settings is not None:
+        return settings
+
+    from config import get_settings
+
+    return get_settings()
+
+
+def _thumbnail_error(file_id: int, settings: Any, reason: str, error: Optional[str] = None) -> Dict[str, Any]:
+    payload = {
+        "file_id": file_id,
+        "thumbnail_path": build_thumbnail_path(settings.thumbnail_dir, file_id),
+        "reason": reason,
+    }
+    if error:
+        payload["error"] = error
+    return payload
+
+
+def _load_thumbnail_image(file_id: int, settings: Any) -> tuple[Optional[Image.Image], Optional[Dict[str, Any]]]:
+    thumbnail_path = build_thumbnail_path(settings.thumbnail_dir, file_id)
+    if not os.path.exists(thumbnail_path):
+        return None, _thumbnail_error(file_id, settings, "thumbnail_not_found")
+
+    try:
+        with Image.open(thumbnail_path) as opened:
+            opened.load()
+            img = ImageOps.exif_transpose(opened)
+            if img.mode in ("RGBA", "P"):
+                img = img.convert("RGB")
+            else:
+                img = img.copy()
+            img.thumbnail(THUMBNAIL_MODEL_SIZE, Image.LANCZOS)
+            return img, None
+    except Exception as exc:
+        return None, _thumbnail_error(file_id, settings, "image_open_failed", str(exc))
+
+
+def _encode_preprocessed_batch(image_inputs: List[Any], clip_encoder_module: Any) -> np.ndarray:
+    import torch
+
+    with torch.no_grad():
+        batch_tensor = torch.stack(image_inputs)
+        embeddings = clip_encoder_module._model.encode_image(batch_tensor)
+        embeddings = embeddings / embeddings.norm(dim=-1, keepdim=True)
+        return embeddings.cpu().numpy()
+
+
+def _encode_images_batch_detailed(
+    file_ids: List[int],
+    settings: Any = None,
+    batch_size: int = 16,
+) -> Dict[str, Any]:
+    settings = _resolve_settings(settings)
+    result = {
+        "embeddings": [],
+        "encoded_count": 0,
+        "encode_failed_count": 0,
+        "encode_errors": [],
+    }
+
+    if not file_ids:
+        return result
+
+    from infra.image import clip_encoder as ce
+
+    if not ce._load_model():
+        result["encode_failed_count"] = len(file_ids)
+        result["encode_errors"] = [
+            _thumbnail_error(file_id, settings, "model_encode_failed", "SigLIP model unavailable")
+            for file_id in file_ids
+        ]
+        return result
+
+    for start in range(0, len(file_ids), batch_size):
+        batch_ids = file_ids[start:start + batch_size]
+        preprocessed_inputs: List[Any] = []
+        valid_ids: List[int] = []
+
+        for file_id in batch_ids:
+            img, load_error = _load_thumbnail_image(file_id, settings)
+            if load_error is not None:
+                result["encode_errors"].append(load_error)
+                continue
+
+            try:
+                preprocessed_inputs.append(ce._preprocess(img))
+                valid_ids.append(file_id)
+            except Exception as exc:
+                result["encode_errors"].append(
+                    _thumbnail_error(file_id, settings, "preprocess_failed", str(exc))
+                )
+            finally:
+                try:
+                    img.close()
+                except Exception:
+                    pass
+
+        if not preprocessed_inputs:
+            continue
+
+        try:
+            embeddings_np = _encode_preprocessed_batch(preprocessed_inputs, ce)
+            for index, file_id in enumerate(valid_ids):
+                result["embeddings"].append((file_id, embeddings_np[index].flatten()))
+        except Exception as exc:
+            for file_id in valid_ids:
+                result["encode_errors"].append(
+                    _thumbnail_error(file_id, settings, "model_encode_failed", str(exc))
+                )
+
+    result["encoded_count"] = len(result["embeddings"])
+    result["encode_failed_count"] = len(result["encode_errors"])
+    return result
 
 
 def generate_tags_for_image(
@@ -85,25 +207,48 @@ def generate_tags_batch(
     candidates: List[str] = None,
     top_k: int = DEFAULT_TOP_K,
     threshold: float = DEFAULT_THRESHOLD,
+    settings: Any = None,
+    return_diagnostics: bool = False,
 ) -> Dict[int, List[str]]:
     if not is_available():
-        return {}
+        detailed = {
+            "tags_by_file": {},
+            "encoded_count": 0,
+            "encode_failed_count": len(file_ids),
+            "encode_errors": [
+                _thumbnail_error(file_id, _resolve_settings(settings), "model_encode_failed", "SigLIP unavailable")
+                for file_id in file_ids
+            ],
+        }
+        return detailed if return_diagnostics else {}
 
     if candidates is None:
         candidates = TAG_CANDIDATES_ZH + TAG_CANDIDATES_EN
 
     text_emb = _get_text_embeddings(candidates)
     if text_emb.size == 0:
-        return {}
+        detailed = {
+            "tags_by_file": {},
+            "encoded_count": 0,
+            "encode_failed_count": 0,
+            "encode_errors": [],
+        }
+        return detailed if return_diagnostics else {}
 
-    from infra.image.clip_encoder import encode_images_batch
-    image_results = encode_images_batch(file_ids)
+    image_results = _encode_images_batch_detailed(file_ids, settings=settings)
 
     result = {}
-    for file_id, image_emb in image_results:
+    for file_id, image_emb in image_results["embeddings"]:
         similarities = compute_similarity(image_emb, text_emb)
         top_indices = np.argsort(similarities)[::-1][:top_k]
         tags = [candidates[idx] for idx in top_indices if similarities[idx] >= threshold]
         result[file_id] = tags
 
+    if return_diagnostics:
+        return {
+            "tags_by_file": result,
+            "encoded_count": image_results["encoded_count"],
+            "encode_failed_count": image_results["encode_failed_count"],
+            "encode_errors": image_results["encode_errors"],
+        }
     return result

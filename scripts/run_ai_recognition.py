@@ -45,10 +45,10 @@ def _siglip_dependency_available() -> bool:
         return False
 
 
-def _generate_siglip_tags(file_ids: List[int]) -> Dict[int, List[str]]:
+def _generate_siglip_tags(file_ids: List[int], settings: Any = None) -> Dict[int, List[str]]:
     from business.image_recognition.tag_generator import generate_tags_batch
 
-    return generate_tags_batch(file_ids)
+    return generate_tags_batch(file_ids, settings=settings, return_diagnostics=True)
 
 
 @contextmanager
@@ -334,6 +334,9 @@ def run_ai_recognition_validation(
             "no_tags_count": 0,
             "failed_count": 0,
             "top_tags": [],
+            "encoded_count": 0,
+            "encode_failed_count": 0,
+            "encode_error_sample": [],
             "result_type": None,
             "result_len": None,
             "result_key_sample": [],
@@ -385,12 +388,14 @@ def run_ai_recognition_validation(
             return result
 
         try:
-            with _temporary_thumbnail_settings(settings):
-                raw_tag_results = _generate_siglip_tags([item["file_id"] for item in ready_items])
+            raw_generation_result = _generate_siglip_tags(
+                [item["file_id"] for item in ready_items],
+                settings=settings,
+            )
             result["model_loaded"] = True
-            result["result_type"] = type(raw_tag_results).__name__
+            result["result_type"] = type(raw_generation_result).__name__
             try:
-                result["result_len"] = len(raw_tag_results)
+                result["result_len"] = len(raw_generation_result)
             except Exception:
                 result["result_len"] = None
         except Exception as exc:
@@ -407,6 +412,14 @@ def run_ai_recognition_validation(
                 )
             result["warnings"].append(f"SigLIP batch generation failed before any DB write: {exc}")
             return result
+
+        if isinstance(raw_generation_result, dict) and "tags_by_file" in raw_generation_result:
+            raw_tag_results = raw_generation_result.get("tags_by_file", {})
+            result["encoded_count"] = raw_generation_result.get("encoded_count", 0)
+            result["encode_failed_count"] = raw_generation_result.get("encode_failed_count", 0)
+            result["encode_error_sample"] = raw_generation_result.get("encode_errors", [])[:5]
+        else:
+            raw_tag_results = raw_generation_result
 
         tags_by_file, mapping_warnings, unmapped_keys = _normalize_tag_results(raw_tag_results, ready_items)
         result["warnings"].extend(mapping_warnings)
@@ -548,6 +561,9 @@ def format_ai_recognition_text(result: Dict[str, Any]) -> str:
         f"no_tags_count: {result['no_tags_count']}",
         f"failed_count: {result['failed_count']}",
         f"top_tags: {result['top_tags']}",
+        f"encoded_count: {result['encoded_count']}",
+        f"encode_failed_count: {result['encode_failed_count']}",
+        f"encode_error_sample: {result['encode_error_sample']}",
         f"result_type: {result['result_type']}",
         f"result_len: {result['result_len']}",
         f"result_key_sample: {result['result_key_sample']}",
