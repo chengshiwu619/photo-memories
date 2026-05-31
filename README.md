@@ -148,6 +148,8 @@ python scripts/maintain_thumbnails.py --db-path D:\photo-memories-cache\photos.d
 
 默认 `workers=2`、`batch_size=10`。dry-run 和 JSON 输出都会显示本次将使用的并发参数、每个 `file_id` 的诊断字段，以及建议的 `next_steps`。
 
+后台照片索引现在支持保守并发：worker 线程只负责图片读取、缩略图生成和元数据提取，SQLite 写入与 checkpoint 仍保持串行。NAS/SMB 默认建议 `workers=2`；如果遇到 NAS 压力、解码异常或索引不稳定，可回退到 `workers=1`。
+
 ## License
 
 [MIT](LICENSE)

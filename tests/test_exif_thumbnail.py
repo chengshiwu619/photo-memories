@@ -99,9 +99,17 @@ def test_generate_thumbnail_respects_max_size():
             fake_settings.__dict__["thumbnail_dir"] = thumb_dir
             try:
                 thumb_path, w, h = generate_thumbnail(src, "3.jpg")
-                thumb_img = Image.open(thumb_path)
-                assert thumb_img.width <= 400
-                assert thumb_img.height <= 400
+                max_width, max_height = fake_settings.thumbnail_size
+                with Image.open(src) as src_img:
+                    expected_ratio = src_img.width / src_img.height
+                with Image.open(thumb_path) as thumb_img:
+                    actual_ratio = thumb_img.width / thumb_img.height
+
+                    assert thumb_img.width <= max_width
+                    assert thumb_img.height <= max_height
+                    assert thumb_img.width == max_width
+                    assert thumb_img.height == int(max_width / expected_ratio)
+                    assert abs(actual_ratio - expected_ratio) < 0.01
             finally:
                 pass
     finally:

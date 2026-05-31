@@ -1,6 +1,7 @@
 import os
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from PIL import Image, ImageOps
 import exifread
@@ -166,6 +167,7 @@ def generate_thumbnail(filepath, thumbnail_name):
 
 
 INDEX_COMMIT_EVERY = 20
+INDEX_WORKERS = 2
 
 
 def compute_phash(filepath):
@@ -272,12 +274,54 @@ def _index_single_photo(file_id, file_path):
     )
 
 
-def index_photos(progress_callback=None, batch_limit=None):
+def _flush_pending_writes(pending_writes, limit=None):
+    if not pending_writes:
+        return 0
+    rows_to_write = pending_writes if limit is None else pending_writes[:limit]
+    with _db.connect() as conn:
+        conn.executemany(
+            """INSERT OR REPLACE INTO photo_metadata
+               (file_id, date_taken, camera_model, gps_lat, gps_lon,
+                width, height, thumbnail_path, exif_json, indexed_at, phash)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows_to_write,
+        )
+    flushed = len(rows_to_write)
+    del pending_writes[:flushed]
+    return flushed
+
+
+def _process_index_batch(batch_rows, workers):
+    if workers <= 1:
+        results = []
+        for file_id, file_path in batch_rows:
+            results.append((file_id, file_path, _index_single_photo(file_id, file_path), None))
+        return results
+
+    ordered_results = [None] * len(batch_rows)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(_index_single_photo, file_id, file_path): (idx, file_id, file_path)
+            for idx, (file_id, file_path) in enumerate(batch_rows)
+        }
+        for future in as_completed(future_map):
+            idx, file_id, file_path = future_map[future]
+            try:
+                row = future.result()
+                ordered_results[idx] = (file_id, file_path, row, None)
+            except Exception as exc:
+                ordered_results[idx] = (file_id, file_path, None, exc)
+    return ordered_results
+
+
+def index_photos(progress_callback=None, batch_limit=None, workers=INDEX_WORKERS, batch_size=INDEX_COMMIT_EVERY):
     _db.init_tables()
+    workers = max(int(workers), 1)
+    batch_size = max(int(batch_size), 1)
 
     photos = get_unindexed_photos()
     total = len(photos)
-    logger.info(f"开始索引照片: 共 {total} 张待索引")
+    logger.info(f"开始索引照片: 共 {total} 张待索引, workers={workers}, batch_size={batch_size}")
     cp = _cp.load()
     start_idx = cp["current_index"] if cp else 0
     indexed = cp.get("indexed", 0) if cp else 0
@@ -292,75 +336,42 @@ def index_photos(progress_callback=None, batch_limit=None):
     batch_count = 0
     pending_writes = []
 
-    for i in range(start_idx, total):
-        file_id, file_path = photos[i]
+    for batch_start in range(start_idx, total, batch_size):
+        batch_end = min(batch_start + batch_size, total)
+        batch_rows = photos[batch_start:batch_end]
+        batch_results = _process_index_batch(batch_rows, workers)
 
-        try:
-            row = _index_single_photo(file_id, file_path)
-            if row is not None:
+        for offset, (file_id, file_path, row, error) in enumerate(batch_results):
+            if error is not None:
+                logger.error(f"索引照片失败 {file_path}: {error}")
+            elif row is not None:
                 pending_writes.append(row)
                 indexed += 1
                 batch_count += 1
 
-                if len(pending_writes) >= INDEX_COMMIT_EVERY:
-                    with _db.connect() as conn:
-                        conn.executemany(
-                            """INSERT OR REPLACE INTO photo_metadata
-                               (file_id, date_taken, camera_model, gps_lat, gps_lon,
-                                width, height, thumbnail_path, exif_json, indexed_at, phash)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                            pending_writes,
-                        )
-                    pending_writes.clear()
-        except Exception as e:
-            logger.error(f"索引照片失败 {file_path}: {e}")
+            while len(pending_writes) >= INDEX_COMMIT_EVERY:
+                _flush_pending_writes(pending_writes, limit=INDEX_COMMIT_EVERY)
 
-        if progress_callback:
-            progress_callback(i + 1, total)
+            if progress_callback:
+                progress_callback(batch_start + offset + 1, total)
+
+        if pending_writes:
+            _flush_pending_writes(pending_writes)
 
         if batch_limit and batch_count >= batch_limit:
-            if pending_writes:
-                with _db.connect() as conn:
-                    conn.executemany(
-                        """INSERT OR REPLACE INTO photo_metadata
-                           (file_id, date_taken, camera_model, gps_lat, gps_lon,
-                            width, height, thumbnail_path, exif_json, indexed_at, phash)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        pending_writes,
-                    )
-                pending_writes.clear()
-            _cp.save(CheckpointState.PAUSED, current_index=i + 1, total=total, indexed=indexed)
-            logger.info(f"索引热身完成: {indexed}/{total}, 剩余 {total - i - 1} 张后台继续")
+            _cp.save(CheckpointState.PAUSED, current_index=batch_end, total=total, indexed=indexed)
+            logger.info(f"索引热身完成: {indexed}/{total}, 剩余 {total - batch_end} 张后台继续")
             return {"paused": True, "batch_limit_reached": True, "total": total, "indexed": indexed}
 
-        if (i + 1) % 20 == 0:
-            if _cp.is_pause_or_stop_requested():
-                if pending_writes:
-                    with _db.connect() as conn:
-                        conn.executemany(
-                            """INSERT OR REPLACE INTO photo_metadata
-                               (file_id, date_taken, camera_model, gps_lat, gps_lon,
-                                width, height, thumbnail_path, exif_json, indexed_at, phash)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                            pending_writes,
-                        )
-                    pending_writes.clear()
-                _cp.save(CheckpointState.PAUSED, current_index=i + 1, total=total, indexed=indexed)
-                logger.info(f"索引暂停: {indexed}/{total}")
-                return {"paused": True, "total": total, "indexed": indexed}
+        if _cp.is_pause_or_stop_requested():
+            _cp.save(CheckpointState.PAUSED, current_index=batch_end, total=total, indexed=indexed)
+            logger.info(f"索引暂停: {indexed}/{total}")
+            return {"paused": True, "total": total, "indexed": indexed}
 
-            _cp.save(CheckpointState.RUNNING, current_index=i + 1, total=total, indexed=indexed)
+        _cp.save(CheckpointState.RUNNING, current_index=batch_end, total=total, indexed=indexed)
 
     if pending_writes:
-        with _db.connect() as conn:
-            conn.executemany(
-                """INSERT OR REPLACE INTO photo_metadata
-                   (file_id, date_taken, camera_model, gps_lat, gps_lon,
-                    width, height, thumbnail_path, exif_json, indexed_at, phash)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                pending_writes,
-            )
-        pending_writes.clear()
+        _flush_pending_writes(pending_writes)
 
     _cp.clear()
     logger.info(f"索引完成: 总计 {total}, 已索引 {indexed}")
