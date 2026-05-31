@@ -164,6 +164,20 @@ python scripts/run_ai_recognition.py --limit 50 --apply
 3. 纭缁撴灉绋冲畾鍚庯紝鍐嶆墿澶у埌 `--limit 50 --apply`銆?
 4. 涓嶈涓€寮€濮嬪氨鐩存帴鍋氬叏閲忚瘑鍒€?
 
+## 缁存姢锛欰I 鏍囩绯荤粺
+
+AI 璇嗗浘鍦ㄨ繖涓」鐩腑鐨勫畾浣嶆槸鈥滄爣绛剧郴缁熲€濓紝涓嶆槸鈥滅瓫閫夌郴缁熲€濄€?
+鎵€鏈夌収鐗囬粯璁ら兘鏈夊洖蹇嗕环鍊硷紝鏍囩鐢ㄤ簬鍚岀被鍥炲繂銆佺壒娈婂洖蹇嗗垎缁勩€佹悳绱㈠拰鑱氬悎锛涢噸澶嶅拰鎹熷潖鏄姸鎬侀棶棰橈紝涓嶆槸鍐呭鎺掗櫎銆?
+
+鎺ㄨ崘鍏堣窇绋冲畾鐨?path 鏍囩锛?
+
+```bash
+python scripts/run_ai_labeling.py --db-path D:\photo-memories-cache\photos.db --source path --limit 50 --dry-run
+python scripts/run_ai_labeling.py --db-path D:\photo-memories-cache\photos.db --source path --limit 50 --apply
+```
+
+SigLIP 鏄彲閫夌殑澧炲己鏍囩鏉ユ簮锛屼笉搴旈樆濉炲熀纭€ path 鏍囩娴佺▼銆?涓嶈涓€寮€濮嬪氨鍏ㄩ噺璺戙€?
+
 ## License
 
 [MIT](LICENSE)
