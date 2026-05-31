@@ -150,6 +150,20 @@ python scripts/maintain_thumbnails.py --db-path D:\photo-memories-cache\photos.d
 
 后台照片索引现在支持保守并发：worker 线程只负责图片读取、缩略图生成和元数据提取，SQLite 写入与 checkpoint 仍保持串行。NAS/SMB 默认建议 `workers=2`；如果遇到 NAS 压力、解码异常或索引不稳定，可回退到 `workers=1`。
 
+## 缁存姢锛欰I 璇嗗埆灏忔壒閲忛獙璇?
+
+```bash
+python scripts/run_ai_recognition.py --limit 10 --dry-run
+python scripts/run_ai_recognition.py --limit 10 --apply
+python scripts/run_ai_recognition.py --limit 50 --apply
+```
+
+鎺ㄨ崘椤哄簭锛?
+1. 鍏堢敤 `--limit 10 --dry-run` 鍙煡鐪嬪皢瑕佽瘑鍒殑 `file_id`锛屼笉鍔犺浇妯″瀷銆佷笉鍐欐暟鎹簱銆?
+2. 鍐嶇敤 `--limit 10 --apply` 鍋氫竴娆″皬鎵归噺 SigLIP 鏍囩楠岃瘉锛岀‘璁?`photo_tags` 鍐欏叆姝ｅ父銆?
+3. 纭缁撴灉绋冲畾鍚庯紝鍐嶆墿澶у埌 `--limit 50 --apply`銆?
+4. 涓嶈涓€寮€濮嬪氨鐩存帴鍋氬叏閲忚瘑鍒€?
+
 ## License
 
 [MIT](LICENSE)
