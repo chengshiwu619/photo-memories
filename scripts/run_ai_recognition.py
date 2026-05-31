@@ -150,42 +150,84 @@ def _build_file_result(
     return result
 
 
+def _normalize_path_key(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value:
+        return None
+    return os.path.normcase(os.path.abspath(os.path.normpath(value)))
+
+
+def _iter_result_entries(raw_results: Any) -> tuple[List[tuple[Any, Any]], List[str]]:
+    warnings: List[str] = []
+    entries: List[tuple[Any, Any]] = []
+
+    if isinstance(raw_results, dict):
+        return list(raw_results.items()), warnings
+
+    if isinstance(raw_results, (list, tuple)):
+        for item in raw_results:
+            if isinstance(item, dict):
+                if "tags" not in item:
+                    warnings.append(f"ignored result dict without tags key: {item!r}")
+                    continue
+                key = item.get("file_id", item.get("path", item.get("thumbnail_path", item.get("source_path"))))
+                entries.append((key, item.get("tags")))
+                continue
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                entries.append((item[0], item[1]))
+                continue
+            warnings.append(f"ignored unsupported result entry: {item!r}")
+        return entries, warnings
+
+    warnings.append("generate_tags_batch returned an unsupported non-mapping result; unable to map outputs to file_id.")
+    return entries, warnings
+
+
 def _normalize_tag_results(
     raw_results: Any,
     selected: List[Dict[str, Any]],
-) -> tuple[Dict[int, Optional[List[str]]], List[str]]:
+) -> tuple[Dict[int, Optional[List[str]]], List[str], List[Any]]:
     warnings: List[str] = []
     normalized: Dict[int, Optional[List[str]]] = {}
-    if not isinstance(raw_results, dict):
-        return normalized, ["generate_tags_batch returned a non-dict result; unable to map outputs to file_id."]
+    unmapped_keys: List[Any] = []
+
+    entries, entry_warnings = _iter_result_entries(raw_results)
+    warnings.extend(entry_warnings)
+    if not entries and not isinstance(raw_results, dict):
+        return normalized, warnings, unmapped_keys
+    if isinstance(raw_results, dict) and len(raw_results) == 0:
+        return normalized, warnings, unmapped_keys
 
     by_thumbnail_path = {
-        os.path.abspath(item["thumbnail_path"]): item["file_id"] for item in selected
+        _normalize_path_key(item["thumbnail_path"]): item["file_id"] for item in selected
     }
-    by_thumbnail_path_raw = {
-        item["thumbnail_path"]: item["file_id"] for item in selected
+    by_source_path = {
+        _normalize_path_key(item["source_path"]): item["file_id"] for item in selected
     }
     by_file_id = {item["file_id"]: item["file_id"] for item in selected}
+    by_file_id_str = {str(item["file_id"]): item["file_id"] for item in selected}
 
-    for key, value in raw_results.items():
+    for key, value in entries:
         mapped_file_id: Optional[int] = None
         if isinstance(key, int) and key in by_file_id:
             mapped_file_id = key
         elif isinstance(key, str):
-            if key.isdigit():
+            if key in by_file_id_str:
+                mapped_file_id = by_file_id_str[key]
+            elif key.isdigit():
                 mapped_file_id = by_file_id.get(int(key))
             if mapped_file_id is None:
-                mapped_file_id = by_thumbnail_path.get(os.path.abspath(key))
+                mapped_file_id = by_thumbnail_path.get(_normalize_path_key(key))
             if mapped_file_id is None:
-                mapped_file_id = by_thumbnail_path_raw.get(key)
+                mapped_file_id = by_source_path.get(_normalize_path_key(key))
 
         if mapped_file_id is None:
             warnings.append(f"unmapped tag result key ignored: {key!r}")
+            unmapped_keys.append(key)
             continue
 
         normalized[mapped_file_id] = value
 
-    return normalized, warnings
+    return normalized, warnings, unmapped_keys
 
 
 def run_ai_recognition_validation(
@@ -277,20 +319,34 @@ def run_ai_recognition_validation(
             result["warnings"].append(f"SigLIP batch generation failed before any DB write: {exc}")
             return result
 
-        tags_by_file, mapping_warnings = _normalize_tag_results(raw_tag_results, ready_items)
+        tags_by_file, mapping_warnings, unmapped_keys = _normalize_tag_results(raw_tag_results, ready_items)
         result["warnings"].extend(mapping_warnings)
+        candidate_file_id_sample = [item["file_id"] for item in ready_items[:5]]
+        empty_result = isinstance(raw_tag_results, dict) and len(raw_tag_results) == 0
 
         pending_rows: List[tuple[int, str, str]] = []
         for item in ready_items:
             result["processed"] += 1
             if item["file_id"] not in tags_by_file:
+                if empty_result:
+                    reason = "no_encoded_images_or_empty_result"
+                    error = (
+                        "generate_tags_batch returned an empty result for the whole batch; "
+                        f"candidate_file_id_sample={candidate_file_id_sample}"
+                    )
+                else:
+                    reason = "result_mapping_missing"
+                    error = (
+                        "generate_tags_batch returned no result for this file_id; "
+                        f"result_key_sample={unmapped_keys[:5]} candidate_file_id_sample={candidate_file_id_sample}"
+                    )
                 result["failed"] += 1
                 result["file_results"].append(
                     _build_file_result(
                         item,
                         status="failed_result_mapping",
-                        reason="result_mapping_missing",
-                        error="generate_tags_batch returned no result for this file_id",
+                        reason=reason,
+                        error=error,
                     )
                 )
                 continue
@@ -344,12 +400,13 @@ def run_ai_recognition_validation(
             )
 
         if pending_rows:
+            before_changes = conn.total_changes
             conn.executemany(
                 "INSERT OR IGNORE INTO photo_tags (file_id, tag, source) VALUES (?, ?, ?)",
                 pending_rows,
             )
             conn.commit()
-            result["db_updated"] = len(pending_rows)
+            result["db_updated"] = conn.total_changes - before_changes
 
         return result
     finally:

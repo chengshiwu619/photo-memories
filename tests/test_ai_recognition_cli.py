@@ -172,6 +172,48 @@ def test_ai_recognition_apply_maps_thumbnail_path_keys_to_file_ids(tmp_path, mon
     assert rows == [("mountain", "siglip")]
 
 
+def test_ai_recognition_apply_maps_numeric_string_keys_to_file_ids(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "cache"
+    thumb_dir = cache_dir / "thumbnails"
+    cache_dir.mkdir()
+    thumb_dir.mkdir()
+    db_path = cache_dir / "photos.db"
+    _create_ai_recognition_db(str(db_path), str(thumb_dir))
+
+    monkeypatch.setattr("scripts.run_ai_recognition._siglip_dependency_available", lambda: True)
+    monkeypatch.setattr(
+        "scripts.run_ai_recognition._generate_siglip_tags",
+        lambda _file_ids: {"1": ["river"]},
+    )
+
+    result = run_ai_recognition_validation(db_path=str(db_path), limit=10, dry_run=False)
+    assert result["succeeded"] == 1
+    assert result["failed"] == 0
+    assert result["db_updated"] == 1
+    assert result["file_results"][0]["status"] == "succeeded_with_tags"
+
+
+def test_ai_recognition_apply_maps_list_of_dict_results(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "cache"
+    thumb_dir = cache_dir / "thumbnails"
+    cache_dir.mkdir()
+    thumb_dir.mkdir()
+    db_path = cache_dir / "photos.db"
+    _create_ai_recognition_db(str(db_path), str(thumb_dir))
+
+    monkeypatch.setattr("scripts.run_ai_recognition._siglip_dependency_available", lambda: True)
+    monkeypatch.setattr(
+        "scripts.run_ai_recognition._generate_siglip_tags",
+        lambda _file_ids: [{"file_id": 1, "tags": ["forest", "lake"]}],
+    )
+
+    result = run_ai_recognition_validation(db_path=str(db_path), limit=10, dry_run=False)
+    assert result["succeeded"] == 1
+    assert result["failed"] == 0
+    assert result["db_updated"] == 2
+    assert result["file_results"][0]["status"] == "succeeded_with_tags"
+
+
 def test_ai_recognition_apply_records_no_tags_without_failing(tmp_path, monkeypatch):
     cache_dir = tmp_path / "cache"
     thumb_dir = cache_dir / "thumbnails"
@@ -222,8 +264,32 @@ def test_ai_recognition_apply_marks_missing_result_as_mapping_failure(tmp_path, 
     assert result["failed"] == 1
     assert result["db_updated"] == 0
     assert result["file_results"][0]["status"] == "failed_result_mapping"
-    assert result["file_results"][0]["reason"] == "result_mapping_missing"
+    assert result["file_results"][0]["reason"] == "no_encoded_images_or_empty_result"
     assert tag_count == 0
+
+
+def test_ai_recognition_apply_reports_unmapped_keys_with_samples(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "cache"
+    thumb_dir = cache_dir / "thumbnails"
+    cache_dir.mkdir()
+    thumb_dir.mkdir()
+    db_path = cache_dir / "photos.db"
+    _create_ai_recognition_db(str(db_path), str(thumb_dir))
+
+    monkeypatch.setattr("scripts.run_ai_recognition._siglip_dependency_available", lambda: True)
+    monkeypatch.setattr(
+        "scripts.run_ai_recognition._generate_siglip_tags",
+        lambda _file_ids: [("Z:/mismatch/thumb.jpg", ["clouds"])],
+    )
+
+    result = run_ai_recognition_validation(db_path=str(db_path), limit=10, dry_run=False)
+
+    assert result["succeeded"] == 0
+    assert result["failed"] == 1
+    assert result["file_results"][0]["status"] == "failed_result_mapping"
+    assert result["file_results"][0]["reason"] == "result_mapping_missing"
+    assert "result_key_sample" in result["file_results"][0]["error"]
+    assert "candidate_file_id_sample" in result["file_results"][0]["error"]
 
 
 def test_ai_recognition_cli_json_output_is_valid(tmp_path):
