@@ -4,7 +4,8 @@ import sqlite3
 import subprocess
 import sys
 
-from scripts.run_ai_labeling import _extract_path_tags, run_ai_labeling
+from scripts.audit_path_tags import audit_path_tags, guess_tag_type
+from scripts.run_ai_labeling import _extract_path_tags, run_ai_labeling, run_path_noise_cleanup
 
 
 def _create_ai_label_db(db_path, thumb_dir):
@@ -355,3 +356,150 @@ def test_apply_writes_only_cleaned_tags(tmp_path):
     assert "2.79GB" not in tags
     assert "2050P+28V" not in tags
     assert "p-7" not in tags
+
+
+def test_cleanup_noise_dry_run_does_not_delete_database(tmp_path):
+    cache_dir = tmp_path / "cache"
+    thumb_dir = cache_dir / "thumbnails"
+    cache_dir.mkdir()
+    thumb_dir.mkdir()
+    db_path = cache_dir / "photos.db"
+    _create_ai_label_db(str(db_path), str(thumb_dir))
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("INSERT INTO photo_tags (file_id, tag, source) VALUES (1, 'no', 'path')")
+        conn.execute("INSERT INTO photo_tags (file_id, tag, source) VALUES (2, 'gb', 'path')")
+        conn.execute("INSERT INTO photo_tags (file_id, tag, source) VALUES (2, 'no', 'siglip')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = run_path_noise_cleanup(db_path=str(db_path), dry_run=True)
+    assert result["matched_row_count"] == 2
+    assert result["deleted_rows"] == 0
+
+    conn = sqlite3.connect(db_path)
+    try:
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM photo_tags WHERE source = 'path' AND tag IN ('no', 'gb')"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert remaining == 2
+
+
+def test_cleanup_noise_apply_only_deletes_path_source_noise(tmp_path):
+    cache_dir = tmp_path / "cache"
+    thumb_dir = cache_dir / "thumbnails"
+    cache_dir.mkdir()
+    thumb_dir.mkdir()
+    db_path = cache_dir / "photos.db"
+    _create_ai_label_db(str(db_path), str(thumb_dir))
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("INSERT INTO photo_tags (file_id, tag, source) VALUES (1, 'no', 'path')")
+        conn.execute("INSERT INTO photo_tags (file_id, tag, source) VALUES (1, 'category:life', 'path')")
+        conn.execute("INSERT INTO photo_tags (file_id, tag, source) VALUES (2, 'year:2023', 'path')")
+        conn.execute("INSERT INTO photo_tags (file_id, tag, source) VALUES (3, '希威社', 'path')")
+        conn.execute("INSERT INTO photo_tags (file_id, tag, source) VALUES (2, 'mobile', 'path')")
+        conn.execute("INSERT INTO photo_tags (file_id, tag, source) VALUES (2, 'mobile', 'siglip')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = run_path_noise_cleanup(db_path=str(db_path), dry_run=False)
+    assert result["deleted_rows"] == 2
+
+    conn = sqlite3.connect(db_path)
+    try:
+        path_noise = conn.execute(
+            "SELECT COUNT(*) FROM photo_tags WHERE source = 'path' AND tag IN ('no', 'mobile')"
+        ).fetchone()[0]
+        siglip_noise = conn.execute(
+            "SELECT COUNT(*) FROM photo_tags WHERE source = 'siglip' AND tag = 'mobile'"
+        ).fetchone()[0]
+        preserved = {
+            row[0]
+            for row in conn.execute(
+                "SELECT tag FROM photo_tags WHERE source = 'path' AND tag IN ('category:life', 'year:2023', '希威社')"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+
+    assert path_noise == 0
+    assert siglip_noise == 1
+    assert preserved == {"category:life", "year:2023", "希威社"}
+
+
+def test_audit_path_tags_is_read_only_and_top_n_works(tmp_path):
+    cache_dir = tmp_path / "cache"
+    thumb_dir = cache_dir / "thumbnails"
+    cache_dir.mkdir()
+    thumb_dir.mkdir()
+    db_path = cache_dir / "photos.db"
+    _create_ai_label_db(str(db_path), str(thumb_dir))
+
+    run_ai_labeling(db_path=str(db_path), source="path", limit=50, dry_run=False)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        before_count = conn.execute("SELECT COUNT(*) FROM photo_tags").fetchone()[0]
+    finally:
+        conn.close()
+
+    payload = audit_path_tags(db_path=str(db_path), source="path", top=3)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        after_count = conn.execute("SELECT COUNT(*) FROM photo_tags").fetchone()[0]
+    finally:
+        conn.close()
+
+    assert len(payload["audit_items"]) == 3
+    assert before_count == after_count
+
+
+def test_audit_guess_type_rules_cover_category_year_noise_and_chinese():
+    assert guess_tag_type("category:sample") == "category"
+    assert guess_tag_type("year:2019") == "year"
+    assert guess_tag_type("2050P+28V") == "numeric_or_size_noise"
+    assert guess_tag_type("dcim") == "source_device"
+    assert guess_tag_type("日常生活") == "chinese_semantic"
+
+
+def test_audit_json_output_structure_is_stable(tmp_path):
+    cache_dir = tmp_path / "cache"
+    thumb_dir = cache_dir / "thumbnails"
+    cache_dir.mkdir()
+    thumb_dir.mkdir()
+    db_path = cache_dir / "photos.db"
+    _create_ai_label_db(str(db_path), str(thumb_dir))
+    run_ai_labeling(db_path=str(db_path), source="path", limit=50, dry_run=False)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/audit_path_tags.py",
+            "--db-path",
+            str(db_path),
+            "--source",
+            "path",
+            "--top",
+            "5",
+            "--json",
+        ],
+        cwd="d:\\photo-memories-source",
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    payload = json.loads(result.stdout)
+    assert payload["source"] == "path"
+    assert payload["top"] == 5
+    assert isinstance(payload["audit_items"], list)
+    assert "cleaning_plan_template" in payload
+    assert {"delete_tags", "rename_tags", "keep_tags"} <= set(payload["cleaning_plan_template"].keys())

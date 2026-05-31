@@ -179,6 +179,8 @@ python scripts/run_ai_labeling.py --db-path D:\photo-memories-cache\photos.db --
 SigLIP 鏄彲閫夌殑澧炲己鏍囩鏉ユ簮锛屼笉搴旈樆濉炲熀纭€ path 鏍囩娴佺▼銆?涓嶈涓€寮€濮嬪氨鍏ㄩ噺璺戙€?
 
 path 閺嶅洨顒峰厛浠ヤ欢澶广€佺洰褰曘€佹潵婧愮洰褰曚綔涓虹矖绮掑害鏍囩鏉ユ簮锛屼絾浼氳繃婊ゅ閲忚瘝銆佺紪鍙锋畫鐗囥€侀€氱敤鏍圭洰褰曡瘝锛堝 `2.79GB`銆乣2050P+28V`銆乣p-3`銆乣photos`锛夛紝apply 鍙啓鍏?`cleaned_tags`銆俤ry-run 浼氬悓鏃惰緭鍑?`raw_tags`銆乣cleaned_tags` 鍜?`filtered_tags`锛屾柟渚夸汉宸ユ鏌ユ爣绛捐川閲忋€?
+濡傛灉搴撻噷杩樻湁鏃╂湡宸插啓鍏ョ殑 path 鍣０鏍囩锛堝 `no`銆乣gb`銆乣waxzml`銆乣mobile`銆乣dcim`銆乣p-3`锛夛紝鍙厛鐢?`python scripts/run_ai_labeling.py --db-path ... --source path --cleanup-noise --dry-run` 鏌ョ湅灏嗚娓呯悊鐨勬爣绛惧拰鏍锋湰 `file_id`锛屽啀鐢?`--apply` 鍙垹闄?`photo_tags` 涓?`source='path'` 鐨勮繖浜涙棫鍣０鏍囩锛屼笉浼氬奖鍝?`siglip` 绛夊叾浠栨潵婧愩€?
+濡傛灉瑕佷负鍚庣画 LLM 鏍囩娓呮礂鍋氬噯澶囷紝鍏堢敤鍙瀹¤鍛戒护瀵?`photo_tags(source='path')` 鍋?top N 缁熻銆佹牱鏈?`file_id`/璺緞鍜岀矖鍒嗙被锛氬 `python scripts/audit_path_tags.py --db-path ... --source path --top 200 --json`銆傚璁″鍑哄寘鍚?`tag`銆乢ount`銆乣distinct_file_count`銆乻ample_file_ids`銆乻ample_paths`銆乢urrent_source`銆乬uessed_type`锛屽彲鐢ㄤ簬鍚庣画涓€娆℃€х粰 LLM 鍒ゆ柇鍝簺鏍囩淇濈暀銆佸垹闄ゃ€侀噸鍛藉悕鎴栧悎骞躲€傛湰姝ヤ笉鍐欐暟鎹簱銆佷笉鑱旂綉銆?
 
 ## License
 
