@@ -37,6 +37,34 @@ ASCII_NOISE = {
     "p",
     "v",
     "photos",
+    "waxzml",
+    "dcim",
+    "mobile",
+    "mobilebackup",
+    "moments",
+    "sm-n9600",
+    "vol",
+}
+PATH_NOISE_TAGS = {
+    "no",
+    "gb",
+    "mb",
+    "kb",
+    "tb",
+    "p",
+    "v",
+    "photos",
+    "waxzml",
+    "dcim",
+    "mobile",
+    "mobilebackup",
+    "moments",
+    "sm-n9600",
+    "vol",
+    "p-3",
+    "p-4",
+    "p-7",
+    "p+28v",
 }
 CAPACITY_TOKEN_PATTERN = re.compile(r"^\d+(?:\.\d+)?(?:gb|mb|kb|tb)$", re.IGNORECASE)
 COUNT_TOKEN_PATTERN = re.compile(r"^\d+[pv](?:\+\d+[pv])*$", re.IGNORECASE)
@@ -520,6 +548,98 @@ def _merge_counters(base: Counter[str], extra: Counter[str]) -> Counter[str]:
     return merged
 
 
+def _fetch_current_top_path_tags(conn: sqlite3.Connection, limit: int = 10) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT tag, COUNT(*) AS tag_count
+        FROM photo_tags
+        WHERE source = 'path'
+        GROUP BY tag
+        ORDER BY tag_count DESC, tag ASC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [{"tag": row["tag"], "count": row["tag_count"]} for row in rows]
+
+
+def run_path_noise_cleanup(
+    db_path: Optional[str] = None,
+    dry_run: bool = True,
+    sample_limit: int = 5,
+) -> Dict[str, Any]:
+    settings = _resolve_settings(db_path)
+    conn = sqlite3.connect(settings.db_path, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        placeholders = ",".join("?" for _ in PATH_NOISE_TAGS)
+        rows = conn.execute(
+            f"""
+            SELECT tag, COUNT(*) AS tag_count
+            FROM photo_tags
+            WHERE source = 'path'
+              AND LOWER(tag) IN ({placeholders})
+            GROUP BY tag
+            ORDER BY tag_count DESC, tag ASC
+            """,
+            tuple(sorted(PATH_NOISE_TAGS)),
+        ).fetchall()
+
+        cleanup_items: List[Dict[str, Any]] = []
+        total_matches = 0
+        for row in rows:
+            tag = row["tag"]
+            sample_rows = conn.execute(
+                """
+                SELECT file_id
+                FROM photo_tags
+                WHERE source = 'path' AND tag = ?
+                ORDER BY file_id
+                LIMIT ?
+                """,
+                (tag, max(int(sample_limit), 1)),
+            ).fetchall()
+            count = row["tag_count"]
+            total_matches += count
+            cleanup_items.append(
+                {
+                    "tag": tag,
+                    "count": count,
+                    "sample_file_ids": [sample["file_id"] for sample in sample_rows],
+                }
+            )
+
+        deleted_rows = 0
+        if cleanup_items and not dry_run:
+            before_changes = conn.total_changes
+            conn.execute(
+                f"""
+                DELETE FROM photo_tags
+                WHERE source = 'path'
+                  AND LOWER(tag) IN ({placeholders})
+                """,
+                tuple(sorted(PATH_NOISE_TAGS)),
+            )
+            conn.commit()
+            deleted_rows = conn.total_changes - before_changes
+
+        return {
+            "mode": "cleanup_noise",
+            "source": "path",
+            "dry_run": dry_run,
+            "db_path": os.path.abspath(settings.db_path),
+            "noise_tags": sorted(PATH_NOISE_TAGS),
+            "matched_tag_count": len(cleanup_items),
+            "matched_row_count": total_matches,
+            "deleted_rows": deleted_rows,
+            "cleanup_items": cleanup_items,
+            "top_tags_after_cleanup": _fetch_current_top_path_tags(conn),
+            "warnings": [],
+        }
+    finally:
+        conn.close()
+
+
 def run_ai_labeling(
     db_path: Optional[str] = None,
     limit: int = DEFAULT_LIMIT,
@@ -614,6 +734,27 @@ def run_ai_labeling(
 
 
 def format_ai_labeling_text(result: Dict[str, Any]) -> str:
+    if result.get("mode") == "cleanup_noise":
+        lines = [
+            "Path Tag Cleanup Report",
+            f"db_path: {result['db_path']}",
+            f"source: {result['source']}",
+            f"dry_run: {result['dry_run']}",
+            f"matched_tag_count: {result['matched_tag_count']}",
+            f"matched_row_count: {result['matched_row_count']}",
+            f"deleted_rows: {result['deleted_rows']}",
+            f"top_tags_after_cleanup: {result['top_tags_after_cleanup']}",
+        ]
+        if result.get("cleanup_items"):
+            lines.append("cleanup items:")
+            for item in result["cleanup_items"]:
+                lines.append(f"- tag={item['tag']} count={item['count']} sample_file_ids={item['sample_file_ids']}")
+        if result.get("warnings"):
+            lines.append("warnings:")
+            for warning in result["warnings"]:
+                lines.append(f"- {warning}")
+        return "\n".join(lines)
+
     lines = [
         "AI Labeling Report",
         f"db_path: {result['db_path']}",
@@ -677,6 +818,7 @@ def parse_args(argv=None):
     parser.add_argument("--source", choices=["path", "siglip", "all"], default="path", help="Label source to run. Default is stable path tags.")
     parser.add_argument("--sample-mode", choices=["sequential", "random", "folder-diverse"], default=DEFAULT_SAMPLE_MODE, help="How to sample candidates.")
     parser.add_argument("--seed", type=int, help="Optional random seed for random/folder-diverse sampling.")
+    parser.add_argument("--cleanup-noise", action="store_true", help="Preview or remove historical path-tag noise from photo_tags where source='path'.")
     return parser.parse_args(argv)
 
 
@@ -686,14 +828,22 @@ def main(argv=None):
     if args.dry_run:
         dry_run = True
 
-    result = run_ai_labeling(
-        db_path=args.db_path,
-        limit=max(args.limit, 0),
-        dry_run=dry_run,
-        source=args.source,
-        sample_mode=args.sample_mode,
-        seed=args.seed,
-    )
+    if args.cleanup_noise:
+        if args.source != "path":
+            raise SystemExit("--cleanup-noise currently only supports --source path")
+        result = run_path_noise_cleanup(
+            db_path=args.db_path,
+            dry_run=dry_run,
+        )
+    else:
+        result = run_ai_labeling(
+            db_path=args.db_path,
+            limit=max(args.limit, 0),
+            dry_run=dry_run,
+            source=args.source,
+            sample_mode=args.sample_mode,
+            seed=args.seed,
+        )
     if args.json_output:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
