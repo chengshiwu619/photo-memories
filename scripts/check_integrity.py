@@ -12,6 +12,10 @@ from services.startup_integrity import (  # noqa: E402
     build_startup_integrity_report,
     format_integrity_report_text,
 )
+from scripts.maintain_thumbnails import (  # noqa: E402
+    build_failed_thumbnail_diagnosis,
+    refine_integrity_report_with_failed_diagnosis,
+)
 
 
 class _CliSettings:
@@ -55,6 +59,23 @@ def main(argv=None):
         max_samples=max(args.max_samples, 0),
         with_repair_plan=args.with_repair_plan,
     )
+    if args.with_repair_plan and report.get("db_path") and report.get("summary", {}).get("warning_count", 0) >= 0:
+        failed_check = next(
+            (check for check in report.get("checks", []) if check["check_name"] == "thumbnail_failed"),
+            None,
+        )
+        if failed_check and failed_check.get("count", 0) > 0:
+            diagnosis_summary = build_failed_thumbnail_diagnosis(
+                db_path=report["db_path"],
+                settings=settings or _CliSettings(report["db_path"]),
+                limit=None,
+                file_ids=None,
+            )
+            report = refine_integrity_report_with_failed_diagnosis(
+                report,
+                diagnosis_summary,
+                max_samples=max(args.max_samples, 0),
+            )
     if args.json_output:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:

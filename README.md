@@ -131,11 +131,22 @@ python scripts/maintain_thumbnails.py --db-path D:\photo-memories-cache\photos.d
 真实操作建议顺序：
 
 ```bash
+python scripts/check_integrity.py --db-path D:\photo-memories-cache\photos.db --with-repair-plan
 python scripts/maintain_thumbnails.py --db-path D:\photo-memories-cache\photos.db --retry-failed
 python scripts/maintain_thumbnails.py --db-path D:\photo-memories-cache\photos.db --retry-failed --file-id 1072
 ```
 
-先备份 `photos.db`，再从单个 `file_id` 的 `--apply` 开始；确认无误后再用 `--limit 5 --apply` 小批量推进，最后再处理剩余 `__FAILED__` 记录。默认 `workers=2`、`batch_size=10`，dry-run 和 JSON 输出都会显示本次将使用的并发参数与每个 `file_id` 的计划或结果。
+1. 先运行 `check_integrity` 看总体状态。
+2. 再运行 `maintain_thumbnails --retry-failed` 做 failed 根因诊断。
+3. 如果诊断多数是路径、NAS、不可访问问题，先修路径或重新索引，不要直接 `--apply`。
+4. 如果 `retry_recommended=true`，先备份 `photos.db`。
+5. 先对单个 `file_id` 执行 `--apply`。
+6. 单个成功后，再用 `--limit 5 --apply` 小批量推进。
+7. 处理后再运行 `check_integrity` 复查。
+8. `thumbnail_failed` 清零后，再考虑 `migrate-signature --apply`。
+9. 最后再启动程序验证 UI。
+
+默认 `workers=2`、`batch_size=10`。dry-run 和 JSON 输出都会显示本次将使用的并发参数、每个 `file_id` 的诊断字段，以及建议的 `next_steps`。
 
 ## License
 

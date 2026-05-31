@@ -198,7 +198,10 @@ def test_integrity_cli_outputs_repair_plan_in_text_and_json(tmp_path):
     )
     report = json.loads(json_result.stdout)
     assert "repair_plan" in report
+    assert "thumbnail_failed_diagnosis_summary" in report
     assert len(report["repair_plan"]) > 0
     assert len(report["repair_plan"][0]["sample_ids"]) <= 1
     assert any(step["check_name"] == "thumbnail_file_missing" for step in report["repair_plan"])
     assert any(step["plan_type"] == "thumbnail_failed_retry" for step in report["repair_plan"])
+    failed_step = next(step for step in report["repair_plan"] if step["check_name"] == "thumbnail_failed")
+    assert "missing or inaccessible source paths" in failed_step["action"]

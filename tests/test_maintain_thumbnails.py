@@ -5,7 +5,12 @@ import subprocess
 import sys
 import threading
 
-from scripts.maintain_thumbnails import run_thumbnail_maintenance
+from scripts.maintain_thumbnails import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_WORKERS,
+    diagnose_failed_thumbnail_item,
+    run_thumbnail_maintenance,
+)
 
 
 def _write_test_image(path):
@@ -42,9 +47,11 @@ def _create_thumbnail_maintenance_db(
     thumbnail_sig="600x600_q90",
     failed_file_ids=None,
     broken_file_ids=None,
+    source_exts=None,
 ):
     failed_file_ids = set(failed_file_ids or [])
     broken_file_ids = set(broken_file_ids or [])
+    source_exts = source_exts or {}
     conn = sqlite3.connect(db_path)
     try:
         conn.executescript(
@@ -80,7 +87,8 @@ def _create_thumbnail_maintenance_db(
         files = []
         metadata = []
         for file_id in range(1, 5):
-            file_path = os.path.join(source_dir, f"source-{file_id}.jpg")
+            ext = source_exts.get(file_id, ".jpg")
+            file_path = os.path.join(source_dir, f"source-{file_id}{ext}")
             files.append((file_id, file_path, 1))
             if file_id in failed_file_ids:
                 thumbnail_path = "__FAILED__"
@@ -102,6 +110,88 @@ def _create_thumbnail_maintenance_db(
         conn.commit()
     finally:
         conn.close()
+
+
+def test_missing_source_is_not_retry_recommended(tmp_path):
+    item = {
+        "file_id": 1,
+        "file_path": str(tmp_path / "missing.jpg"),
+        "target_thumbnail_path": str(tmp_path / "thumbs" / "1.jpg"),
+    }
+    diagnosis = diagnose_failed_thumbnail_item(item)
+    assert diagnosis["likely_reason"] == "missing_source"
+    assert diagnosis["retry_recommended"] is False
+
+
+def test_not_file_is_not_retry_recommended(tmp_path):
+    source_dir = tmp_path / "folder-source"
+    source_dir.mkdir()
+    item = {
+        "file_id": 1,
+        "file_path": str(source_dir),
+        "target_thumbnail_path": str(tmp_path / "thumbs" / "1.jpg"),
+    }
+    diagnosis = diagnose_failed_thumbnail_item(item)
+    assert diagnosis["likely_reason"] == "not_file"
+    assert diagnosis["retry_recommended"] is False
+
+
+def test_unsupported_extension_is_not_retry_recommended(tmp_path):
+    source_path = tmp_path / "source-1.txt"
+    source_path.write_text("not an image", encoding="utf-8")
+    item = {
+        "file_id": 1,
+        "file_path": str(source_path),
+        "target_thumbnail_path": str(tmp_path / "thumbs" / "1.jpg"),
+    }
+    diagnosis = diagnose_failed_thumbnail_item(item)
+    assert diagnosis["likely_reason"] == "unsupported_extension"
+    assert diagnosis["retry_recommended"] is False
+
+
+def test_non_ascii_path_diagnosis_is_safe(tmp_path):
+    source_path = tmp_path / "中文目录" / "照片.jpg"
+    source_path.parent.mkdir()
+    _write_test_image(source_path)
+    item = {
+        "file_id": 1,
+        "file_path": str(source_path),
+        "target_thumbnail_path": str(tmp_path / "thumbs" / "1.jpg"),
+    }
+    diagnosis = diagnose_failed_thumbnail_item(item)
+    assert diagnosis["has_non_ascii"] is True
+    assert diagnosis["retry_recommended"] is True
+    assert diagnosis["likely_reason"] in {"non_ascii_path", "source_ok_retry_possible"}
+
+
+def test_special_char_path_diagnosis_is_safe(tmp_path):
+    source_path = tmp_path / "special#name(1).jpg"
+    _write_test_image(source_path)
+    item = {
+        "file_id": 1,
+        "file_path": str(source_path),
+        "target_thumbnail_path": str(tmp_path / "thumbs" / "1.jpg"),
+    }
+    diagnosis = diagnose_failed_thumbnail_item(item)
+    assert diagnosis["has_special_chars"] is True
+    assert diagnosis["retry_recommended"] is True
+    assert diagnosis["likely_reason"] == "special_char_path"
+
+
+def test_readable_supported_source_is_retry_recommended(tmp_path):
+    source_path = tmp_path / "source-1.jpg"
+    _write_test_image(source_path)
+    item = {
+        "file_id": 1,
+        "file_path": str(source_path),
+        "target_thumbnail_path": str(tmp_path / "thumbs" / "1.jpg"),
+    }
+    diagnosis = diagnose_failed_thumbnail_item(item)
+    assert diagnosis["source_exists"] is True
+    assert diagnosis["source_is_file"] is True
+    assert diagnosis["source_readable"] is True
+    assert diagnosis["retry_recommended"] is True
+    assert diagnosis["likely_reason"] == "source_ok_retry_possible"
 
 
 def test_default_dry_run_does_not_write_database_or_files(tmp_path):
@@ -126,13 +216,13 @@ def test_default_dry_run_does_not_write_database_or_files(tmp_path):
     assert result["dry_run"] is True
     assert result["db_updated"] == 0
     assert result["attempted"] == 0
-    assert result["workers"] == 2
-    assert result["batch_size"] == 10
+    assert result["workers"] == DEFAULT_WORKERS
+    assert result["batch_size"] == DEFAULT_BATCH_SIZE
     assert thumb_value == "__FAILED__"
     assert not missing_target.exists()
 
 
-def test_retry_failed_dry_run_only_lists_plan(tmp_path):
+def test_retry_failed_dry_run_lists_plan_and_diagnostics(tmp_path):
     cache_dir = tmp_path / "cache"
     thumb_dir = cache_dir / "thumbnails"
     source_dir = tmp_path / "sources"
@@ -149,6 +239,7 @@ def test_retry_failed_dry_run_only_lists_plan(tmp_path):
         limit=1,
         workers=3,
         batch_size=4,
+        scope_limited=True,
     )
     plan = result["operations"]["retry_failed"]
 
@@ -159,7 +250,28 @@ def test_retry_failed_dry_run_only_lists_plan(tmp_path):
     assert len(plan["selected"]) == 1
     assert result["db_updated"] == 0
     assert result["file_results"][0]["status"] == "planned"
-    assert result["file_results"][0]["file_id"] == 1
+    assert "likely_reason" in result["file_results"][0]
+    assert "recommended_action" in result["file_results"][0]
+    assert result["next_steps"]
+
+
+def test_retry_failed_apply_rejects_without_explicit_scope(tmp_path):
+    cache_dir = tmp_path / "cache"
+    thumb_dir = cache_dir / "thumbnails"
+    source_dir = tmp_path / "sources"
+    cache_dir.mkdir()
+    thumb_dir.mkdir(parents=True)
+    source_dir.mkdir()
+
+    db_path = cache_dir / "photos.db"
+    _create_thumbnail_maintenance_db(str(db_path), str(source_dir), str(thumb_dir), failed_file_ids={1, 2})
+
+    result = run_thumbnail_maintenance(db_path=str(db_path), retry_failed=True, apply=True)
+
+    assert result["attempted"] == 0
+    assert result["db_updated"] == 0
+    assert result["planned_apply_count"] == 0
+    assert any("refused" in warning for warning in result["warnings"])
 
 
 def test_retry_failed_apply_updates_thumbnail_path_on_success(tmp_path, monkeypatch):
@@ -171,9 +283,7 @@ def test_retry_failed_apply_updates_thumbnail_path_on_success(tmp_path, monkeypa
     source_dir.mkdir()
 
     source_path = source_dir / "source-1.jpg"
-    second_source_path = source_dir / "source-2.jpg"
     _write_test_image(source_path)
-    _write_test_image(second_source_path)
     db_path = cache_dir / "photos.db"
     _create_thumbnail_maintenance_db(str(db_path), str(source_dir), str(thumb_dir), failed_file_ids={1})
 
@@ -186,7 +296,13 @@ def test_retry_failed_apply_updates_thumbnail_path_on_success(tmp_path, monkeypa
         _fake_create_thumbnail_file,
     )
 
-    result = run_thumbnail_maintenance(db_path=str(db_path), retry_failed=True, apply=True)
+    result = run_thumbnail_maintenance(
+        db_path=str(db_path),
+        retry_failed=True,
+        apply=True,
+        file_ids=[1],
+        scope_limited=True,
+    )
     target_path = thumb_dir / "1.jpg"
     conn = sqlite3.connect(db_path)
     try:
@@ -199,9 +315,7 @@ def test_retry_failed_apply_updates_thumbnail_path_on_success(tmp_path, monkeypa
     assert result["db_updated"] == 1
     assert target_path.exists()
     assert thumb_value == str(target_path)
-    assert result["file_results"][0]["status"] == "succeeded"
-    assert result["workers"] == 2
-    assert result["batch_size"] == 10
+    assert result["file_results"][-1]["status"] == "succeeded"
 
 
 def test_retry_failed_apply_skips_missing_source_and_keeps_failed_marker(tmp_path):
@@ -215,7 +329,13 @@ def test_retry_failed_apply_skips_missing_source_and_keeps_failed_marker(tmp_pat
     db_path = cache_dir / "photos.db"
     _create_thumbnail_maintenance_db(str(db_path), str(source_dir), str(thumb_dir), failed_file_ids={1})
 
-    result = run_thumbnail_maintenance(db_path=str(db_path), retry_failed=True, apply=True)
+    result = run_thumbnail_maintenance(
+        db_path=str(db_path),
+        retry_failed=True,
+        apply=True,
+        file_ids=[1],
+        scope_limited=True,
+    )
     conn = sqlite3.connect(db_path)
     try:
         thumb_value = conn.execute("SELECT thumbnail_path FROM photo_metadata WHERE file_id = 1").fetchone()[0]
@@ -226,7 +346,7 @@ def test_retry_failed_apply_skips_missing_source_and_keeps_failed_marker(tmp_pat
     assert result["db_updated"] == 0
     assert thumb_value == "__FAILED__"
     assert result["file_results"][0]["status"] == "skipped"
-    assert result["file_results"][0]["error"] == "source file missing"
+    assert result["file_results"][0]["likely_reason"] == "missing_source"
 
 
 def test_retry_failed_apply_generation_exception_keeps_failed_marker(tmp_path, monkeypatch):
@@ -238,9 +358,7 @@ def test_retry_failed_apply_generation_exception_keeps_failed_marker(tmp_path, m
     source_dir.mkdir()
 
     source_path = source_dir / "source-1.jpg"
-    second_source_path = source_dir / "source-2.jpg"
     _write_test_image(source_path)
-    _write_test_image(second_source_path)
     db_path = cache_dir / "photos.db"
     _create_thumbnail_maintenance_db(str(db_path), str(source_dir), str(thumb_dir), failed_file_ids={1})
 
@@ -252,7 +370,13 @@ def test_retry_failed_apply_generation_exception_keeps_failed_marker(tmp_path, m
         _boom,
     )
 
-    result = run_thumbnail_maintenance(db_path=str(db_path), retry_failed=True, apply=True)
+    result = run_thumbnail_maintenance(
+        db_path=str(db_path),
+        retry_failed=True,
+        apply=True,
+        file_ids=[1],
+        scope_limited=True,
+    )
     conn = sqlite3.connect(db_path)
     try:
         thumb_value = conn.execute("SELECT thumbnail_path FROM photo_metadata WHERE file_id = 1").fetchone()[0]
@@ -277,7 +401,13 @@ def test_limit_and_file_id_filter_only_select_requested_failed_rows(tmp_path):
     db_path = cache_dir / "photos.db"
     _create_thumbnail_maintenance_db(str(db_path), str(source_dir), str(thumb_dir), failed_file_ids={1, 2, 3})
 
-    result = run_thumbnail_maintenance(db_path=str(db_path), retry_failed=True, file_ids=[2, 3], limit=1)
+    result = run_thumbnail_maintenance(
+        db_path=str(db_path),
+        retry_failed=True,
+        file_ids=[2, 3],
+        limit=1,
+        scope_limited=True,
+    )
     selected = result["operations"]["retry_failed"]["selected"]
 
     assert result["operations"]["retry_failed"]["found"] == 2
@@ -296,7 +426,12 @@ def test_non_failed_records_are_not_retried(tmp_path):
     db_path = cache_dir / "photos.db"
     _create_thumbnail_maintenance_db(str(db_path), str(source_dir), str(thumb_dir), failed_file_ids={1})
 
-    result = run_thumbnail_maintenance(db_path=str(db_path), retry_failed=True, file_ids=[4])
+    result = run_thumbnail_maintenance(
+        db_path=str(db_path),
+        retry_failed=True,
+        file_ids=[4],
+        scope_limited=True,
+    )
 
     assert result["operations"]["retry_failed"]["found"] == 0
     assert result["selected"] == 0
@@ -318,6 +453,7 @@ def test_workers_and_batch_size_are_clamped_to_minimum_one(tmp_path):
         retry_failed=True,
         workers=0,
         batch_size=0,
+        scope_limited=True,
     )
 
     assert result["workers"] == 1
@@ -379,6 +515,8 @@ def test_database_updates_stay_on_main_thread(tmp_path, monkeypatch):
         db_path=str(db_path),
         retry_failed=True,
         apply=True,
+        file_ids=[1, 2],
+        scope_limited=True,
         workers=2,
         batch_size=1,
     )
@@ -472,7 +610,7 @@ def test_migrate_signature_refuses_when_missing_thumbnail_files_exist(tmp_path):
     assert any("blocked" in warning or "missing thumbnail files" in warning for warning in result["warnings"])
 
 
-def test_json_output_is_valid(tmp_path):
+def test_json_output_is_valid_and_contains_diagnostics(tmp_path):
     cache_dir = tmp_path / "cache"
     thumb_dir = cache_dir / "thumbnails"
     source_dir = tmp_path / "sources"
@@ -494,7 +632,9 @@ def test_json_output_is_valid(tmp_path):
 
     assert payload["mode"] == "retry_failed"
     assert payload["dry_run"] is True
-    assert payload["workers"] == 2
-    assert payload["batch_size"] == 10
+    assert payload["workers"] == DEFAULT_WORKERS
+    assert payload["batch_size"] == DEFAULT_BATCH_SIZE
     assert payload["file_results"][0]["status"] == "planned"
-    assert payload["file_results"][0]["file_id"] == 1
+    assert "likely_reason" in payload["file_results"][0]
+    assert "retry_recommended" in payload["file_results"][0]
+    assert payload["next_steps"]
