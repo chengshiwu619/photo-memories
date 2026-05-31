@@ -265,6 +265,12 @@ def test_ai_recognition_apply_marks_missing_result_as_mapping_failure(tmp_path, 
     assert result["db_updated"] == 0
     assert result["file_results"][0]["status"] == "failed_result_mapping"
     assert result["file_results"][0]["reason"] == "no_encoded_images_or_empty_result"
+    assert result["result_type"] == "dict"
+    assert result["result_len"] == 0
+    assert result["result_key_sample"] == []
+    assert result["candidate_file_id_sample"] == [1]
+    assert len(result["candidate_thumbnail_path_sample"]) == 1
+    assert len(result["candidate_source_path_sample"]) == 1
     assert tag_count == 0
 
 
@@ -288,6 +294,9 @@ def test_ai_recognition_apply_reports_unmapped_keys_with_samples(tmp_path, monke
     assert result["failed"] == 1
     assert result["file_results"][0]["status"] == "failed_result_mapping"
     assert result["file_results"][0]["reason"] == "result_mapping_missing"
+    assert result["result_type"] == "list"
+    assert result["result_len"] == 1
+    assert result["result_key_sample"] == ["Z:/mismatch/thumb.jpg"]
     assert "result_key_sample" in result["file_results"][0]["error"]
     assert "candidate_file_id_sample" in result["file_results"][0]["error"]
 

@@ -1,7 +1,9 @@
 import argparse
 from contextlib import contextmanager
+from collections import Counter, defaultdict
 import json
 import os
+import random
 import sqlite3
 import sys
 from typing import Any, Dict, List, Optional
@@ -14,6 +16,7 @@ if PROJECT_ROOT not in sys.path:
 
 DEFAULT_LIMIT = 10
 SIGLIP_SOURCE = "siglip"
+DEFAULT_SAMPLE_MODE = "sequential"
 
 
 class _CliSettings:
@@ -80,7 +83,53 @@ def _temporary_thumbnail_settings(settings: Any):
             thumbnail_loader._loader = original_loader
 
 
-def _select_siglip_candidates(conn: sqlite3.Connection, limit: int) -> tuple[list[Dict[str, Any]], int]:
+def _pick_candidates(
+    candidates: List[Dict[str, Any]],
+    limit: int,
+    sample_mode: str,
+    seed: Optional[int],
+) -> List[Dict[str, Any]]:
+    limit = max(int(limit), 0)
+    if limit == 0 or not candidates:
+        return []
+
+    if sample_mode == "sequential":
+        return candidates[:limit]
+
+    rng = random.Random(seed)
+    if sample_mode == "random":
+        picked = list(candidates)
+        rng.shuffle(picked)
+        return picked[:limit]
+
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for item in candidates:
+        grouped[item["source_folder"]].append(item)
+
+    folders = list(grouped.keys())
+    rng.shuffle(folders)
+    for folder in folders:
+        rng.shuffle(grouped[folder])
+
+    selected: List[Dict[str, Any]] = []
+    while folders and len(selected) < limit:
+        next_round: List[str] = []
+        for folder in folders:
+            bucket = grouped[folder]
+            if bucket and len(selected) < limit:
+                selected.append(bucket.pop(0))
+            if bucket:
+                next_round.append(folder)
+        folders = next_round
+    return selected
+
+
+def _select_siglip_candidates(
+    conn: sqlite3.Connection,
+    limit: int,
+    sample_mode: str = DEFAULT_SAMPLE_MODE,
+    seed: Optional[int] = None,
+) -> Dict[str, Any]:
     rows = conn.execute(
         """
         SELECT
@@ -103,28 +152,34 @@ def _select_siglip_candidates(conn: sqlite3.Connection, limit: int) -> tuple[lis
         (SIGLIP_SOURCE,),
     ).fetchall()
 
-    selected: List[Dict[str, Any]] = []
-    skipped = 0
+    candidates: List[Dict[str, Any]] = []
+    already_tagged_skipped = 0
+    invalid_thumbnail_skipped = 0
     for row in rows:
         if row["has_siglip_tags"]:
-            skipped += 1
+            already_tagged_skipped += 1
             continue
         thumb_path = row["thumbnail_path"]
         if not thumb_path or not os.path.exists(thumb_path):
-            skipped += 1
+            invalid_thumbnail_skipped += 1
             continue
-        selected.append(
+        candidates.append(
             {
                 "file_id": row["file_id"],
                 "source_path": row["source_path"],
                 "thumbnail_path": thumb_path,
+                "source_folder": os.path.dirname(row["source_path"]) or "",
                 "current_status": "ready_for_siglip",
             }
         )
-        if len(selected) >= limit:
-            break
 
-    return selected, skipped
+    selected = _pick_candidates(candidates, limit=limit, sample_mode=sample_mode, seed=seed)
+    return {
+        "candidate_count": len(candidates),
+        "selected": selected,
+        "already_tagged_skipped": already_tagged_skipped,
+        "invalid_thumbnail_skipped": invalid_thumbnail_skipped,
+    }
 
 
 def _build_file_result(
@@ -138,6 +193,7 @@ def _build_file_result(
         "file_id": item["file_id"],
         "source_path": item["source_path"],
         "thumbnail_path": item["thumbnail_path"],
+        "source_folder": item["source_folder"],
         "current_status": item["current_status"],
         "status": status,
     }
@@ -234,6 +290,8 @@ def run_ai_recognition_validation(
     db_path: Optional[str] = None,
     limit: int = DEFAULT_LIMIT,
     dry_run: bool = True,
+    sample_mode: str = DEFAULT_SAMPLE_MODE,
+    seed: Optional[int] = None,
 ) -> Dict[str, Any]:
     settings = _resolve_settings(db_path)
     db_path = os.path.abspath(settings.db_path)
@@ -242,20 +300,46 @@ def run_ai_recognition_validation(
     conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
     try:
-        selected, skipped = _select_siglip_candidates(conn, max(int(limit), 0))
+        selection = _select_siglip_candidates(
+            conn,
+            max(int(limit), 0),
+            sample_mode=sample_mode,
+            seed=seed,
+        )
+        selected = selection["selected"]
+        selected_folders = sorted({item["source_folder"] for item in selected if item["source_folder"]})
         result: Dict[str, Any] = {
             "dry_run": dry_run,
             "mode": "siglip_tag_validation",
             "db_path": db_path,
             "limit": max(int(limit), 0),
+            "sample_mode": sample_mode,
+            "seed": seed,
+            "candidate_count": selection["candidate_count"],
             "selected": len(selected),
-            "skipped": skipped,
+            "selected_folder_count": len(selected_folders),
+            "selected_source_folder_samples": selected_folders[:10],
+            "already_tagged_skipped": selection["already_tagged_skipped"],
+            "invalid_thumbnail_skipped": selection["invalid_thumbnail_skipped"],
+            "skipped": selection["already_tagged_skipped"] + selection["invalid_thumbnail_skipped"],
             "processed": 0,
             "succeeded": 0,
             "failed": 0,
             "model_loaded": False,
             "db_updated": 0,
             "dependency_available": dependency_available,
+            "tags_inserted": 0,
+            "files_with_tags": 0,
+            "files_without_tags": 0,
+            "no_tags_count": 0,
+            "failed_count": 0,
+            "top_tags": [],
+            "result_type": None,
+            "result_len": None,
+            "result_key_sample": [],
+            "candidate_file_id_sample": [item["file_id"] for item in selected[:5]],
+            "candidate_thumbnail_path_sample": [item["thumbnail_path"] for item in selected[:5]],
+            "candidate_source_path_sample": [item["source_path"] for item in selected[:5]],
             "warnings": [],
             "file_results": [],
         }
@@ -304,6 +388,11 @@ def run_ai_recognition_validation(
             with _temporary_thumbnail_settings(settings):
                 raw_tag_results = _generate_siglip_tags([item["file_id"] for item in ready_items])
             result["model_loaded"] = True
+            result["result_type"] = type(raw_tag_results).__name__
+            try:
+                result["result_len"] = len(raw_tag_results)
+            except Exception:
+                result["result_len"] = None
         except Exception as exc:
             result["failed"] += len(ready_items)
             result["processed"] += len(ready_items)
@@ -321,10 +410,18 @@ def run_ai_recognition_validation(
 
         tags_by_file, mapping_warnings, unmapped_keys = _normalize_tag_results(raw_tag_results, ready_items)
         result["warnings"].extend(mapping_warnings)
+        if isinstance(raw_tag_results, dict):
+            result["result_key_sample"] = list(raw_tag_results.keys())[:5]
+        elif isinstance(raw_tag_results, (list, tuple)):
+            result["result_key_sample"] = [
+                entry[0] if isinstance(entry, (list, tuple)) and len(entry) >= 1 else entry
+                for entry in list(raw_tag_results)[:5]
+            ]
         candidate_file_id_sample = [item["file_id"] for item in ready_items[:5]]
         empty_result = isinstance(raw_tag_results, dict) and len(raw_tag_results) == 0
 
         pending_rows: List[tuple[int, str, str]] = []
+        run_tag_counter: Counter[str] = Counter()
         for item in ready_items:
             result["processed"] += 1
             if item["file_id"] not in tags_by_file:
@@ -378,6 +475,8 @@ def run_ai_recognition_validation(
 
             result["succeeded"] += 1
             if not labels:
+                result["files_without_tags"] += 1
+                result["no_tags_count"] += 1
                 result["file_results"].append(
                     _build_file_result(
                         item,
@@ -388,8 +487,10 @@ def run_ai_recognition_validation(
                 )
                 continue
 
+            result["files_with_tags"] += 1
             for label in labels:
                 pending_rows.append((item["file_id"], label, SIGLIP_SOURCE))
+                run_tag_counter[label] += 1
             result["file_results"].append(
                 _build_file_result(
                     item,
@@ -407,6 +508,13 @@ def run_ai_recognition_validation(
             )
             conn.commit()
             result["db_updated"] = conn.total_changes - before_changes
+            result["tags_inserted"] = result["db_updated"]
+
+        result["failed_count"] = result["failed"]
+        result["top_tags"] = [
+            {"tag": tag, "count": count}
+            for tag, count in run_tag_counter.most_common(10)
+        ]
 
         return result
     finally:
@@ -420,13 +528,32 @@ def format_ai_recognition_text(result: Dict[str, Any]) -> str:
         f"dry_run: {result['dry_run']}",
         f"mode: {result['mode']}",
         f"limit: {result['limit']}",
+        f"sample_mode: {result['sample_mode']}",
+        f"seed: {result['seed']}",
+        f"candidate_count: {result['candidate_count']}",
         f"selected: {result['selected']}",
+        f"selected_folder_count: {result['selected_folder_count']}",
+        f"selected_source_folder_samples: {result['selected_source_folder_samples']}",
+        f"already_tagged_skipped: {result['already_tagged_skipped']}",
+        f"invalid_thumbnail_skipped: {result['invalid_thumbnail_skipped']}",
         f"skipped: {result['skipped']}",
         f"processed: {result['processed']}",
         f"succeeded: {result['succeeded']}",
         f"failed: {result['failed']}",
         f"model_loaded: {result['model_loaded']}",
         f"db_updated: {result['db_updated']}",
+        f"tags_inserted: {result['tags_inserted']}",
+        f"files_with_tags: {result['files_with_tags']}",
+        f"files_without_tags: {result['files_without_tags']}",
+        f"no_tags_count: {result['no_tags_count']}",
+        f"failed_count: {result['failed_count']}",
+        f"top_tags: {result['top_tags']}",
+        f"result_type: {result['result_type']}",
+        f"result_len: {result['result_len']}",
+        f"result_key_sample: {result['result_key_sample']}",
+        f"candidate_file_id_sample: {result['candidate_file_id_sample']}",
+        f"candidate_thumbnail_path_sample: {result['candidate_thumbnail_path_sample']}",
+        f"candidate_source_path_sample: {result['candidate_source_path_sample']}",
         f"dependency_available: {result['dependency_available']}",
     ]
     if result.get("warnings"):
@@ -454,6 +581,13 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Validate the local AI recognition path in small batches.")
     parser.add_argument("--db-path", help="Optional path to the SQLite database to inspect.")
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help="Maximum number of eligible photos to process.")
+    parser.add_argument(
+        "--sample-mode",
+        choices=["sequential", "random", "folder-diverse"],
+        default=DEFAULT_SAMPLE_MODE,
+        help="How to sample candidates for small-batch validation.",
+    )
+    parser.add_argument("--seed", type=int, help="Optional random seed for random / folder-diverse sampling.")
     parser.add_argument("--dry-run", action="store_true", help="Preview selected file_ids only. No model load, DB write, or network access.")
     parser.add_argument("--apply", action="store_true", help="Actually run a small local SigLIP tagging batch and write photo_tags rows.")
     parser.add_argument("--json", action="store_true", dest="json_output", help="Print structured JSON output only.")
@@ -470,6 +604,8 @@ def main(argv=None):
         db_path=args.db_path,
         limit=max(args.limit, 0),
         dry_run=dry_run,
+        sample_mode=args.sample_mode,
+        seed=args.seed,
     )
     if args.json_output:
         print(json.dumps(result, ensure_ascii=False, indent=2))
