@@ -135,10 +135,71 @@ def test_ai_recognition_apply_writes_siglip_tags_for_small_batch(tmp_path, monke
     assert result["model_loaded"] is True
     assert result["db_updated"] == 2
     assert result["file_results"][0]["labels"] == ["beach", "sunset"]
+    assert result["file_results"][0]["status"] == "succeeded_with_tags"
     assert rows == [("beach", "siglip"), ("sunset", "siglip")]
 
 
-def test_ai_recognition_apply_handles_missing_batch_result_without_writing(tmp_path, monkeypatch):
+def test_ai_recognition_apply_maps_thumbnail_path_keys_to_file_ids(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "cache"
+    thumb_dir = cache_dir / "thumbnails"
+    cache_dir.mkdir()
+    thumb_dir.mkdir()
+    db_path = cache_dir / "photos.db"
+    _create_ai_recognition_db(str(db_path), str(thumb_dir))
+
+    monkeypatch.setattr("scripts.run_ai_recognition._siglip_dependency_available", lambda: True)
+    thumb_path = os.path.join(str(thumb_dir), "1.jpg")
+    monkeypatch.setattr(
+        "scripts.run_ai_recognition._generate_siglip_tags",
+        lambda _file_ids: {thumb_path: ["mountain"]},
+    )
+
+    result = run_ai_recognition_validation(db_path=str(db_path), limit=10, dry_run=False)
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT tag, source FROM photo_tags WHERE file_id = ?",
+            (1,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert result["processed"] == 1
+    assert result["succeeded"] == 1
+    assert result["failed"] == 0
+    assert result["db_updated"] == 1
+    assert result["file_results"][0]["status"] == "succeeded_with_tags"
+    assert rows == [("mountain", "siglip")]
+
+
+def test_ai_recognition_apply_records_no_tags_without_failing(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "cache"
+    thumb_dir = cache_dir / "thumbnails"
+    cache_dir.mkdir()
+    thumb_dir.mkdir()
+    db_path = cache_dir / "photos.db"
+    _create_ai_recognition_db(str(db_path), str(thumb_dir))
+
+    monkeypatch.setattr("scripts.run_ai_recognition._siglip_dependency_available", lambda: True)
+    monkeypatch.setattr("scripts.run_ai_recognition._generate_siglip_tags", lambda _file_ids: {1: []})
+
+    result = run_ai_recognition_validation(db_path=str(db_path), limit=10, dry_run=False)
+    conn = sqlite3.connect(db_path)
+    try:
+        tag_count = conn.execute("SELECT COUNT(*) FROM photo_tags WHERE file_id = ?", (1,)).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert result["processed"] == 1
+    assert result["succeeded"] == 1
+    assert result["failed"] == 0
+    assert result["db_updated"] == 0
+    assert result["file_results"][0]["status"] == "succeeded_no_tags"
+    assert result["file_results"][0]["reason"] == "no_tags_above_threshold"
+    assert tag_count == 0
+
+
+def test_ai_recognition_apply_marks_missing_result_as_mapping_failure(tmp_path, monkeypatch):
     cache_dir = tmp_path / "cache"
     thumb_dir = cache_dir / "thumbnails"
     cache_dir.mkdir()
@@ -160,7 +221,8 @@ def test_ai_recognition_apply_handles_missing_batch_result_without_writing(tmp_p
     assert result["succeeded"] == 0
     assert result["failed"] == 1
     assert result["db_updated"] == 0
-    assert result["file_results"][0]["status"] == "failed"
+    assert result["file_results"][0]["status"] == "failed_result_mapping"
+    assert result["file_results"][0]["reason"] == "result_mapping_missing"
     assert tag_count == 0
 
 

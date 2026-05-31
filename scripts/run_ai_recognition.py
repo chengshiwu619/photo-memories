@@ -1,4 +1,5 @@
 import argparse
+from contextlib import contextmanager
 import json
 import os
 import sqlite3
@@ -45,6 +46,38 @@ def _generate_siglip_tags(file_ids: List[int]) -> Dict[int, List[str]]:
     from business.image_recognition.tag_generator import generate_tags_batch
 
     return generate_tags_batch(file_ids)
+
+
+@contextmanager
+def _temporary_thumbnail_settings(settings: Any):
+    try:
+        from infra.image import thumbnail_loader
+    except Exception:
+        yield
+        return
+
+    original_get_settings = thumbnail_loader.get_settings
+    original_loader = thumbnail_loader._loader
+    try:
+        thumbnail_loader.get_settings = lambda: settings
+        if original_loader is not None:
+            try:
+                original_loader.clear()
+            except Exception:
+                pass
+        thumbnail_loader._loader = None
+        yield
+    finally:
+        thumbnail_loader.get_settings = original_get_settings
+        try:
+            active_loader = thumbnail_loader._loader
+            if active_loader is not None:
+                active_loader.clear()
+        except Exception:
+            pass
+        thumbnail_loader._loader = None
+        if original_loader is not None:
+            thumbnail_loader._loader = original_loader
 
 
 def _select_siglip_candidates(conn: sqlite3.Connection, limit: int) -> tuple[list[Dict[str, Any]], int]:
@@ -117,6 +150,44 @@ def _build_file_result(
     return result
 
 
+def _normalize_tag_results(
+    raw_results: Any,
+    selected: List[Dict[str, Any]],
+) -> tuple[Dict[int, Optional[List[str]]], List[str]]:
+    warnings: List[str] = []
+    normalized: Dict[int, Optional[List[str]]] = {}
+    if not isinstance(raw_results, dict):
+        return normalized, ["generate_tags_batch returned a non-dict result; unable to map outputs to file_id."]
+
+    by_thumbnail_path = {
+        os.path.abspath(item["thumbnail_path"]): item["file_id"] for item in selected
+    }
+    by_thumbnail_path_raw = {
+        item["thumbnail_path"]: item["file_id"] for item in selected
+    }
+    by_file_id = {item["file_id"]: item["file_id"] for item in selected}
+
+    for key, value in raw_results.items():
+        mapped_file_id: Optional[int] = None
+        if isinstance(key, int) and key in by_file_id:
+            mapped_file_id = key
+        elif isinstance(key, str):
+            if key.isdigit():
+                mapped_file_id = by_file_id.get(int(key))
+            if mapped_file_id is None:
+                mapped_file_id = by_thumbnail_path.get(os.path.abspath(key))
+            if mapped_file_id is None:
+                mapped_file_id = by_thumbnail_path_raw.get(key)
+
+        if mapped_file_id is None:
+            warnings.append(f"unmapped tag result key ignored: {key!r}")
+            continue
+
+        normalized[mapped_file_id] = value
+
+    return normalized, warnings
+
+
 def run_ai_recognition_validation(
     db_path: Optional[str] = None,
     limit: int = DEFAULT_LIMIT,
@@ -167,42 +238,106 @@ def run_ai_recognition_validation(
             )
             return result
 
-        try:
-            tags_by_file = _generate_siglip_tags([item["file_id"] for item in selected])
-            result["model_loaded"] = True
-        except Exception as exc:
-            result["failed"] = len(selected)
-            result["processed"] = len(selected)
-            for item in selected:
-                result["file_results"].append(
-                    _build_file_result(item, status="failed", error=str(exc), reason="tag generation crashed")
-                )
-            result["warnings"].append(f"SigLIP batch generation failed before any DB write: {exc}")
-            return result
-
-        pending_rows: List[tuple[int, str, str]] = []
+        ready_items: List[Dict[str, Any]] = []
         for item in selected:
-            result["processed"] += 1
-            labels = tags_by_file.get(item["file_id"])
-            if labels is None:
+            if not os.path.exists(item["thumbnail_path"]):
+                result["processed"] += 1
                 result["failed"] += 1
                 result["file_results"].append(
                     _build_file_result(
                         item,
-                        status="failed",
-                        reason="no_result",
+                        status="failed_missing_thumbnail",
+                        reason="thumbnail_missing_before_inference",
+                        error="thumbnail_path no longer exists at apply time",
+                    )
+                )
+            else:
+                ready_items.append(item)
+
+        if not ready_items:
+            result["warnings"].append("All selected items were skipped because thumbnails were missing at apply time.")
+            return result
+
+        try:
+            with _temporary_thumbnail_settings(settings):
+                raw_tag_results = _generate_siglip_tags([item["file_id"] for item in ready_items])
+            result["model_loaded"] = True
+        except Exception as exc:
+            result["failed"] += len(ready_items)
+            result["processed"] += len(ready_items)
+            for item in ready_items:
+                result["file_results"].append(
+                    _build_file_result(
+                        item,
+                        status="failed_model_error",
+                        error=str(exc),
+                        reason="tag generation crashed",
+                    )
+                )
+            result["warnings"].append(f"SigLIP batch generation failed before any DB write: {exc}")
+            return result
+
+        tags_by_file, mapping_warnings = _normalize_tag_results(raw_tag_results, ready_items)
+        result["warnings"].extend(mapping_warnings)
+
+        pending_rows: List[tuple[int, str, str]] = []
+        for item in ready_items:
+            result["processed"] += 1
+            if item["file_id"] not in tags_by_file:
+                result["failed"] += 1
+                result["file_results"].append(
+                    _build_file_result(
+                        item,
+                        status="failed_result_mapping",
+                        reason="result_mapping_missing",
                         error="generate_tags_batch returned no result for this file_id",
                     )
                 )
                 continue
 
+            labels = tags_by_file[item["file_id"]]
+            if labels is None:
+                result["failed"] += 1
+                result["file_results"].append(
+                    _build_file_result(
+                        item,
+                        status="failed_result_mapping",
+                        reason="result_value_invalid",
+                        error="generate_tags_batch returned an invalid non-list value for this file_id",
+                    )
+                )
+                continue
+
+            if not isinstance(labels, list):
+                result["failed"] += 1
+                result["file_results"].append(
+                    _build_file_result(
+                        item,
+                        status="failed_result_mapping",
+                        reason="result_value_invalid",
+                        error="generate_tags_batch returned a non-list tag payload for this file_id",
+                    )
+                )
+                continue
+
             result["succeeded"] += 1
+            if not labels:
+                result["file_results"].append(
+                    _build_file_result(
+                        item,
+                        status="succeeded_no_tags",
+                        reason="no_tags_above_threshold",
+                        labels=[],
+                    )
+                )
+                continue
+
             for label in labels:
                 pending_rows.append((item["file_id"], label, SIGLIP_SOURCE))
             result["file_results"].append(
                 _build_file_result(
                     item,
-                    status="succeeded",
+                    status="succeeded_with_tags",
                     reason="tags_generated",
                     labels=labels,
                 )
