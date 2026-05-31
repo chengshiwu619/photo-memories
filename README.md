@@ -1,187 +1,84 @@
-# NAS 照片回忆
+# photo-memories
 
-> 本地化搭建的照片回忆系统，用它来唤醒 NAS 沉睡的照片。
+本项目是一个本地照片回忆库：扫描 NAS 或本地照片，生成缩略图、索引、标签和回忆卡片，帮助重新发现沉睡照片。
 
-你的 NAS 里躺着几万张照片，却很少翻看。这个项目用 LLM 自动分类文件夹、AI 识别生成回忆，以瀑布流的方式把照片重新呈现给你——一切都在本地运行，数据不离开你的硬盘。
+## 产品定位
 
-## 功能特点
+- 所有照片默认都有回忆价值。
+- AI 识图只负责打标签，不负责筛选或排除。
+- 成人、写真、截图、生活照不默认排除。
+- 重复、损坏是状态问题，不是内容排除。
+- 特殊回忆是类似苹果相册 Memories 的卡片堆叠，不是简单 tag group。
 
-- 🔍 **极速扫描** — Everything 搜索引擎集成，6 万+文件秒级发现；无 Everything 时自动回退 os.walk
-- 🤖 **LLM 智能分类** — DeepSeek API 自动将文件夹归为生活照片 / 拍摄样片
-- 🧠 **AI 识别** — SigLIP 语义标签、DeepFace 人脸聚类、YOLOv8 目标检测（均基于缩略图，onnxruntime 推理）
-- 💭 **回忆生成** — 那年今日、近期回忆、特殊日期回忆、文件夹回忆，多类型卡片堆叠展示
-- 🖼️ **瀑布流浏览** — 虚拟滚动 + 懒加载缩略图，万级照片流畅展示，循环洗牌不重复
-- 📅 **时间线视图** — 按拍摄时间浏览全部照片
-- ✨ **特殊回忆** — 节日回忆、文件夹回忆等多类型卡片堆叠，初期自动填充
-- 🔒 **完全本地** — 照片、缩略图、数据库全部存储在本地，仅 LLM 调用需要联网
-
-## 快速开始
-
-### 环境依赖
+## 环境
 
 - Python 3.10+
-- [DeepSeek API Key](https://platform.deepseek.com/)（用于分类和回忆生成）
-- Windows（Everything 集成为可选）
+- Windows
+- SQLite
+- 可选：Everything / `es.exe`
+- 可选：SigLIP 依赖（仅增强标签，不阻塞基础流程）
 
-### 安装
+## 安装
 
 ```bash
-git clone https://github.com/chengshiwu619/photo-memories.git
+git clone <repo>
 cd photo-memories
 pip install -r requirements.txt
 ```
 
-### 启动
+## 启动
 
 ```bash
 python main.py ui
 ```
 
-首次启动会弹出配置窗口，填写：
-- **照片库路径** — NAS 照片存放路径（如 `Y:\`），支持分号分隔多路径
-- **缓存数据路径** — 数据库和缩略图存储路径
-- **DeepSeek API Key** — `sk-...`
+首次启动需要配置：
 
-启动后自动执行：文件扫描 → LLM 分类 → 缩略图生成 → 回忆发现，无需手动操作。
+- 照片目录
+- 缓存目录
+- API Key（仅在需要 LLM 分类/生成时）
 
-## Everything 集成（可选但强烈推荐）
+## 常用命令
 
-项目内置 Everything 命令行集成，用于极速文件扫描。
-
-### 配置步骤
-
-1. 下载 [Everything 1.5a 便携版 64位](https://www.voidtools.com/forum/viewtopic.php?t=9787)
-2. 将 `Everything64.exe` 放入 `everything/` 目录
-3. **以管理员身份运行** `Everything64.exe`（首次需管理员权限创建 NTFS 索引）
-4. 前往 **工具 → 选项 → NTFS**，对目标盘勾选「包含在数据库中」
-5. 如果是网络盘（NAS/SMB），前往 **工具 → 选项 → 文件夹**，添加为强制索引
-6. 等待索引完成，后续启动时 `launch.bat` 会自动启动 Everything
-
-无 Everything 时自动回退到 `os.walk` 遍历 + 文件列表缓存。
-
-## 项目结构
-
-```
-├── business/                # 业务层
-│   ├── classifier/          # LLM 文件夹分类 + 关键词精分类
-│   ├── indexer/             # 照片索引 & 缩略图生成 & 感知哈希去重
-│   ├── memory/              # 回忆发现（那年今日/近期/特殊日期/文件夹）
-│   ├── scanner/             # 文件扫描（Everything / os.walk）
-│   └── image_recognition/   # AI 识别（场景聚类/人脸/目标检测）
-├── infra/                   # 基础设施层
-│   ├── db/repositories/     # 数据仓库（FilesRepo/MemoriesRepo/...）
-│   ├── image/               # 缩略图加载/CLIP编码/人脸检测/目标检测
-│   └── llm/                 # LLM 客户端（DeepSeek/OpenAI 兼容）
-├── core/                    # 核心层
-│   ├── models.py            # 数据模型定义
-│   └── checkpoint_manager.py # 长任务断点持久化
-├── services/                # 服务层
-│   └── background_task_manager.py # 后台任务管理
-├── ui/                      # UI 层
-│   ├── app.py               # 主窗口
-│   ├── components/          # 瀑布流/侧边栏/图片查看器/特殊回忆/时间线
-│   └── recommendation.py    # 照片排序 & 间隔算法
-├── config.py                # 配置管理（Pydantic Settings + .env）
-├── db_manager.py            # 数据库管理（SQLite + WAL + 自动迁移）
-├── logger_setup.py          # 日志系统
-└── main.py                  # 入口
-```
-
-## 技术栈
-
-- **UI**: PyQt6 + 虚拟瀑布流（QScrollArea + 动态卡片）+ 异步原图加载
-- **LLM**: DeepSeek API（文件夹分类 + 回忆生成）
-- **AI 识别**: SigLIP/OpenCLIP（语义标签）+ DeepFace（人脸聚类）+ LibreYOLO ONNX（目标检测）
-- **扫描**: Everything CLI / os.walk
-- **数据库**: SQLite + WAL 模式 + 版本自动迁移
-- **缩略图**: Pillow + EXIF 自动旋转 + 感知哈希去重
-- **配置**: Pydantic Settings + .env
-
-## 测试
-
-```bash
-python -m pytest tests/test_config.py
-```
-
-## 维护：手动完整性检查
+完整性检查：
 
 ```bash
 python scripts/check_integrity.py
-python scripts/check_integrity.py --db-path D:\photo-memories-cache\photos.db --json
 python scripts/check_integrity.py --db-path D:\photo-memories-cache\photos.db --with-repair-plan
-python scripts/check_integrity.py --db-path D:\photo-memories-cache\photos.db --with-repair-plan --show-zero
 ```
 
-该命令默认是 dry-run，只输出完整性报告，并隐藏 `count=0` 的文本检查项；`--show-zero` 可查看完整检查项。`--with-repair-plan` 只生成建议动作，不会自动修复或修改照片、缓存、数据库。
-如果怀疑还在使用旧缩略图缓存，可查看报告中的 `thumbnail_cache_version_missing`、`thumbnail_cache_version_stale`、`thumbnail_file_missing` 等检查项。
-
-## 维护：缩略图维护工具
+缩略图维护：
 
 ```bash
-python scripts/maintain_thumbnails.py
-python scripts/maintain_thumbnails.py --db-path D:\photo-memories-cache\photos.db --retry-failed
-python scripts/maintain_thumbnails.py --db-path D:\photo-memories-cache\photos.db --retry-failed --apply
-python scripts/maintain_thumbnails.py --db-path D:\photo-memories-cache\photos.db --migrate-signature
-python scripts/maintain_thumbnails.py --db-path D:\photo-memories-cache\photos.db --migrate-signature --apply
-```
-
-该命令默认是 dry-run，只输出缩略图状态、重试计划或签名迁移计划，不会修改数据库或缓存。只有显式传入 `--apply` 时，才会对少量 `__FAILED__` 记录尝试重试，或仅更新 `thumbnail_params.thumbnail_sig`。
-历史签名如 `600x600_q90` 会被识别为旧缓存签名并提示迁移，但启动时不会仅因为旧签名就自动删除缩略图文件或清空 `photo_metadata.thumbnail_path`。
-
-真实操作建议顺序：
-
-```bash
-python scripts/check_integrity.py --db-path D:\photo-memories-cache\photos.db --with-repair-plan
 python scripts/maintain_thumbnails.py --db-path D:\photo-memories-cache\photos.db --retry-failed
 python scripts/maintain_thumbnails.py --db-path D:\photo-memories-cache\photos.db --retry-failed --file-id 1072
 ```
 
-1. 先运行 `check_integrity` 看总体状态。
-2. 再运行 `maintain_thumbnails --retry-failed` 做 failed 根因诊断。
-3. 如果诊断多数是路径、NAS、不可访问问题，先修路径或重新索引，不要直接 `--apply`。
-4. 如果 `retry_recommended=true`，先备份 `photos.db`。
-5. 先对单个 `file_id` 执行 `--apply`。
-6. 单个成功后，再用 `--limit 5 --apply` 小批量推进。
-7. 处理后再运行 `check_integrity` 复查。
-8. `thumbnail_failed` 清零后，再考虑 `migrate-signature --apply`。
-9. 最后再启动程序验证 UI。
-
-默认 `workers=2`、`batch_size=10`。dry-run 和 JSON 输出都会显示本次将使用的并发参数、每个 `file_id` 的诊断字段，以及建议的 `next_steps`。
-
-后台照片索引现在支持保守并发：worker 线程只负责图片读取、缩略图生成和元数据提取，SQLite 写入与 checkpoint 仍保持串行。NAS/SMB 默认建议 `workers=2`；如果遇到 NAS 压力、解码异常或索引不稳定，可回退到 `workers=1`。
-
-## 缁存姢锛欰I 璇嗗埆灏忔壒閲忛獙璇?
-
-```bash
-python scripts/run_ai_recognition.py --limit 10 --dry-run
-python scripts/run_ai_recognition.py --limit 10 --apply
-python scripts/run_ai_recognition.py --limit 50 --apply
-```
-
-鎺ㄨ崘椤哄簭锛?
-1. 鍏堢敤 `--limit 10 --dry-run` 鍙煡鐪嬪皢瑕佽瘑鍒殑 `file_id`锛屼笉鍔犺浇妯″瀷銆佷笉鍐欐暟鎹簱銆?
-2. 鍐嶇敤 `--limit 10 --apply` 鍋氫竴娆″皬鎵归噺 SigLIP 鏍囩楠岃瘉锛岀‘璁?`photo_tags` 鍐欏叆姝ｅ父銆?
-3. 纭缁撴灉绋冲畾鍚庯紝鍐嶆墿澶у埌 `--limit 50 --apply`銆?
-4. 涓嶈涓€寮€濮嬪氨鐩存帴鍋氬叏閲忚瘑鍒€?
-
-## 缁存姢锛欰I 鏍囩绯荤粺
-
-AI 璇嗗浘鍦ㄨ繖涓」鐩腑鐨勫畾浣嶆槸鈥滄爣绛剧郴缁熲€濓紝涓嶆槸鈥滅瓫閫夌郴缁熲€濄€?
-鎵€鏈夌収鐗囬粯璁ら兘鏈夊洖蹇嗕环鍊硷紝鏍囩鐢ㄤ簬鍚岀被鍥炲繂銆佺壒娈婂洖蹇嗗垎缁勩€佹悳绱㈠拰鑱氬悎锛涢噸澶嶅拰鎹熷潖鏄姸鎬侀棶棰橈紝涓嶆槸鍐呭鎺掗櫎銆?
-
-鎺ㄨ崘鍏堣窇绋冲畾鐨?path 鏍囩锛?
+基础 path 标签：
 
 ```bash
 python scripts/run_ai_labeling.py --db-path D:\photo-memories-cache\photos.db --source path --limit 50 --dry-run
 python scripts/run_ai_labeling.py --db-path D:\photo-memories-cache\photos.db --source path --limit 50 --apply
 ```
 
-SigLIP 鏄彲閫夌殑澧炲己鏍囩鏉ユ簮锛屼笉搴旈樆濉炲熀纭€ path 鏍囩娴佺▼銆?涓嶈涓€寮€濮嬪氨鍏ㄩ噺璺戙€?
+path 标签审计：
 
-path 閺嶅洨顒峰厛浠ヤ欢澶广€佺洰褰曘€佹潵婧愮洰褰曚綔涓虹矖绮掑害鏍囩鏉ユ簮锛屼絾浼氳繃婊ゅ閲忚瘝銆佺紪鍙锋畫鐗囥€侀€氱敤鏍圭洰褰曡瘝锛堝 `2.79GB`銆乣2050P+28V`銆乣p-3`銆乣photos`锛夛紝apply 鍙啓鍏?`cleaned_tags`銆俤ry-run 浼氬悓鏃惰緭鍑?`raw_tags`銆乣cleaned_tags` 鍜?`filtered_tags`锛屾柟渚夸汉宸ユ鏌ユ爣绛捐川閲忋€?
-濡傛灉搴撻噷杩樻湁鏃╂湡宸插啓鍏ョ殑 path 鍣０鏍囩锛堝 `no`銆乣gb`銆乣waxzml`銆乣mobile`銆乣dcim`銆乣p-3`锛夛紝鍙厛鐢?`python scripts/run_ai_labeling.py --db-path ... --source path --cleanup-noise --dry-run` 鏌ョ湅灏嗚娓呯悊鐨勬爣绛惧拰鏍锋湰 `file_id`锛屽啀鐢?`--apply` 鍙垹闄?`photo_tags` 涓?`source='path'` 鐨勮繖浜涙棫鍣０鏍囩锛屼笉浼氬奖鍝?`siglip` 绛夊叾浠栨潵婧愩€?
-濡傛灉瑕佷负鍚庣画 LLM 鏍囩娓呮礂鍋氬噯澶囷紝鍏堢敤鍙瀹¤鍛戒护瀵?`photo_tags(source='path')` 鍋?top N 缁熻銆佹牱鏈?`file_id`/璺緞鍜岀矖鍒嗙被锛氬 `python scripts/audit_path_tags.py --db-path ... --source path --top 200 --json`銆傚璁″鍑哄寘鍚?`tag`銆乢ount`銆乣distinct_file_count`銆乻ample_file_ids`銆乻ample_paths`銆乢urrent_source`銆乬uessed_type`锛屽彲鐢ㄤ簬鍚庣画涓€娆℃€х粰 LLM 鍒ゆ柇鍝簺鏍囩淇濈暀銆佸垹闄ゃ€侀噸鍛藉悕鎴栧悎骞躲€傛湰姝ヤ笉鍐欐暟鎹簱銆佷笉鑱旂綉銆?
+```bash
+python scripts/audit_path_tags.py --db-path D:\photo-memories-cache\photos.db --source path --top 200
+python scripts/audit_path_tags.py --db-path D:\photo-memories-cache\photos.db --source path --top 200 --json
+```
 
-## License
+## 文档入口
 
-[MIT](LICENSE)
+维护入口统一看：
+
+- [项目文档/AGENTS.md](<项目文档/AGENTS.md>)
+- [项目文档/项目架构.md](<项目文档/项目架构.md>)
+- [项目文档/项目状态.md](<项目文档/项目状态.md>)
+- [项目文档/项目记忆.md](<项目文档/项目记忆.md>)
+
+## 当前建议
+
+- 先做缩略图内容识别和视觉标签生产。
+- 当前不要做 UI 大改、schema 改动、全量 SigLIP、人脸识别、YOLO 全量化。
+- 不要一开始就跑全量识别或全量重建。
