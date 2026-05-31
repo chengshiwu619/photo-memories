@@ -1,8 +1,10 @@
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import sqlite3
 import sys
+import threading
 from typing import Any, Dict, List, Optional
 
 
@@ -89,6 +91,52 @@ def _update_thumbnail_signature(conn: sqlite3.Connection, signature: str) -> int
     return 1
 
 
+def _make_file_result(
+    file_id: int,
+    source_path: str,
+    target_path: str,
+    status: str,
+    error: Optional[str] = None,
+) -> Dict[str, Any]:
+    result = {
+        "file_id": file_id,
+        "source_path": source_path,
+        "target_path": target_path,
+        "status": status,
+    }
+    if error:
+        result["error"] = error
+    return result
+
+
+def _retry_failed_thumbnail_worker(item: Dict[str, Any], thumbnail_size: Any) -> Dict[str, Any]:
+    file_result = _make_file_result(
+        file_id=item["file_id"],
+        source_path=item["file_path"],
+        target_path=item["target_thumbnail_path"],
+        status="planned",
+    )
+    if not os.path.isfile(item["file_path"]):
+        file_result["status"] = "skipped"
+        file_result["error"] = "source file missing"
+        return file_result
+
+    try:
+        create_thumbnail_file(
+            item["file_path"],
+            item["target_thumbnail_path"],
+            thumbnail_size=thumbnail_size,
+            quality=THUMBNAIL_JPEG_QUALITY,
+        )
+    except Exception as exc:
+        file_result["status"] = "failed"
+        file_result["error"] = str(exc)
+        return file_result
+
+    file_result["status"] = "succeeded"
+    return file_result
+
+
 def run_thumbnail_maintenance(
     db_path: Optional[str] = None,
     limit: int = 20,
@@ -96,7 +144,11 @@ def run_thumbnail_maintenance(
     retry_failed: bool = False,
     migrate_signature: bool = False,
     apply: bool = False,
+    workers: int = 2,
+    batch_size: int = 10,
 ) -> Dict[str, Any]:
+    workers = max(int(workers), 1)
+    batch_size = max(int(batch_size), 1)
     if not db_path:
         from config import get_settings
 
@@ -143,7 +195,10 @@ def run_thumbnail_maintenance(
         "failed": 0,
         "skipped": 0,
         "db_updated": 0,
+        "workers": workers,
+        "batch_size": batch_size,
         "warnings": [],
+        "file_results": [],
         "operations": {},
     }
 
@@ -164,42 +219,80 @@ def run_thumbnail_maintenance(
             selected_rows = _get_failed_rows(conn, settings, limit=limit, file_ids=file_ids)
             result["found"] += total_failed
             result["selected"] += len(selected_rows)
+            planned_results = [
+                _make_file_result(
+                    file_id=row["file_id"],
+                    source_path=row["file_path"],
+                    target_path=row["target_thumbnail_path"],
+                    status="planned",
+                )
+                for row in selected_rows
+            ]
+            result["file_results"].extend(planned_results)
             result["operations"]["retry_failed"] = {
                 "found": total_failed,
                 "selected": selected_rows,
+                "results": planned_results,
             }
             if apply:
-                for row in selected_rows:
-                    result["attempted"] += 1
-                    file_path = row["file_path"]
-                    file_id = row["file_id"]
-                    target_path = row["target_thumbnail_path"]
-                    if not os.path.isfile(file_path):
-                        result["skipped"] += 1
-                        result["warnings"].append(f"file_id={file_id} source file missing")
-                        continue
-                    try:
-                        create_thumbnail_file(
-                            file_path,
-                            target_path,
-                            thumbnail_size=settings.thumbnail_size,
-                            quality=THUMBNAIL_JPEG_QUALITY,
-                        )
-                    except Exception as exc:
-                        result["failed"] += 1
-                        result["warnings"].append(f"file_id={file_id} retry failed: {exc}")
-                        continue
+                result["file_results"] = []
+                result["operations"]["retry_failed"]["results"] = result["file_results"]
+                result["operations"]["retry_failed"]["workers"] = workers
+                result["operations"]["retry_failed"]["batch_size"] = batch_size
+                result["operations"]["retry_failed"]["db_write_thread_id"] = threading.get_ident()
+                for start in range(0, len(selected_rows), batch_size):
+                    batch_rows = selected_rows[start:start + batch_size]
+                    worker_results_by_file_id: Dict[int, Dict[str, Any]] = {}
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        future_map = {
+                            executor.submit(
+                                _retry_failed_thumbnail_worker,
+                                row,
+                                settings.thumbnail_size,
+                            ): row["file_id"]
+                            for row in batch_rows
+                        }
+                        for future in as_completed(future_map):
+                            worker_result = future.result()
+                            worker_results_by_file_id[worker_result["file_id"]] = worker_result
 
-                    conn.execute(
-                        "UPDATE photo_metadata SET thumbnail_path = ? WHERE file_id = ? AND thumbnail_path = '__FAILED__'",
-                        (target_path, file_id),
-                    )
-                    if conn.execute(
-                        "SELECT thumbnail_path FROM photo_metadata WHERE file_id = ?",
-                        (file_id,),
-                    ).fetchone()[0] == target_path:
-                        result["db_updated"] += 1
-                    result["succeeded"] += 1
+                    for row in batch_rows:
+                        file_id = row["file_id"]
+                        target_path = row["target_thumbnail_path"]
+                        file_result = worker_results_by_file_id[file_id]
+                        result["attempted"] += 1
+
+                        if file_result["status"] == "skipped":
+                            result["skipped"] += 1
+                            result["warnings"].append(
+                                f"file_id={file_id} {file_result.get('error', 'skipped')}"
+                            )
+                            result["file_results"].append(file_result)
+                            continue
+
+                        if file_result["status"] == "failed":
+                            result["failed"] += 1
+                            result["warnings"].append(
+                                f"file_id={file_id} retry failed: {file_result.get('error', 'unknown error')}"
+                            )
+                            result["file_results"].append(file_result)
+                            continue
+
+                        cursor = conn.execute(
+                            "UPDATE photo_metadata SET thumbnail_path = ? WHERE file_id = ? AND thumbnail_path = '__FAILED__'",
+                            (target_path, file_id),
+                        )
+                        if cursor.rowcount:
+                            result["db_updated"] += cursor.rowcount
+                            result["succeeded"] += 1
+                            result["file_results"].append(file_result)
+                            continue
+
+                        file_result["status"] = "failed"
+                        file_result["error"] = "database update skipped because record was no longer marked __FAILED__"
+                        result["failed"] += 1
+                        result["warnings"].append(f"file_id={file_id} {file_result['error']}")
+                        result["file_results"].append(file_result)
 
         if migrate_signature:
             can_migrate = missing_count == 0
@@ -253,6 +346,8 @@ def format_maintenance_text(result: Dict[str, Any]) -> str:
         f"failed: {result['failed']}",
         f"skipped: {result['skipped']}",
         f"db_updated: {result['db_updated']}",
+        f"workers: {result['workers']}",
+        f"batch_size: {result['batch_size']}",
     ]
     if result.get("suggested_action_summary"):
         lines.append("suggested actions:")
@@ -264,6 +359,16 @@ def format_maintenance_text(result: Dict[str, Any]) -> str:
             lines.append(
                 f"- file_id={item['file_id']} source={item['file_path']} target={item['target_thumbnail_path']}"
             )
+    if result.get("file_results"):
+        lines.append("per-file results:")
+        for item in result["file_results"]:
+            line = (
+                f"- file_id={item['file_id']} status={item['status']} "
+                f"source={item['source_path']} target={item['target_path']}"
+            )
+            if item.get("error"):
+                line += f" error={item['error']}"
+            lines.append(line)
     if result.get("operations", {}).get("migrate_signature"):
         op = result["operations"]["migrate_signature"]
         lines.append("migrate_signature plan:")
@@ -286,6 +391,8 @@ def parse_args(argv=None):
     parser.add_argument("--file-id", type=int, action="append", dest="file_ids", help="Restrict maintenance to specific file_id values.")
     parser.add_argument("--retry-failed", action="store_true", help="Plan or retry __FAILED__ thumbnail rows.")
     parser.add_argument("--migrate-signature", action="store_true", help="Plan or apply thumbnail_sig migration only.")
+    parser.add_argument("--workers", type=int, default=2, help="Worker threads for small-batch retry-failed generation. Minimum 1.")
+    parser.add_argument("--batch-size", type=int, default=10, help="Batch size for retry-failed processing. Minimum 1.")
     parser.add_argument("--apply", action="store_true", help="Actually write DB updates / generate thumbnails. Omit for dry-run.")
     parser.add_argument("--json", action="store_true", dest="json_output", help="Print structured JSON output only.")
     return parser.parse_args(argv)
@@ -300,6 +407,8 @@ def main(argv=None):
         retry_failed=args.retry_failed,
         migrate_signature=args.migrate_signature,
         apply=args.apply,
+        workers=max(args.workers, 1),
+        batch_size=max(args.batch_size, 1),
     )
     if args.json_output:
         print(json.dumps(result, ensure_ascii=False, indent=2))

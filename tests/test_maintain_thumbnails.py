@@ -3,6 +3,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 
 from scripts.maintain_thumbnails import run_thumbnail_maintenance
 
@@ -125,6 +126,8 @@ def test_default_dry_run_does_not_write_database_or_files(tmp_path):
     assert result["dry_run"] is True
     assert result["db_updated"] == 0
     assert result["attempted"] == 0
+    assert result["workers"] == 2
+    assert result["batch_size"] == 10
     assert thumb_value == "__FAILED__"
     assert not missing_target.exists()
 
@@ -140,13 +143,23 @@ def test_retry_failed_dry_run_only_lists_plan(tmp_path):
     db_path = cache_dir / "photos.db"
     _create_thumbnail_maintenance_db(str(db_path), str(source_dir), str(thumb_dir), failed_file_ids={1, 2})
 
-    result = run_thumbnail_maintenance(db_path=str(db_path), retry_failed=True, limit=1)
+    result = run_thumbnail_maintenance(
+        db_path=str(db_path),
+        retry_failed=True,
+        limit=1,
+        workers=3,
+        batch_size=4,
+    )
     plan = result["operations"]["retry_failed"]
 
     assert result["dry_run"] is True
+    assert result["workers"] == 3
+    assert result["batch_size"] == 4
     assert plan["found"] == 2
     assert len(plan["selected"]) == 1
     assert result["db_updated"] == 0
+    assert result["file_results"][0]["status"] == "planned"
+    assert result["file_results"][0]["file_id"] == 1
 
 
 def test_retry_failed_apply_updates_thumbnail_path_on_success(tmp_path, monkeypatch):
@@ -158,7 +171,9 @@ def test_retry_failed_apply_updates_thumbnail_path_on_success(tmp_path, monkeypa
     source_dir.mkdir()
 
     source_path = source_dir / "source-1.jpg"
+    second_source_path = source_dir / "source-2.jpg"
     _write_test_image(source_path)
+    _write_test_image(second_source_path)
     db_path = cache_dir / "photos.db"
     _create_thumbnail_maintenance_db(str(db_path), str(source_dir), str(thumb_dir), failed_file_ids={1})
 
@@ -184,6 +199,9 @@ def test_retry_failed_apply_updates_thumbnail_path_on_success(tmp_path, monkeypa
     assert result["db_updated"] == 1
     assert target_path.exists()
     assert thumb_value == str(target_path)
+    assert result["file_results"][0]["status"] == "succeeded"
+    assert result["workers"] == 2
+    assert result["batch_size"] == 10
 
 
 def test_retry_failed_apply_skips_missing_source_and_keeps_failed_marker(tmp_path):
@@ -207,6 +225,45 @@ def test_retry_failed_apply_skips_missing_source_and_keeps_failed_marker(tmp_pat
     assert result["skipped"] == 1
     assert result["db_updated"] == 0
     assert thumb_value == "__FAILED__"
+    assert result["file_results"][0]["status"] == "skipped"
+    assert result["file_results"][0]["error"] == "source file missing"
+
+
+def test_retry_failed_apply_generation_exception_keeps_failed_marker(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "cache"
+    thumb_dir = cache_dir / "thumbnails"
+    source_dir = tmp_path / "sources"
+    cache_dir.mkdir()
+    thumb_dir.mkdir(parents=True)
+    source_dir.mkdir()
+
+    source_path = source_dir / "source-1.jpg"
+    second_source_path = source_dir / "source-2.jpg"
+    _write_test_image(source_path)
+    _write_test_image(second_source_path)
+    db_path = cache_dir / "photos.db"
+    _create_thumbnail_maintenance_db(str(db_path), str(source_dir), str(thumb_dir), failed_file_ids={1})
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("decoder blew up")
+
+    monkeypatch.setattr(
+        "scripts.maintain_thumbnails.create_thumbnail_file",
+        _boom,
+    )
+
+    result = run_thumbnail_maintenance(db_path=str(db_path), retry_failed=True, apply=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        thumb_value = conn.execute("SELECT thumbnail_path FROM photo_metadata WHERE file_id = 1").fetchone()[0]
+    finally:
+        conn.close()
+
+    assert result["failed"] == 1
+    assert result["db_updated"] == 0
+    assert thumb_value == "__FAILED__"
+    assert result["file_results"][0]["status"] == "failed"
+    assert "decoder blew up" in result["file_results"][0]["error"]
 
 
 def test_limit_and_file_id_filter_only_select_requested_failed_rows(tmp_path):
@@ -243,6 +300,92 @@ def test_non_failed_records_are_not_retried(tmp_path):
 
     assert result["operations"]["retry_failed"]["found"] == 0
     assert result["selected"] == 0
+
+
+def test_workers_and_batch_size_are_clamped_to_minimum_one(tmp_path):
+    cache_dir = tmp_path / "cache"
+    thumb_dir = cache_dir / "thumbnails"
+    source_dir = tmp_path / "sources"
+    cache_dir.mkdir()
+    thumb_dir.mkdir(parents=True)
+    source_dir.mkdir()
+
+    db_path = cache_dir / "photos.db"
+    _create_thumbnail_maintenance_db(str(db_path), str(source_dir), str(thumb_dir), failed_file_ids={1})
+
+    result = run_thumbnail_maintenance(
+        db_path=str(db_path),
+        retry_failed=True,
+        workers=0,
+        batch_size=0,
+    )
+
+    assert result["workers"] == 1
+    assert result["batch_size"] == 1
+
+
+def test_database_updates_stay_on_main_thread(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "cache"
+    thumb_dir = cache_dir / "thumbnails"
+    source_dir = tmp_path / "sources"
+    cache_dir.mkdir()
+    thumb_dir.mkdir(parents=True)
+    source_dir.mkdir()
+
+    source_path = source_dir / "source-1.jpg"
+    second_source_path = source_dir / "source-2.jpg"
+    _write_test_image(source_path)
+    _write_test_image(second_source_path)
+    db_path = cache_dir / "photos.db"
+    _create_thumbnail_maintenance_db(str(db_path), str(source_dir), str(thumb_dir), failed_file_ids={1, 2})
+
+    execute_thread_ids = []
+    real_connect = sqlite3.connect
+    main_thread_id = threading.get_ident()
+
+    class RecordingConnection:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, *args, **kwargs):
+            execute_thread_ids.append(threading.get_ident())
+            return self._conn.execute(*args, **kwargs)
+
+        def commit(self):
+            return self._conn.commit()
+
+        def close(self):
+            return self._conn.close()
+
+        @property
+        def row_factory(self):
+            return self._conn.row_factory
+
+        @row_factory.setter
+        def row_factory(self, value):
+            self._conn.row_factory = value
+
+    def _recording_connect(*args, **kwargs):
+        return RecordingConnection(real_connect(*args, **kwargs))
+
+    def _fake_create_thumbnail_file(source_path, target_path, thumbnail_size, quality):
+        _write_test_image(target_path)
+        return (16, 16)
+
+    monkeypatch.setattr("scripts.maintain_thumbnails.sqlite3.connect", _recording_connect)
+    monkeypatch.setattr("scripts.maintain_thumbnails.create_thumbnail_file", _fake_create_thumbnail_file)
+
+    result = run_thumbnail_maintenance(
+        db_path=str(db_path),
+        retry_failed=True,
+        apply=True,
+        workers=2,
+        batch_size=1,
+    )
+
+    assert result["db_updated"] == 2
+    assert execute_thread_ids
+    assert all(thread_id == main_thread_id for thread_id in execute_thread_ids)
 
 
 def test_migrate_signature_dry_run_does_not_write_database(tmp_path):
@@ -351,3 +494,7 @@ def test_json_output_is_valid(tmp_path):
 
     assert payload["mode"] == "retry_failed"
     assert payload["dry_run"] is True
+    assert payload["workers"] == 2
+    assert payload["batch_size"] == 10
+    assert payload["file_results"][0]["status"] == "planned"
+    assert payload["file_results"][0]["file_id"] == 1
