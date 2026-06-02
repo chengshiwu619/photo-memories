@@ -12,6 +12,9 @@ ES_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 FALLBACK_ES = os.path.join(os.environ.get("TEMP", os.path.expanduser("~")), "es_tool", "es.exe")
 
 _ES_INSTANCE = None
+_BAD_PATH_COUNT = 0
+_BAD_PATH_SAMPLES = []
+BAD_PATH_SAMPLE_LIMIT = 10
 
 _db = Database()
 _cp = CheckpointManager(_db, "scan")
@@ -111,6 +114,23 @@ def _run_es(args, timeout=120):
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         logger.warning(f"es.exe 调用失败: {e}")
         return "", -1
+
+
+def _reset_bad_path_stats():
+    global _BAD_PATH_COUNT, _BAD_PATH_SAMPLES
+    _BAD_PATH_COUNT = 0
+    _BAD_PATH_SAMPLES = []
+
+
+def _record_bad_path_sample(filepath, reason):
+    global _BAD_PATH_COUNT
+    _BAD_PATH_COUNT += 1
+    if len(_BAD_PATH_SAMPLES) < BAD_PATH_SAMPLE_LIMIT:
+        _BAD_PATH_SAMPLES.append({"path": filepath, "reason": reason})
+
+
+def _get_bad_path_stats():
+    return _BAD_PATH_COUNT, list(_BAD_PATH_SAMPLES)
 
 
 _drive_mappings_cache = None
@@ -239,8 +259,65 @@ def _match_source_dir(filepath):
     return None
 
 
+def _file_list_cache_path(settings=None):
+    _s = settings or get_settings()
+    return os.path.join(_s.photo_data_dir, "filelist.txt")
+
+
+def _source_cache_keys(settings=None):
+    _s = settings or get_settings()
+    keys = {os.path.normpath(_s.source_drive)}
+    keys.update(os.path.normpath(p) for p in _s.source_dirs)
+    return keys
+
+
+def load_cached_file_list(settings=None):
+    _s = settings or get_settings()
+    list_file = _file_list_cache_path(_s)
+    if not os.path.exists(list_file):
+        return None
+
+    with open(list_file, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    if not lines:
+        return None
+
+    header_prefix = "# SOURCE_DRIVE="
+    header = lines[0].strip()
+    if not header.startswith(header_prefix):
+        return None
+
+    cached_source = os.path.normpath(header[len(header_prefix):])
+    if cached_source not in _source_cache_keys(_s):
+        logger.info("缓存文件列表来源不匹配当前 SOURCE_DRIVE, 重新扫描")
+        return None
+
+    paths = []
+    skipped = 0
+    for line in lines[1:]:
+        path = os.path.normpath(line.rstrip("\n"))
+        if not path.strip():
+            continue
+        if "\ufffd" in path or "?" in path:
+            skipped += 1
+            continue
+        paths.append(path)
+
+    if skipped:
+        logger.warning(f"缓存文件列表跳过 {skipped} 个编码损坏路径")
+    if paths:
+        logger.info(f"使用缓存文件列表: {len(paths)} 个文件")
+        return paths
+    return None
+
+
 def _list_all_image_files():
     _s = get_settings()
+    cached = load_cached_file_list(_s)
+    if cached:
+        return cached
+
     list_file = os.path.join(_s.photo_data_dir, "filelist.txt")
     if os.path.exists(list_file):
         with open(list_file, "r", encoding="utf-8") as f:
@@ -296,12 +373,11 @@ def _list_all_image_files():
 
 def _parse_es_csv(text):
     files = []
-    skipped = 0
     for line in text.strip().split("\n"):
         line = line.strip()
         filepath = line.strip("\"")
         if "\ufffd" in filepath or "?" in filepath:
-            skipped += 1
+            _record_bad_path_sample(filepath, "encoding_damaged")
             continue
         sd = _match_source_dir(filepath)
         if sd is None:
@@ -310,8 +386,6 @@ def _parse_es_csv(text):
         ext = os.path.splitext(filepath)[1].lower()
         if ext in ALL_EXTENSIONS:
             files.append(filepath)
-    if skipped:
-        logger.warning(f"跳过 {skipped} 个编码损坏的文件路径")
     return files
 
 
@@ -350,6 +424,295 @@ def _walk_files():
     os.replace(tmp_file, list_file)
     logger.info(f"文件列表已缓存: {list_file}, 共 {len(file_list)} 个")
     return file_list
+
+
+def normalize_path_identity(filepath):
+    path = os.path.normpath(str(filepath or "")).replace("/", "\\")
+    if path.startswith("\\\\?\\UNC\\"):
+        path = "\\" + path[7:]
+    elif path.startswith("\\\\?\\"):
+        path = path[4:]
+    return path.rstrip("\\").casefold()
+
+
+def _canonicalize_discovered_path(filepath):
+    path = os.path.normpath(filepath)
+    sd = _match_source_dir(path)
+    if sd is not None:
+        path = _normalize_filepath(path, sd)
+    return os.path.normpath(path)
+
+
+def _iter_walk_files(limit=None, verbose=False):
+    _s = get_settings()
+    yielded = 0
+    for source_dir in _s.source_dirs:
+        if not os.path.isdir(source_dir):
+            logger.warning(f"照片库路径不存在, 跳过: {source_dir}")
+            continue
+        for root, dirs, files in os.walk(source_dir):
+            for fname in files:
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in ALL_EXTENSIONS:
+                    if verbose:
+                        logger.debug(f"跳过非媒体扩展名: {os.path.join(root, fname)}")
+                    continue
+                yield _canonicalize_discovered_path(os.path.join(root, fname))
+                yielded += 1
+                if limit and yielded >= limit:
+                    return
+
+
+def _discover_incremental_files(limit=None, prefer_everything=True, verbose=False, es_timeout=None):
+    _reset_bad_path_stats()
+    if prefer_everything:
+        inst = _detect_instance()
+        if inst != "__FAIL__":
+            ext_list = [e.lstrip(".") for e in ALL_EXTENSIONS]
+            ext_query = "ext:%s" % ";".join(ext_list)
+            logger.info("增量扫描 Everything 查询: %s" % ext_query)
+            timeout = es_timeout or getattr(get_settings(), "everything_timeout_seconds", 20)
+            out, code = _run_es(["-csv", "-no-header", ext_query], timeout=timeout)
+            if code == 0 and out:
+                files = _parse_es_csv(out)
+                if files:
+                    files = [_canonicalize_discovered_path(fp) for fp in files]
+                    if limit:
+                        files = files[:limit]
+                    logger.info("增量扫描 Everything 返回 %s 个媒体文件" % len(files))
+                    return files, "everything"
+                if verbose:
+                    logger.info("Everything 返回结果未命中配置的照片源目录, 回退目录遍历")
+            elif verbose:
+                logger.info("Everything 查询失败或为空, 回退目录遍历")
+        elif verbose:
+            logger.info("Everything IPC 不可用, 回退目录遍历")
+
+    files = list(_iter_walk_files(limit=limit, verbose=verbose))
+    logger.info("增量扫描目录遍历发现 %s 个媒体文件" % len(files))
+    return files, "walk"
+
+
+def _build_file_row(filepath, settings):
+    stat = os.stat(filepath)
+    folder = os.path.normpath(os.path.dirname(filepath))
+    source_dir = _match_source_dir(filepath)
+    if source_dir is None and settings.source_dirs:
+        source_dir = settings.source_dirs[0]
+    is_image = os.path.splitext(filepath)[1].lower() in IMAGE_EXTENSIONS
+    return {
+        "file_path": filepath,
+        "file_name": os.path.basename(filepath),
+        "folder_path": folder,
+        "folder_name": os.path.basename(folder),
+        "file_size": stat.st_size,
+        "file_mtime": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+        "file_hash": None,
+        "is_image": 1 if is_image else 0,
+        "scanned_at": datetime.now().isoformat(),
+        "source_dir": source_dir,
+    }
+
+
+def _load_existing_file_index(db):
+    existing = {}
+    with db.connect() as conn:
+        rows = conn.execute(
+            "SELECT id, file_path, file_size, file_mtime, source_dir FROM files"
+        ).fetchall()
+    for row in rows:
+        canonical_path = _canonicalize_discovered_path(row["file_path"])
+        existing[normalize_path_identity(canonical_path)] = row
+    return existing
+
+
+def incremental_scan(
+    progress_callback=None,
+    limit=None,
+    dry_run=True,
+    verbose=False,
+    prefer_everything=True,
+    db=None,
+    settings=None,
+    status_callback=None,
+    should_stop=None,
+    should_pause=None,
+    es_timeout=None,
+):
+    """Safely discover new/changed media files without deleting source files or DB rows."""
+    _s = settings or get_settings()
+    scan_db = db or _db
+    scan_db.init_tables()
+
+    logger.info(
+        "增量扫描开始: source_drive=%s limit=%s dry_run=%s prefer_everything=%s",
+        _s.source_drive,
+        limit,
+        dry_run,
+        prefer_everything,
+    )
+
+    file_list, discovery_source = _discover_incremental_files(
+        limit=limit,
+        prefer_everything=prefer_everything,
+        verbose=verbose,
+        es_timeout=es_timeout,
+    )
+    bad_path_count, bad_path_samples = _get_bad_path_stats()
+    existing = _load_existing_file_index(scan_db)
+
+    stats = {
+        "dry_run": bool(dry_run),
+        "state": "running",
+        "current_task": "scan",
+        "discovery_source": discovery_source,
+        "scanned": 0,
+        "new": 0,
+        "existing": 0,
+        "changed": 0,
+        "skipped": 0,
+        "errors": 0,
+        "db_inserted": 0,
+        "db_updated": 0,
+        "thumbnail_pending": 0,
+        "tag_pending": 0,
+        "bad_path_count": bad_path_count,
+        "batch_limit_reached": False,
+        "paused": False,
+        "stopped": False,
+        "samples": {
+            "new": [],
+            "changed": [],
+            "skipped": [],
+            "errors": [],
+            "bad_paths": bad_path_samples,
+        },
+    }
+    if limit and len(file_list) >= limit:
+        stats["batch_limit_reached"] = True
+
+    pending_inserts = []
+    pending_updates = []
+    seen_keys = set()
+
+    total = len(file_list)
+    for i, raw_path in enumerate(file_list):
+        if _cp.is_pause_or_stop_requested() or (should_stop and should_stop()):
+            stats["state"] = "paused" if _cp.is_pause_or_stop_requested() else "stopped"
+            stats["paused"] = stats["state"] == "paused"
+            stats["stopped"] = stats["state"] == "stopped"
+            logger.info("增量扫描收到暂停/停止请求: %s", stats["state"])
+            break
+        if should_pause and should_pause():
+            stats["state"] = "paused"
+            stats["paused"] = True
+            logger.info("增量扫描收到暂停请求")
+            break
+
+        filepath = _canonicalize_discovered_path(raw_path)
+        key = normalize_path_identity(filepath)
+        stats["scanned"] += 1
+
+        if key in seen_keys:
+            stats["skipped"] += 1
+            if verbose and len(stats["samples"]["skipped"]) < 10:
+                stats["samples"]["skipped"].append({"path": filepath, "reason": "duplicate_in_discovery"})
+            continue
+        seen_keys.add(key)
+
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext not in ALL_EXTENSIONS:
+            stats["skipped"] += 1
+            if verbose and len(stats["samples"]["skipped"]) < 10:
+                stats["samples"]["skipped"].append({"path": filepath, "reason": "unsupported_extension"})
+            continue
+
+        try:
+            row = _build_file_row(filepath, _s)
+        except OSError as exc:
+            stats["errors"] += 1
+            if len(stats["samples"]["errors"]) < 10:
+                stats["samples"]["errors"].append({"path": filepath, "error": str(exc)})
+            logger.warning(f"增量扫描读取文件状态失败: {filepath}: {exc}")
+            continue
+
+        old = existing.get(key)
+        if old is None:
+            stats["new"] += 1
+            stats["thumbnail_pending"] += 1 if row["is_image"] else 0
+            stats["tag_pending"] += 1 if row["is_image"] else 0
+            if len(stats["samples"]["new"]) < 10:
+                stats["samples"]["new"].append(filepath)
+            pending_inserts.append(row)
+        elif old["file_size"] != row["file_size"] or old["file_mtime"] != row["file_mtime"]:
+            stats["changed"] += 1
+            stats["thumbnail_pending"] += 1 if row["is_image"] else 0
+            stats["tag_pending"] += 1 if row["is_image"] else 0
+            if len(stats["samples"]["changed"]) < 10:
+                stats["samples"]["changed"].append(filepath)
+            pending_updates.append((row, old["id"]))
+        else:
+            stats["existing"] += 1
+            if verbose and stats["existing"] <= 10:
+                logger.debug(f"增量扫描已存在且未变化: {filepath}")
+
+        if progress_callback:
+            progress_callback(i + 1, total)
+        if status_callback:
+            status_callback(dict(stats))
+
+    if dry_run:
+        if stats["state"] == "running":
+            stats["state"] = "done"
+        logger.info("增量扫描 dry-run 完成: %s", stats)
+        return stats
+
+    with scan_db.connect() as conn:
+        for row in pending_inserts:
+            result = conn.execute(
+                """INSERT OR IGNORE INTO files
+                   (file_path, file_name, folder_path, folder_name, file_size, file_mtime,
+                    file_hash, is_image, scanned_at, source_dir)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    row["file_path"], row["file_name"], row["folder_path"], row["folder_name"],
+                    row["file_size"], row["file_mtime"], row["file_hash"], row["is_image"],
+                    row["scanned_at"], row["source_dir"],
+                ),
+            )
+            stats["db_inserted"] += result.rowcount
+
+        for row, file_id in pending_updates:
+            result = conn.execute(
+                """UPDATE files
+                   SET file_path = ?, file_name = ?, folder_path = ?, folder_name = ?,
+                       file_size = ?, file_mtime = ?, is_image = ?, scanned_at = ?, source_dir = ?
+                   WHERE id = ?""",
+                (
+                    row["file_path"], row["file_name"], row["folder_path"], row["folder_name"],
+                    row["file_size"], row["file_mtime"], row["is_image"], row["scanned_at"],
+                    row["source_dir"], file_id,
+                ),
+            )
+            stats["db_updated"] += result.rowcount
+            if row["is_image"]:
+                conn.execute(
+                    """UPDATE photo_metadata
+                       SET thumbnail_path = NULL, indexed_at = NULL, phash = NULL, is_duplicate_of = NULL
+                       WHERE file_id = ?""",
+                    (file_id,),
+                )
+                conn.execute(
+                    "DELETE FROM photo_tags WHERE file_id = ? AND source = 'siglip'",
+                    (file_id,),
+                )
+
+    if stats["state"] == "running":
+        stats["state"] = "done"
+    if status_callback:
+        status_callback(dict(stats))
+    logger.info("增量扫描写库完成: %s", stats)
+    return stats
 
 
 def full_scan(progress_callback=None, batch_limit=None):

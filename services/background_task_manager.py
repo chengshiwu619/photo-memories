@@ -1,7 +1,30 @@
 from abc import ABC, abstractmethod
+import threading
+from copy import deepcopy
 from typing import Optional
 from PyQt6.QtCore import QThread, pyqtSignal
 from logger_setup import logger
+from services.ai_device import resolve_ai_device
+
+
+DEFAULT_BACKGROUND_STATUS = {
+    "state": "idle",
+    "running": False,
+    "paused": False,
+    "error": None,
+    "current_task": "",
+    "scanned": 0,
+    "new": 0,
+    "existing": 0,
+    "changed": 0,
+    "skipped": 0,
+    "errors": 0,
+    "bad_path_count": 0,
+    "thumbnail_pending": 0,
+    "tag_pending": 0,
+    "ai_device": "cpu",
+    "gpu_available": False,
+}
 
 
 class Stage(ABC):
@@ -21,7 +44,7 @@ class ScanStage(Stage):
 
     def run(self, progress_callback=None) -> dict:
         import os
-        from business.scanner.fast_scan import full_scan, clear_checkpoint
+        from business.scanner.fast_scan import incremental_scan, clear_checkpoint
         clear_checkpoint()
         if os.environ.get("PHOTO_TEST_MODE", "").lower() in ("1", "true", "yes"):
             from db_manager import Database
@@ -29,7 +52,17 @@ class ScanStage(Stage):
             with db.connect() as conn:
                 n = conn.execute("SELECT COUNT(1) FROM files").fetchone()[0]
             return {"total": n, "new": 0, "removed": 0}
-        return full_scan(progress_callback=progress_callback, batch_limit=self._batch_limit)
+
+        result = incremental_scan(
+            progress_callback=progress_callback,
+            limit=self._batch_limit,
+            dry_run=False,
+            verbose=False,
+            es_timeout=None,
+        )
+        result["total"] = result.get("scanned", 0)
+        result["removed"] = 0
+        return result
 
 
 class ClassifyStage(Stage):
@@ -173,6 +206,9 @@ class BackgroundTaskManager:
 
     def __init__(self):
         self._threads: list[QThread] = []
+        self._status = dict(DEFAULT_BACKGROUND_STATUS)
+        self._lock = threading.Lock()
+        self.refresh_ai_device_status()
 
     @classmethod
     def get_instance(cls) -> "BackgroundTaskManager":
@@ -200,3 +236,32 @@ class BackgroundTaskManager:
             if t.isRunning():
                 t.quit()
                 t.wait(500)
+        self.update_status(state="paused", running=False, paused=True, current_task="")
+
+    def refresh_ai_device_status(self):
+        info = resolve_ai_device()
+        self.update_status(ai_device=info.device, gpu_available=info.gpu_available)
+        return info
+
+    def update_status(self, **kwargs):
+        with self._lock:
+            self._status.update(kwargs)
+            state = self._status.get("state")
+            self._status["running"] = state == "running"
+            self._status["paused"] = state == "paused"
+
+    def update_from_scan_result(self, result: dict):
+        payload = {k: result.get(k, 0) for k in [
+            "scanned", "new", "existing", "changed", "skipped", "errors",
+            "bad_path_count", "thumbnail_pending", "tag_pending",
+        ]}
+        payload["state"] = result.get("state", "done")
+        payload["current_task"] = result.get("current_task", "scan")
+        self.update_status(**payload)
+
+    def mark_task(self, task_name: str, state: str = "running", error: Optional[str] = None):
+        self.update_status(current_task=task_name, state=state, error=error)
+
+    def get_status(self) -> dict:
+        with self._lock:
+            return deepcopy(self._status)

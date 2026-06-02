@@ -98,7 +98,21 @@ def _encode_preprocessed_batch(image_inputs: List[Any], clip_encoder_module: Any
 
     with torch.no_grad():
         batch_tensor = torch.stack(image_inputs)
-        embeddings = clip_encoder_module._model.encode_image(batch_tensor)
+        active_device = getattr(clip_encoder_module, "get_active_device", lambda: "unloaded")()
+        if active_device not in {"", "unloaded", "cpu"}:
+            batch_tensor = batch_tensor.to(active_device)
+        try:
+            embeddings = clip_encoder_module._model.encode_image(batch_tensor)
+        except Exception:
+            if active_device == "cuda" and hasattr(clip_encoder_module, "_reset_model"):
+                logger.warning("SigLIP CUDA 推理失败，降级 CPU 后重试")
+                clip_encoder_module._reset_model()
+                if not clip_encoder_module._load_model(preferred_device="cpu"):
+                    raise
+                batch_tensor = torch.stack(image_inputs)
+                embeddings = clip_encoder_module._model.encode_image(batch_tensor)
+            else:
+                raise
         embeddings = embeddings / embeddings.norm(dim=-1, keepdim=True)
         return embeddings.cpu().numpy()
 

@@ -1,15 +1,10 @@
-import os
-
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QProgressBar, QApplication, QMessageBox
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QProgressBar, QApplication
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont
 
 from logger_setup import logger
-
-
-from services.background_task_manager import Pipeline, ScanStage, ClassifyStage, IndexStage
 
 
 class StartupWindow(QWidget):
@@ -113,21 +108,12 @@ class StartupWindow(QWidget):
         self.move(x, y)
 
     def start(self):
-        pipeline = Pipeline()
-        pipeline.add_stage(ScanStage())
-        pipeline.add_stage(ClassifyStage())
-        pipeline.add_stage(IndexStage())
-        self.worker = pipeline
-        pipeline.stage_changed.connect(self.stage_label.setText)
-        pipeline.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
-        pipeline.all_done.connect(self._on_all_done, Qt.ConnectionType.QueuedConnection)
-        pipeline.error_occurred.connect(self._on_error, Qt.ConnectionType.QueuedConnection)
-        pipeline.interactive_classify_needed.connect(self._on_classify_needed, Qt.ConnectionType.QueuedConnection)
-        pipeline.background_scan_needed.connect(self.background_scan_needed.emit)
-        pipeline.background_index_needed.connect(self.background_index_needed.emit)
-        pipeline.finished.connect(self._on_worker_finished)
-        pipeline.start()
-        logger.info("Pipeline 启动流程开始")
+        self.stage_label.setText("正在准备主界面...")
+        self.progress_bar.setRange(0, 0)
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.setText("后台处理中")
+        QTimer.singleShot(0, self._on_all_done)
+        logger.info("轻量启动完成：跳过扫描、索引、LLM 分类，直接进入主界面")
 
     def _on_progress(self, current, total):
         if total > 0:

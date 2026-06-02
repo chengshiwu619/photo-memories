@@ -185,7 +185,12 @@ class Database:
                 folder_path TEXT PRIMARY KEY,
                 category INTEGER NOT NULL,
                 confidence TEXT,
-                classified_at TEXT
+                classified_at TEXT,
+                fingerprint TEXT,
+                classifier_version TEXT,
+                prompt_version TEXT,
+                status TEXT DEFAULT 'ok',
+                error TEXT
             );
 
             CREATE TABLE IF NOT EXISTS photo_metadata (
@@ -424,6 +429,18 @@ class Database:
                 for idx_sql in indexes:
                     conn.execute(idx_sql)
                 logger.info(f"补建缺失表: {table_name}")
+        folder_category_columns = [
+            ("fingerprint", "TEXT"),
+            ("classifier_version", "TEXT"),
+            ("prompt_version", "TEXT"),
+            ("status", "TEXT DEFAULT 'ok'"),
+            ("error", "TEXT"),
+        ]
+        if self._table_exists(conn, "folder_categories"):
+            for col, ddl in folder_category_columns:
+                if not self._column_exists(conn, "folder_categories", col):
+                    conn.execute(f"ALTER TABLE folder_categories ADD COLUMN {col} {ddl}")
+                    logger.info(f"补建缺失字段: folder_categories.{col}")
         conn.commit()
 
     def _check_and_clear_thumbnails(self, conn):

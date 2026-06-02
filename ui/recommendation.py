@@ -123,7 +123,7 @@ def _make_photo_dict(r):
         "id": r["id"], "file_path": r["file_path"], "file_name": r["file_name"],
         "folder_path": r["folder_path"],
         "folder_name": r["folder_display"] if "folder_display" in r.keys() else os.path.basename(r["folder_path"]),
-        "thumbnail_path": r["thumbnail_path"],
+        "thumbnail_path": r["thumbnail_path"] if "thumbnail_path" in r.keys() and r["thumbnail_path"] else "",
         "width": r["width"] if "width" in r.keys() else None,
         "height": r["height"] if "height" in r.keys() else None,
         "date_taken": r["date_taken"] if "date_taken" in r.keys() else None,
@@ -166,16 +166,15 @@ def load_photos_from_ids(db, all_ids):
                    f.folder_name as folder_display, f.file_mtime, pm.thumbnail_path,
                    pm.width, pm.height, pm.date_taken
             FROM files f
-            JOIN photo_metadata pm ON f.id = pm.file_id
+            LEFT JOIN photo_metadata pm ON f.id = pm.file_id
             WHERE f.id IN ({placeholders})
-                  AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'""",
+                  AND (pm.thumbnail_path IS NULL OR pm.thumbnail_path != '__FAILED__')""",
         unique_ids,
     ).fetchall()
-    import os
     valid = []
     for r in rows:
         d = _make_photo_dict(r)
-        if d.get("thumbnail_path") and os.path.exists(d["thumbnail_path"]):
+        if not d.get("thumbnail_path") or os.path.exists(d["thumbnail_path"]):
             valid.append(d)
     return _interleave_small_folders(valid)
 
@@ -186,10 +185,11 @@ def load_category_photos_batch(db, cat_id, offset, limit=PAGE_SIZE):
                f.folder_name as folder_display, f.file_mtime, pm.thumbnail_path,
                pm.width, pm.height, pm.date_taken
         FROM files f
-        JOIN folder_categories fc ON f.folder_path = fc.folder_path
+        LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
         LEFT JOIN photo_metadata pm ON f.id = pm.file_id
-        WHERE fc.category = ? AND f.is_image = 1 AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
-              AND pm.is_duplicate_of IS NULL
+        WHERE COALESCE(fc.category, 1) = ? AND f.is_image IN (0, 1)
+              AND (pm.thumbnail_path IS NULL OR pm.thumbnail_path != '__FAILED__')
+              AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
         ORDER BY pm.date_taken DESC
         LIMIT ? OFFSET ?
     """, (cat_id, limit, offset)).fetchall()
@@ -202,16 +202,16 @@ def load_category_photos_batch(db, cat_id, offset, limit=PAGE_SIZE):
                        pm.width, pm.height, pm.date_taken
                 FROM files f
                 LEFT JOIN photo_metadata pm ON f.id = pm.file_id
-                WHERE f.is_image = 1 AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
-                      AND pm.is_duplicate_of IS NULL
+                WHERE f.is_image IN (0, 1)
+                      AND (pm.thumbnail_path IS NULL OR pm.thumbnail_path != '__FAILED__')
+                      AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
                 ORDER BY pm.date_taken DESC
                 LIMIT ?
             """, (limit,)).fetchall()
-    import os as _os
     valid = []
     for r in rows:
         d = _make_photo_dict(r)
-        if d.get("thumbnail_path") and _os.path.exists(d["thumbnail_path"]):
+        if not d.get("thumbnail_path") or _os.path.exists(d["thumbnail_path"]):
             valid.append(d)
     return _interleave_small_folders(valid)
 
@@ -255,7 +255,6 @@ def rank_category_photos(db, cat_id):
     memory_photos = []
     if all_ids:
         memory_photos = load_photos_from_ids(db, all_ids)
-        memory_photos = [p for p in memory_photos if p.get("thumbnail_path")]
         # 交叉验证：确保 memory 中的照片确实属于目标分类（防止脏数据泄漏）
         if memory_photos:
             mem_ids = [p["id"] for p in memory_photos]

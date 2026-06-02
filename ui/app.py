@@ -11,7 +11,7 @@ from PyQt6.QtGui import QFont
 from logger_setup import logger
 from config import (
     CATEGORY_LIFE, CATEGORY_SAMPLE,
-    CATEGORY_NAMES, is_configured,
+    CATEGORY_NAMES, is_configured, get_settings,
 )
 from db_manager import Database
 from infra.db.repositories.memories_repo import MemoriesRepository
@@ -35,6 +35,41 @@ CATEGORIES = [
     (CATEGORY_LIFE, CATEGORY_NAMES[CATEGORY_LIFE]),
     (CATEGORY_SAMPLE, CATEGORY_NAMES[CATEGORY_SAMPLE]),
 ]
+
+
+def safe_path(value) -> str:
+    if value is None:
+        return ""
+    try:
+        path = os.fspath(value)
+    except TypeError:
+        return ""
+    if isinstance(path, bytes):
+        try:
+            path = path.decode(sys.getfilesystemencoding() or "utf-8", errors="replace")
+        except Exception:
+            return ""
+    return path or ""
+
+
+def is_valid_path(value) -> bool:
+    return bool(safe_path(value))
+
+
+def safe_dirname(value) -> str:
+    path = safe_path(value)
+    return os.path.dirname(path) if path else ""
+
+
+def safe_basename(value) -> str:
+    path = safe_path(value)
+    return os.path.basename(path) if path else ""
+
+
+def photos_in_same_folder(photos, folder_path: str) -> list:
+    if not folder_path:
+        return []
+    return [p for p in photos if safe_dirname(p.get("file_path")) == folder_path]
 
 
 class MainWindow(QMainWindow):
@@ -298,12 +333,14 @@ class MainWindow(QMainWindow):
                    pm.width, pm.height, f.file_path, f.file_name,
                    f.folder_path, f.folder_name as folder_display, f.file_mtime
             FROM photo_metadata pm
-            LEFT JOIN files f ON pm.file_id = f.id
+            JOIN files f ON pm.file_id = f.id
+            JOIN folder_categories fc ON f.folder_path = fc.folder_path
             WHERE pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
+                  AND fc.category = ?
                   AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
                   {starred_clause}
             ORDER BY pm.date_taken DESC, f.file_mtime DESC
-        """).fetchall()
+        """, (CATEGORY_LIFE,)).fetchall()
         from ui.recommendation import _make_photo_dict
         self._timeline_photos = [_make_photo_dict(r) for r in rows]
         self._timeline_view.load_photos(self._timeline_photos)
@@ -320,11 +357,13 @@ class MainWindow(QMainWindow):
                        pm.width, pm.height, f.file_path, f.file_name,
                        f.folder_path, f.folder_name as folder_display, f.file_mtime
                 FROM photo_metadata pm
-                LEFT JOIN files f ON pm.file_id = f.id
+                JOIN files f ON pm.file_id = f.id
+                JOIN folder_categories fc ON f.folder_path = fc.folder_path
                 WHERE pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
+                      AND fc.category = ?
                       AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
                 ORDER BY pm.date_taken DESC, f.file_mtime DESC
-            """).fetchall()
+            """, (CATEGORY_LIFE,)).fetchall()
             from ui.recommendation import _make_photo_dict
             new_photos = []
             for r in rows:
@@ -406,7 +445,7 @@ class MainWindow(QMainWindow):
         else:
             logger.info(f"特殊回忆 Phase 3: 生活照片{life_count}>=200，全量生成")
             for discover in [
-                discover_special_date_memories,
+                lambda: discover_special_date_memories(max_groups=2),
                 discover_person_memories,
                 discover_scene_memories,
                 discover_event_memories,
@@ -430,8 +469,20 @@ class MainWindow(QMainWindow):
                     combined.append(m)
                     existing_ids.add(m.id)
 
+        combined = self._limit_special_date_memories(combined, limit=2)
         self._special_view.load_memories(combined)
         self._special_loaded = True
+
+    def _limit_special_date_memories(self, memories, limit=2):
+        special_dates = [m for m in memories if m.memory_type == "special_date"]
+        if len(special_dates) <= limit:
+            return memories
+
+        keep_ids = {m.id for m in special_dates[:limit]}
+        return [
+            m for m in memories
+            if m.memory_type != "special_date" or m.id in keep_ids
+        ]
 
     def _on_memory_clicked(self, memory_id: int):
         from infra.db.repositories.memories_repo import MemoriesRepository
@@ -613,7 +664,7 @@ class MainWindow(QMainWindow):
             photo_data = {
                 "id": row["id"], "file_path": row["file_path"], "file_name": row["file_name"],
                 "folder_path": row["folder_path"],
-                "folder_name": row["folder_display"] if "folder_display" in row.keys() else os.path.basename(row["folder_path"]),
+                "folder_name": row["folder_display"] if "folder_display" in row.keys() else safe_basename(row["folder_path"]),
                 "thumbnail_path": row["thumbnail_path"],
                 "width": row["width"] if "width" in row.keys() else None,
                 "height": row["height"] if "height" in row.keys() else None,
@@ -633,14 +684,18 @@ class MainWindow(QMainWindow):
 
         clicked_id = photo_data.get("id")
         if cat_id is not None:
-            self._record_click(clicked_id, photo_data.get("folder_path", ""))
+            self._record_click(clicked_id, safe_path(photo_data.get("folder_path")))
 
-        clicked_folder = os.path.dirname(photo_data.get("file_path", ""))
-        self._folder_view_counts[clicked_folder] = self._folder_view_counts.get(clicked_folder, 0) + 1
-        if self._folder_view_counts[clicked_folder] >= 20:
-            self._suppressed_folders.add(clicked_folder)
+        clicked_folder = safe_dirname(photo_data.get("file_path"))
+        if clicked_folder:
+            self._folder_view_counts[clicked_folder] = self._folder_view_counts.get(clicked_folder, 0) + 1
+            if self._folder_view_counts[clicked_folder] >= 20:
+                self._suppressed_folders.add(clicked_folder)
+            folder_photos = photos_in_same_folder(all_photos, clicked_folder)
+        else:
+            self._warn_missing_photo_path(clicked_id)
+            folder_photos = [photo_data]
 
-        folder_photos = [p for p in all_photos if os.path.dirname(p.get("file_path", "")) == clicked_folder]
         if not folder_photos:
             folder_photos = all_photos
 
@@ -654,6 +709,15 @@ class MainWindow(QMainWindow):
         self.image_viewer.setGeometry(self._nav_stack.geometry())
         self.image_viewer.show_photos(folder_photos, idx, starred)
         self.image_viewer.raise_()
+
+    def _warn_missing_photo_path(self, file_id):
+        if not hasattr(self, "_missing_file_path_warning_ids"):
+            self._missing_file_path_warning_ids = set()
+        key = file_id if file_id is not None else "__unknown__"
+        if key in self._missing_file_path_warning_ids:
+            return
+        self._missing_file_path_warning_ids.add(key)
+        logger.warning(f"点击照片缺少 file_path, 已跳过同文件夹筛选: file_id={file_id}")
 
     def _record_click(self, file_id, folder_path):
         cat_id = CATEGORIES[self.current_page][0]
@@ -676,7 +740,7 @@ class MainWindow(QMainWindow):
             return
 
         self._recategorize_target_id = photo.get("id")
-        folder_path = os.path.dirname(photo.get("file_path", ""))
+        folder_path = safe_dirname(photo.get("file_path"))
         if not folder_path:
             return
 
@@ -690,7 +754,7 @@ class MainWindow(QMainWindow):
         dlg_layout.setContentsMargins(24, 20, 24, 20)
         dlg_layout.setSpacing(12)
 
-        name_label = QLabel(os.path.basename(folder_path))
+        name_label = QLabel(safe_basename(folder_path))
         name_label.setFont(QFont("Microsoft YaHei", 13, QFont.Weight.Bold))
         name_label.setStyleSheet("color: #e0e0e0;")
         name_label.setWordWrap(True)
@@ -792,7 +856,7 @@ def main():
         startup_ref = [None]
         _bg_scan_started = [False]
         _bg_index_started = [False]
-        _bg_refine_started = [False]
+        _bg_classify_started = [False]
 
         def show_main_window():
             logger.info("show_main_window 开始, 优先构建主界面...")
@@ -802,6 +866,7 @@ def main():
                 logger.info("MainWindow 构建完成, 调用 show()")
                 main_window[0].show()
                 logger.info("主界面已显示")
+                QTimer.singleShot(100, start_background_scan)
                 QTimer.singleShot(1000, start_memory_discovery)
             except Exception as e:
                 logger.exception("MainWindow 构建失败!")
@@ -814,7 +879,7 @@ def main():
             if st:
                 st.hide()
                 st.close()
-            start_background_keyword_refine()
+            QTimer.singleShot(800, start_background_folder_classify)
 
         def start_memory_discovery():
             from PyQt6.QtCore import QThread
@@ -835,24 +900,41 @@ def main():
             BackgroundTaskManager.get_instance().register(bg)
             logger.info("回忆发现线程已启动")
 
-        def start_background_keyword_refine():
-            if _bg_refine_started[0]:
-                logger.info("后台关键词精分类已在运行，跳过重复启动")
+        def start_background_folder_classify():
+            if _bg_classify_started[0]:
+                logger.info("后台文件夹分类已在运行，跳过重复启动")
                 return
-            _bg_refine_started[0] = True
+            _bg_classify_started[0] = True
             from PyQt6.QtCore import QThread
 
-            class BgRefineWorker(QThread):
+            class BgClassifyWorker(QThread):
                 def run(self):
-                    from business.classifier.folder_classifier import refine_sample_keywords
-                    refined = refine_sample_keywords()
-                    logger.info(f"后台关键词精分类完成: {refined} 个文件夹重新分类")
+                    manager = BackgroundTaskManager.get_instance()
+                    manager.mark_task("folder_classify", "running")
+                    try:
+                        from business.classifier.folder_classifier import classify_folders, refine_sample_keywords
+                        result = classify_folders()
+                        refined = refine_sample_keywords()
+                        manager.mark_task("folder_classify", "done")
+                        logger.info(
+                            "后台文件夹分类完成: classified=%s skipped=%s unknown=%s llm_queued=%s refined=%s",
+                            result.get("classified", 0),
+                            result.get("skipped", 0),
+                            result.get("unknown", 0),
+                            result.get("llm_queued", 0),
+                            refined,
+                        )
+                    except Exception as exc:
+                        manager.mark_task("folder_classify", "error", error=str(exc))
+                        logger.exception("后台文件夹分类失败")
+                    finally:
+                        _bg_classify_started[0] = False
 
-            bg = BgRefineWorker()
-            bg.finished.connect(lambda: logger.info("后台关键词精分类线程结束"))
+            bg = BgClassifyWorker()
+            bg.finished.connect(lambda: logger.info("后台文件夹分类线程结束"))
             bg.start()
             BackgroundTaskManager.get_instance().register(bg)
-            logger.info("后台关键词精分类线程已启动")
+            logger.info("后台文件夹分类线程已启动")
 
         _bg_tags_started = [False]
         _bg_faces_started = [False]
@@ -871,6 +953,9 @@ def main():
                     from infra.db.repositories.photo_tags_repo import PhotoTagsRepository
                     from db_manager import Database
 
+                    manager = BackgroundTaskManager.get_instance()
+                    device_info = manager.refresh_ai_device_status()
+                    manager.mark_task("ai_tags", "running")
                     tagged = PhotoTagsRepository(Database()).get_file_ids_by_source("siglip")
                     with Database().connect() as conn:
                         rows = conn.execute("""
@@ -880,26 +965,35 @@ def main():
                             ORDER BY pm.file_id
                         """).fetchall()
                     file_ids = [r[0] for r in rows if r[0] not in tagged]
+                    tag_limit = max(int(getattr(get_settings(), "background_ai_tag_limit", 128)), 0)
+                    if tag_limit:
+                        file_ids = file_ids[:tag_limit]
                     if not file_ids:
                         logger.info("后台标签生成: 无新照片需要处理")
+                        manager.mark_task("ai_tags", "done")
                         return
-                    logger.info(f"后台标签生成: 将处理 {len(file_ids)} 张照片")
+                    logger.info(f"后台标签生成: 将处理 {len(file_ids)} 张照片, device={device_info.device}")
                     batch_size = 32
-                    for i in range(0, len(file_ids), batch_size):
-                        batch = file_ids[i:i + batch_size]
-                        tags_dict = generate_tags_batch(batch)
-                        pending = []
-                        for fid, tags in tags_dict.items():
-                            for tag in tags:
-                                pending.append((fid, tag, "siglip"))
-                        if pending:
-                            with Database().connect() as conn:
-                                conn.executemany(
-                                    "INSERT OR IGNORE INTO photo_tags (file_id, tag, source) VALUES (?, ?, ?)",
-                                    pending,
-                                )
-                        logger.debug(f"后台标签: {i + len(batch)}/{len(file_ids)}")
-                    logger.info(f"后台标签生成完成: 已处理 {len(file_ids)} 张照片")
+                    try:
+                        for i in range(0, len(file_ids), batch_size):
+                            batch = file_ids[i:i + batch_size]
+                            tags_dict = generate_tags_batch(batch)
+                            pending = []
+                            for fid, tags in tags_dict.items():
+                                for tag in tags:
+                                    pending.append((fid, tag, "siglip"))
+                            if pending:
+                                with Database().connect() as conn:
+                                    conn.executemany(
+                                        "INSERT OR IGNORE INTO photo_tags (file_id, tag, source) VALUES (?, ?, ?)",
+                                        pending,
+                                    )
+                            logger.debug(f"后台标签: {i + len(batch)}/{len(file_ids)}")
+                        manager.mark_task("ai_tags", "done")
+                        logger.info(f"后台标签生成完成: 已处理 {len(file_ids)} 张照片")
+                    except Exception as exc:
+                        manager.mark_task("ai_tags", "error", error=str(exc))
+                        logger.exception("后台标签生成失败")
 
             bg = BgTagsWorker()
             bg.finished.connect(lambda: logger.info("后台标签生成线程结束"))
@@ -975,7 +1069,8 @@ def main():
 
             class BgScanWorker(QThread):
                 def run(self):
-                    from business.scanner.fast_scan import full_scan, get_checkpoint_status, clear_checkpoint, ScanState
+                    from business.scanner.fast_scan import incremental_scan, get_checkpoint_status, clear_checkpoint, ScanState
+                    manager = BackgroundTaskManager.get_instance()
                     while True:
                         cp = get_checkpoint_status()
                         if cp.get("has_checkpoint") and cp.get("state") in (ScanState.PAUSED, ScanState.STOPPED, ScanState.RUNNING):
@@ -984,14 +1079,30 @@ def main():
                         else:
                             break
                     logger.info("后台扫描开始")
-                    result = full_scan(progress_callback=lambda cur, tot: None)
-                    if result.get("paused"):
-                        logger.info(f"后台扫描暂停: 已扫描 {result.get('total_scanned', 0)}, 共 {result.get('total_found', 0)}")
-                    else:
-                        logger.info(f"后台扫描全部完成: 总计 {result.get('total', 0)} 文件, 新增 {result.get('new', 0)}, 移除 {result.get('removed', 0)}")
+                    manager.mark_task("scan", "running")
+                    settings = get_settings()
+                    result = incremental_scan(
+                        progress_callback=lambda cur, tot: None,
+                        dry_run=False,
+                        limit=max(int(getattr(settings, "background_scan_limit", 1000)), 0) or None,
+                        es_timeout=max(int(getattr(settings, "everything_timeout_seconds", 20)), 1),
+                        status_callback=manager.update_from_scan_result,
+                    )
+                    manager.update_from_scan_result(result)
+                    logger.info(
+                        "后台增量扫描完成: scanned=%s new=%s existing=%s changed=%s skipped=%s errors=%s",
+                        result.get("scanned", 0),
+                        result.get("new", 0),
+                        result.get("existing", 0),
+                        result.get("changed", 0),
+                        result.get("skipped", 0),
+                        result.get("errors", 0),
+                    )
 
             bg = BgScanWorker()
             bg.finished.connect(lambda: logger.info("后台扫描线程结束"))
+            bg.finished.connect(lambda: (_bg_index_started.__setitem__(0, False), start_background_index()))
+            bg.finished.connect(start_background_folder_classify)
             bg.start()
             BackgroundTaskManager.get_instance().register(bg)
             logger.info("后台扫描线程已启动")
@@ -1016,10 +1127,21 @@ def main():
                         else:
                             break
                     logger.info("后台索引开始")
-                    result = index_photos(progress_callback=lambda cur, tot: None)
+                    manager = BackgroundTaskManager.get_instance()
+                    manager.mark_task("thumbnail_index", "running")
+                    result = index_photos(
+                        progress_callback=lambda cur, tot: None,
+                        batch_limit=max(int(getattr(get_settings(), "background_index_limit", 100)), 0) or None,
+                    )
                     if result.get("paused"):
+                        manager.mark_task("thumbnail_index", "paused")
                         logger.info(f"后台索引暂停: {result.get('indexed', 0)}/{result.get('total', 0)}")
                     else:
+                        manager.update_status(
+                            state="done",
+                            current_task="thumbnail_index",
+                            thumbnail_pending=max(result.get("total", 0) - result.get("indexed", 0), 0),
+                        )
                         logger.info(f"后台索引全部完成: 总计 {result.get('total', 0)}, 已索引 {result.get('indexed', 0)}")
 
             bg = BgIndexWorker()
