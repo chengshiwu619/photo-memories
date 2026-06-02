@@ -12,6 +12,7 @@ MAX_SAME_FOLDER_STREAK = 12
 SMALL_FOLDER_THRESHOLD = 100
 FRESHNESS_WINDOW_DAYS = 7
 MAX_SAME_DAY_STREAK = 12
+MIN_MEMORY_VISIBLE_REFS = 4
 
 
 def _interleave_small_folders(photos):
@@ -131,6 +132,15 @@ def _make_photo_dict(r):
     }
 
 
+def _has_renderable_thumbnail(photo):
+    thumb = photo.get("thumbnail_path", "")
+    return bool(thumb and thumb != "__FAILED__" and os.path.exists(thumb))
+
+
+def _filter_renderable_photos(photos):
+    return [p for p in photos if _has_renderable_thumbnail(p)]
+
+
 def _get_recently_shown_ids(db, cat_id, days=FRESHNESS_WINDOW_DAYS):
     rows = db.execute(
         "SELECT DISTINCT file_id FROM photo_shown_history "
@@ -151,7 +161,7 @@ def record_shown_photos(photos, cat_id):
         )
 
 
-def load_photos_from_ids(db, all_ids):
+def load_photos_from_ids(db, all_ids, require_thumbnail=False):
     if not all_ids:
         return []
     seen = set()
@@ -171,12 +181,140 @@ def load_photos_from_ids(db, all_ids):
                   AND (pm.thumbnail_path IS NULL OR pm.thumbnail_path != '__FAILED__')""",
         unique_ids,
     ).fetchall()
-    valid = []
+    by_id = {}
     for r in rows:
         d = _make_photo_dict(r)
-        if not d.get("thumbnail_path") or os.path.exists(d["thumbnail_path"]):
-            valid.append(d)
+        if require_thumbnail:
+            if _has_renderable_thumbnail(d):
+                by_id[d["id"]] = d
+        elif not d.get("thumbnail_path") or os.path.exists(d["thumbnail_path"]):
+            by_id[d["id"]] = d
+    valid = [by_id[pid] for pid in unique_ids if pid in by_id]
     return _interleave_small_folders(valid)
+
+
+def _filter_photos_for_category(db, cat_id, photos):
+    if not photos:
+        return []
+    photo_ids = [p["id"] for p in photos]
+    placeholders = ",".join("?" * len(photo_ids))
+    valid_ids = {
+        r[0] for r in db.execute(
+            f"""SELECT f.id
+                FROM files f
+                JOIN folder_categories fc ON f.folder_path = fc.folder_path
+                WHERE fc.category = ? AND f.id IN ({placeholders})""",
+            [cat_id] + photo_ids,
+        ).fetchall()
+    }
+    return [p for p in photos if p["id"] in valid_ids]
+
+
+def _supplement_memory_photos(db, cat_id, photos, excluded_ids, needed):
+    if needed <= 0:
+        return []
+
+    folders = [p.get("folder_path") for p in photos if p.get("folder_path")]
+    dates = []
+    for p in photos:
+        dt = p.get("date_taken") or p.get("file_mtime")
+        if dt and len(dt) >= 10:
+            dates.append(dt[:10])
+
+    seen = set(excluded_ids)
+    result = []
+    candidate_limit = max(needed * 10, MIN_MEMORY_VISIBLE_REFS * 3)
+
+    def add_rows(rows):
+        nonlocal needed
+        for r in rows:
+            p = _make_photo_dict(r)
+            if p["id"] in seen or not _has_renderable_thumbnail(p):
+                continue
+            seen.add(p["id"])
+            result.append(p)
+            needed -= 1
+            if needed <= 0:
+                break
+
+    base_select = """
+        SELECT f.id, f.file_path, f.file_name, f.folder_path,
+               f.folder_name as folder_display, f.file_mtime, pm.thumbnail_path,
+               pm.width, pm.height, pm.date_taken
+        FROM files f
+        JOIN folder_categories fc ON f.folder_path = fc.folder_path
+        JOIN photo_metadata pm ON f.id = pm.file_id
+        WHERE fc.category = ?
+          AND f.is_image IN (0, 1)
+          AND pm.thumbnail_path IS NOT NULL
+          AND pm.thumbnail_path != '__FAILED__'
+          AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
+    """
+
+    for folder in folders[:3]:
+        if needed <= 0:
+            break
+        rows = db.execute(
+            base_select + " AND f.folder_path = ? ORDER BY pm.date_taken DESC LIMIT ?",
+            (cat_id, folder, candidate_limit),
+        ).fetchall()
+        add_rows(rows)
+
+    for day in dates[:3]:
+        if needed <= 0:
+            break
+        rows = db.execute(
+            base_select + " AND COALESCE(pm.date_taken, f.file_mtime) LIKE ? ORDER BY pm.date_taken DESC LIMIT ?",
+            (cat_id, f"{day}%", candidate_limit),
+        ).fetchall()
+        add_rows(rows)
+
+    if needed > 0:
+        rows = db.execute(
+            base_select + " ORDER BY pm.date_taken DESC LIMIT ?",
+            (cat_id, candidate_limit),
+        ).fetchall()
+        add_rows(rows)
+
+    return result
+
+
+def _load_ranked_memory_photos(db, cat_id):
+    ranked = []
+    seen_ids = set()
+    rows = db.execute(
+        "SELECT id, photo_ids FROM memories WHERE category = ? ORDER BY created_at DESC",
+        (cat_id,),
+    ).fetchall()
+
+    for row in rows:
+        try:
+            import json
+            photo_ids = json.loads(row["photo_ids"])
+        except Exception:
+            continue
+
+        photos = load_photos_from_ids(db, photo_ids, require_thumbnail=True)
+        photos = _filter_photos_for_category(db, cat_id, photos)
+        if len(photos) < MIN_MEMORY_VISIBLE_REFS:
+            photos.extend(
+                _supplement_memory_photos(
+                    db,
+                    cat_id,
+                    photos,
+                    set(photo_ids) | seen_ids,
+                    MIN_MEMORY_VISIBLE_REFS - len(photos),
+                )
+            )
+        if len(photos) < MIN_MEMORY_VISIBLE_REFS:
+            continue
+
+        for p in photos:
+            if p["id"] not in seen_ids:
+                seen_ids.add(p["id"])
+                ranked.append(p)
+
+    return ranked
 
 
 def load_category_photos_batch(db, cat_id, offset, limit=PAGE_SIZE):
@@ -211,7 +349,7 @@ def load_category_photos_batch(db, cat_id, offset, limit=PAGE_SIZE):
     valid = []
     for r in rows:
         d = _make_photo_dict(r)
-        if not d.get("thumbnail_path") or _os.path.exists(d["thumbnail_path"]):
+        if not d.get("thumbnail_path") or os.path.exists(d["thumbnail_path"]):
             valid.append(d)
     return _interleave_small_folders(valid)
 
@@ -237,37 +375,9 @@ def load_starred_photos(db, cat_id):
 
 
 def rank_category_photos(db, cat_id):
-    all_ids = []
-    seen_ids = set()
-    for row in db.execute(
-        "SELECT photo_ids FROM memories WHERE category = ? ORDER BY created_at DESC",
-        (cat_id,),
-    ).fetchall():
-        try:
-            import json
-            for pid in json.loads(row["photo_ids"]):
-                if pid not in seen_ids:
-                    seen_ids.add(pid)
-                    all_ids.append(pid)
-        except Exception:
-            pass
+    memory_photos = _load_ranked_memory_photos(db, cat_id)
 
-    memory_photos = []
-    if all_ids:
-        memory_photos = load_photos_from_ids(db, all_ids)
-        # 交叉验证：确保 memory 中的照片确实属于目标分类（防止脏数据泄漏）
-        if memory_photos:
-            mem_ids = [p["id"] for p in memory_photos]
-            placeholders = ",".join("?" * len(mem_ids))
-            valid_ids = {
-                r[0] for r in db.execute(
-                    f"SELECT f.id FROM files f JOIN folder_categories fc ON f.folder_path = fc.folder_path WHERE fc.category = ? AND f.id IN ({placeholders})",
-                    [cat_id] + mem_ids,
-                ).fetchall()
-            }
-            memory_photos = [p for p in memory_photos if p["id"] in valid_ids]
-
-    batch_photos = load_category_photos_batch(db, cat_id, 0, limit=9999)
+    batch_photos = _filter_renderable_photos(load_category_photos_batch(db, cat_id, 0, limit=9999))
 
     seen_file_ids = set()
     ordered = []

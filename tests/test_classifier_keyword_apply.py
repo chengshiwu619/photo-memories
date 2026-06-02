@@ -189,3 +189,49 @@ def test_classify_folders_dirty_fingerprint_calls_llm(tmp_path, monkeypatch):
     assert row["category"] == classifier.CATEGORY_SAMPLE
     assert row["status"] == "ok"
     assert row["fingerprint"] == classifier.build_folder_fingerprint(folder_path)["fingerprint"]
+
+
+def test_classify_folders_backfills_missing_fingerprint_without_llm(tmp_path, monkeypatch):
+    from business.classifier import folder_classifier as classifier
+
+    db = Database(str(tmp_path / "photos.db"))
+    db.init_tables()
+    source = tmp_path / "Photos"
+    branch = source / "Other"
+    branch.mkdir(parents=True)
+    folder_path = str(branch)
+    monkeypatch.setattr(classifier, "_db", db)
+    monkeypatch.setattr(
+        classifier,
+        "get_settings",
+        lambda: SimpleNamespace(
+            source_drive=str(source),
+            source_dirs=[str(source)],
+            classification_history_file=str(tmp_path / "classification_history.txt"),
+            deepseek_classify_model="test",
+        ),
+    )
+
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO files (id, file_path, file_name, folder_path, folder_name, file_size, file_mtime, is_image) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+            (1, str(branch / "a.jpg"), "a.jpg", folder_path, "Other", 1, "2024-01-01T00:00:00"),
+        )
+        conn.execute(
+            "INSERT INTO folder_categories (folder_path, category, confidence) VALUES (?, ?, ?)",
+            (folder_path, classifier.CATEGORY_LIFE, "llm-branch"),
+        )
+
+    def fail_llm(_branch_info):
+        raise AssertionError("LLM should not be called for trusted old category without fingerprint")
+
+    monkeypatch.setattr(classifier, "classify_branches_with_llm", fail_llm)
+
+    result = classifier.classify_folders()
+
+    assert result["llm_queued"] == 0
+    assert result["skipped"] == 1
+    with db.connect() as conn:
+        row = conn.execute("SELECT fingerprint, status FROM folder_categories WHERE folder_path = ?", (folder_path,)).fetchone()
+    assert row["fingerprint"]
+    assert row["status"] == "ok"

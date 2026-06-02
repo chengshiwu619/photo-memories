@@ -207,6 +207,12 @@ class Database:
                 is_starred INTEGER DEFAULT 0,
                 phash TEXT,
                 is_duplicate_of INTEGER,
+                phash_status TEXT DEFAULT 'ok',
+                phash_error TEXT,
+                thumbnail_status TEXT DEFAULT 'ok',
+                thumbnail_error TEXT,
+                source_file_size INTEGER,
+                source_file_mtime TEXT,
                 FOREIGN KEY (file_id) REFERENCES files(id)
             );
             CREATE INDEX IF NOT EXISTS idx_meta_date ON photo_metadata(date_taken);
@@ -441,6 +447,19 @@ class Database:
                 if not self._column_exists(conn, "folder_categories", col):
                     conn.execute(f"ALTER TABLE folder_categories ADD COLUMN {col} {ddl}")
                     logger.info(f"补建缺失字段: folder_categories.{col}")
+        photo_metadata_columns = [
+            ("phash_status", "TEXT DEFAULT 'ok'"),
+            ("phash_error", "TEXT"),
+            ("thumbnail_status", "TEXT DEFAULT 'ok'"),
+            ("thumbnail_error", "TEXT"),
+            ("source_file_size", "INTEGER"),
+            ("source_file_mtime", "TEXT"),
+        ]
+        if self._table_exists(conn, "photo_metadata"):
+            for col, ddl in photo_metadata_columns:
+                if not self._column_exists(conn, "photo_metadata", col):
+                    conn.execute(f"ALTER TABLE photo_metadata ADD COLUMN {col} {ddl}")
+                    logger.info(f"补建缺失字段: photo_metadata.{col}")
         conn.commit()
 
     def _check_and_clear_thumbnails(self, conn):

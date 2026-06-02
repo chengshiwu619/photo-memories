@@ -153,7 +153,7 @@ _SPECIAL_DATES = {
 }
 
 
-def discover_special_date_memories() -> List[Memory]:
+def discover_special_date_memories(max_groups: Optional[int] = 2, min_photos: int = 3) -> List[Memory]:
     month_days = list(_SPECIAL_DATES.keys())
     db = Database()
     pm_repo = PhotoMetadataRepository(db)
@@ -195,8 +195,12 @@ def discover_special_date_memories() -> List[Memory]:
         groups[key]["ids"].append(file_id)
 
     memories = []
-    for key, group in groups.items():
-        if len(group["ids"]) < 1:
+    group_items = list(groups.items())
+    if max_groups is not None:
+        group_items = group_items[:max_groups]
+
+    for key, group in group_items:
+        if len(group["ids"]) < min_photos:
             continue
 
         photo_ids = group["ids"][:20]

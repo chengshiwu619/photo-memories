@@ -48,9 +48,11 @@ def test_generate_thumbnail_creates_file():
         with patch("business.indexer.photo_indexer.get_settings", return_value=fake_settings):
             fake_settings.__dict__["thumbnail_dir"] = thumb_dir
             try:
-                thumb_path, w, h = generate_thumbnail(src, "1.jpg")
+                thumb_path, w, h, status, error = generate_thumbnail(src, "1.jpg")
                 assert thumb_path is not None
                 assert os.path.exists(thumb_path)
+                assert status == "ok"
+                assert error is None
             finally:
                 pass
     finally:
@@ -72,11 +74,15 @@ def test_generate_thumbnail_skips_existing():
         with patch("business.indexer.photo_indexer.get_settings", return_value=fake_settings):
             fake_settings.__dict__["thumbnail_dir"] = thumb_dir
             try:
-                thumb_path1, w1, h1 = generate_thumbnail(src, "2.jpg")
+                thumb_path1, w1, h1, status1, error1 = generate_thumbnail(src, "2.jpg")
                 assert thumb_path1 is not None
-                thumb_path2, w2, h2 = generate_thumbnail(src, "2.jpg")
+                assert status1 == "ok"
+                assert error1 is None
+                thumb_path2, w2, h2, status2, error2 = generate_thumbnail(src, "2.jpg")
                 assert w2 is None
                 assert h2 is None
+                assert status2 == "ok"
+                assert error2 is None
             finally:
                 pass
     finally:
@@ -98,7 +104,9 @@ def test_generate_thumbnail_respects_max_size():
         with patch("business.indexer.photo_indexer.get_settings", return_value=fake_settings):
             fake_settings.__dict__["thumbnail_dir"] = thumb_dir
             try:
-                thumb_path, w, h = generate_thumbnail(src, "3.jpg")
+                thumb_path, w, h, status, error = generate_thumbnail(src, "3.jpg")
+                assert status == "ok"
+                assert error is None
                 max_width, max_height = fake_settings.thumbnail_size
                 with Image.open(src) as src_img:
                     expected_ratio = src_img.width / src_img.height

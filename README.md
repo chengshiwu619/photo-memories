@@ -54,6 +54,14 @@ python scripts/maintain_thumbnails.py --db-path D:\photo-memories-cache\photos.d
 python scripts/maintain_thumbnails.py --db-path D:\photo-memories-cache\photos.db --retry-failed --file-id 1072
 ```
 
+增量扫描新增照片：
+
+```bash
+python scripts/rescan_photos.py --limit 200 --verbose
+python scripts/rescan_photos.py --limit 200 --apply --index --index-limit 50
+python scripts/rescan_photos.py --no-everything --limit 200 --verbose
+```
+
 基础 path 标签：
 
 ```bash

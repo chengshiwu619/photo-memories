@@ -1,5 +1,6 @@
 import threading
 from contextlib import contextmanager
+import importlib.util
 import sys
 import types
 
@@ -17,10 +18,13 @@ def _install_fake_pil_modules():
 
     imageops_module = types.ModuleType("PIL.ImageOps")
     imageops_module.exif_transpose = lambda img: img
+    imagefile_module = types.ModuleType("PIL.ImageFile")
+    imagefile_module.LOAD_TRUNCATED_IMAGES = False
 
     pil_module.Image = _FakeImageModule
     pil_module.ImageOps = imageops_module
-    return pil_module, _FakeImageModule, imageops_module
+    pil_module.ImageFile = imagefile_module
+    return pil_module, _FakeImageModule, imageops_module, imagefile_module
 
 
 def _install_fake_dotenv_module():
@@ -84,14 +88,24 @@ if "imagehash" not in sys.modules:
 if "pillow_heif" not in sys.modules:
     sys.modules["pillow_heif"] = _install_fake_pillow_heif_module()
 
-if "PIL" not in sys.modules:
-    pil_module, image_module, imageops_module = _install_fake_pil_modules()
+if "PIL" not in sys.modules and importlib.util.find_spec("PIL") is None:
+    pil_module, image_module, imageops_module, imagefile_module = _install_fake_pil_modules()
     sys.modules["PIL"] = pil_module
     sys.modules["PIL.Image"] = image_module
     sys.modules["PIL.ImageOps"] = imageops_module
+    sys.modules["PIL.ImageFile"] = imagefile_module
 
 
-def _make_row(file_id, thumbnail_path=None):
+def _make_row(
+    file_id,
+    thumbnail_path=None,
+    phash_status="ok",
+    phash_error=None,
+    thumbnail_status="ok",
+    thumbnail_error=None,
+    source_file_size=None,
+    source_file_mtime=None,
+):
     return (
         file_id,
         "2024-01-01T00:00:00",
@@ -104,6 +118,12 @@ def _make_row(file_id, thumbnail_path=None):
         None,
         "2024-01-01T00:00:00",
         f"phash-{file_id}",
+        phash_status,
+        phash_error,
+        thumbnail_status,
+        thumbnail_error,
+        source_file_size,
+        source_file_mtime,
     )
 
 
@@ -156,7 +176,7 @@ def test_index_photos_workers_1_matches_serial_semantics(monkeypatch):
 
     monkeypatch.setattr(mod, "_db", fake_db)
     monkeypatch.setattr(mod, "_cp", fake_cp)
-    monkeypatch.setattr(mod, "get_unindexed_photos", lambda: photos)
+    monkeypatch.setattr(mod, "get_unindexed_photos", lambda force_retry=False: photos)
     monkeypatch.setattr(mod, "dedup_by_phash", lambda progress_callback=None: {"checked": 3, "duplicates": 0})
     monkeypatch.setattr(mod, "_index_single_photo", lambda file_id, file_path: _make_row(file_id))
     monkeypatch.setattr(mod, "INDEX_COMMIT_EVERY", 20)
@@ -194,7 +214,7 @@ def test_index_photos_workers_2_process_multiple_items_and_keep_db_writes_on_mai
 
     monkeypatch.setattr(mod, "_db", fake_db)
     monkeypatch.setattr(mod, "_cp", fake_cp)
-    monkeypatch.setattr(mod, "get_unindexed_photos", lambda: photos)
+    monkeypatch.setattr(mod, "get_unindexed_photos", lambda force_retry=False: photos)
     monkeypatch.setattr(mod, "dedup_by_phash", lambda progress_callback=None: {"checked": 4, "duplicates": 0})
     monkeypatch.setattr(mod, "_index_single_photo", _fake_index_single_photo)
     monkeypatch.setattr(mod, "INDEX_COMMIT_EVERY", 2)
@@ -225,7 +245,7 @@ def test_index_photos_single_failure_does_not_block_other_rows_and_failed_marker
 
     monkeypatch.setattr(mod, "_db", fake_db)
     monkeypatch.setattr(mod, "_cp", fake_cp)
-    monkeypatch.setattr(mod, "get_unindexed_photos", lambda: photos)
+    monkeypatch.setattr(mod, "get_unindexed_photos", lambda force_retry=False: photos)
     monkeypatch.setattr(mod, "dedup_by_phash", lambda progress_callback=None: {"checked": 2, "duplicates": 0})
     monkeypatch.setattr(mod, "_index_single_photo", _fake_index_single_photo)
     monkeypatch.setattr(mod, "INDEX_COMMIT_EVERY", 20)
@@ -248,7 +268,7 @@ def test_index_photos_batch_limit_saves_checkpoint_after_batch(monkeypatch):
 
     monkeypatch.setattr(mod, "_db", fake_db)
     monkeypatch.setattr(mod, "_cp", fake_cp)
-    monkeypatch.setattr(mod, "get_unindexed_photos", lambda: photos)
+    monkeypatch.setattr(mod, "get_unindexed_photos", lambda force_retry=False: photos)
     monkeypatch.setattr(mod, "dedup_by_phash", lambda progress_callback=None: {"checked": 0, "duplicates": 0})
     monkeypatch.setattr(mod, "_index_single_photo", lambda file_id, file_path: _make_row(file_id))
     monkeypatch.setattr(mod, "INDEX_COMMIT_EVERY", 20)

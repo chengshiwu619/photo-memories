@@ -216,7 +216,6 @@ class VirtualCategoryPage(QScrollArea):
         self._footer_label.setGeometry(0, self._layout.total_height, self._layout.total_width, 40)
 
     def _render_visible(self):
-        import os
         scroll_y = self.verticalScrollBar().value()
         vp_h = self.viewport().height()
         cards = self._layout.cards_in_range(scroll_y, vp_h) if self._layout else []
@@ -224,9 +223,6 @@ class VirtualCategoryPage(QScrollArea):
             if idx in self._card_widgets:
                 continue
             photo = self._layout.photo_at(idx)
-            thumb = photo.get("thumbnail_path", "")
-            if not thumb or not os.path.exists(thumb):
-                continue
             card = VirtualPhotoCard(photo, w, h, self._viewport)
             card.move(x, y)
             card.load_thumbnail()

@@ -167,6 +167,8 @@ class ImageViewer(QWidget):
         self._cancel_load()
 
         photo = self.photos[self.current_index]
+        self.image_label.clear()
+        self.image_label.setStyleSheet("background: #000000;")
 
         thumb_path = photo.get("thumbnail_path", "")
         if thumb_path:

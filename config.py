@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     phash_threshold: int = 8
     memory_high_freq_days: int = 3
     ai_device: str = "auto"
-    background_scan_limit: int = 1000
+    background_scan_limit: int = 0
     background_index_limit: int = 100
     background_ai_tag_limit: int = 128
     everything_timeout_seconds: int = 20

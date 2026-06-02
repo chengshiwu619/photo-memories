@@ -8,7 +8,8 @@ from db_manager import Database
 from checkpoint_manager import CheckpointManager, CheckpointState
 
 ALL_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
-ES_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "everything", "es.exe")
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ES_PATH = os.path.join(PROJECT_ROOT, "everything", "es.exe")
 FALLBACK_ES = os.path.join(os.environ.get("TEMP", os.path.expanduser("~")), "es_tool", "es.exe")
 
 _ES_INSTANCE = None
@@ -131,6 +132,18 @@ def _record_bad_path_sample(filepath, reason):
 
 def _get_bad_path_stats():
     return _BAD_PATH_COUNT, list(_BAD_PATH_SAMPLES)
+
+
+def _looks_like_source_path(filepath):
+    value = str(filepath or "").replace("/", "\\").casefold()
+    if not value:
+        return False
+    for sd in get_settings().source_dirs:
+        for prefix in _expand_source_dir_prefixes(sd):
+            norm_prefix = prefix.replace("/", "\\").rstrip("\\").casefold()
+            if value.startswith(norm_prefix):
+                return True
+    return False
 
 
 _drive_mappings_cache = None
@@ -299,7 +312,7 @@ def load_cached_file_list(settings=None):
         path = os.path.normpath(line.rstrip("\n"))
         if not path.strip():
             continue
-        if "\ufffd" in path or "?" in path:
+        if "\ufffd" in path:
             skipped += 1
             continue
         paths.append(path)
@@ -329,7 +342,7 @@ def _list_all_image_files():
                 p = os.path.normpath(l.rstrip("\n"))
                 if not p.strip():
                     continue
-                if "\ufffd" in p or "?" in p:
+                if "\ufffd" in p:
                     skipped += 1
                     continue
                 paths.append(p)
@@ -347,25 +360,21 @@ def _list_all_image_files():
 
     logger.info("Everything 全量扫描: %s (实例: [%s])" % (_s.source_drive, inst or "默认"))
 
-    ext_list = [e.lstrip(".") for e in ALL_EXTENSIONS]
-    ext_query = "ext:%s" % ";".join(ext_list)
-    logger.info("查询: %s (全局扩展名搜索, Python侧过滤路径)" % ext_query)
+    query_desc = _build_everything_source_query(_s)
+    logger.info("查询: %s (照片根目录限定搜索)" % query_desc)
 
-    out, code = _run_es(["-csv", "-no-header", ext_query], timeout=120)
-
-    if code == 0 and out:
-        files = _parse_es_csv(out)
-        logger.info("Everything 返回 %s 条记录, 过滤后 %s 个媒体文件" % (len(out.split("\n")), len(files)))
-        if files:
-            os.makedirs(_s.photo_data_dir, exist_ok=True)
-            tmp = list_file + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(f"# SOURCE_DRIVE={os.path.normpath(_s.source_drive)}\n")
-                for fp in files:
-                    f.write(fp + "\n")
-            os.replace(tmp, list_file)
-            logger.info("文件列表已缓存: %s" % list_file)
-            return files
+    files = _query_everything_source_files(timeout=120, settings=_s)
+    logger.info("Everything 过滤后 %s 个媒体文件" % len(files))
+    if files:
+        os.makedirs(_s.photo_data_dir, exist_ok=True)
+        tmp = list_file + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(f"# SOURCE_DRIVE={os.path.normpath(_s.source_drive)}\n")
+            for fp in files:
+                f.write(fp + "\n")
+        os.replace(tmp, list_file)
+        logger.info("文件列表已缓存: %s" % list_file)
+        return files
 
     logger.info("Everything 查询失败, 回退 os.walk")
     return _walk_files()
@@ -376,8 +385,9 @@ def _parse_es_csv(text):
     for line in text.strip().split("\n"):
         line = line.strip()
         filepath = line.strip("\"")
-        if "\ufffd" in filepath or "?" in filepath:
-            _record_bad_path_sample(filepath, "encoding_damaged")
+        if "\ufffd" in filepath:
+            if _looks_like_source_path(filepath):
+                _record_bad_path_sample(filepath, "encoding_damaged")
             continue
         sd = _match_source_dir(filepath)
         if sd is None:
@@ -386,6 +396,87 @@ def _parse_es_csv(text):
         ext = os.path.splitext(filepath)[1].lower()
         if ext in ALL_EXTENSIONS:
             files.append(filepath)
+    return files
+
+
+def _build_everything_ext_query():
+    ext_list = [e.lstrip(".") for e in sorted(ALL_EXTENSIONS)]
+    return "ext:%s" % ";".join(ext_list)
+
+
+def _everything_source_search_paths(settings=None):
+    _s = settings or get_settings()
+    paths = []
+    seen = set()
+    for sd in _s.source_dirs:
+        candidates = []
+        for prefix in _expand_source_dir_prefixes(sd):
+            raw_root = prefix.rstrip("\\/")
+            if len(prefix) == 3 and prefix[1] == ":" and prefix[2] in "\\/":
+                raw_root = prefix
+            root = os.path.normpath(raw_root)
+            if not root:
+                continue
+            candidates.append(root)
+        drive_candidates = [p for p in candidates if len(p) >= 2 and p[1] == ":"]
+        if drive_candidates:
+            candidates = sorted(drive_candidates, key=lambda p: (len(p), p.casefold()))[:1]
+        for root in candidates:
+            key = root.replace("/", "\\").rstrip("\\").casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            paths.append(root)
+
+    def sort_key(path):
+        is_drive = len(path) >= 2 and path[1] == ":"
+        return (0 if is_drive else 1, len(path), path.casefold())
+
+    return sorted(paths, key=sort_key)
+
+
+def _build_everything_source_query(settings=None):
+    _s = settings or get_settings()
+    ext_query = _build_everything_ext_query()
+    source_terms = []
+    for root in _everything_source_search_paths(_s):
+        if root:
+            source_terms.append(f"-path \"{root}\" {ext_query}")
+    if not source_terms:
+        return ext_query
+    return "|".join(source_terms)
+
+
+def _query_everything_source_files(limit=None, timeout=20, settings=None):
+    _s = settings or get_settings()
+    ext_query = _build_everything_ext_query()
+    files = []
+    seen = set()
+    paths = _everything_source_search_paths(_s)
+    if not paths:
+        out, code = _run_es(["-csv", "-no-header", ext_query], timeout=timeout)
+        return _parse_es_csv(out) if code == 0 and out else []
+
+    for root in paths:
+        remaining = None if limit is None else max(limit - len(files), 0)
+        if remaining == 0:
+            break
+        args = ["-path", root, "-csv", "-no-header"]
+        if remaining:
+            args.extend(["-n", str(remaining)])
+        args.append(ext_query)
+        logger.info("Everything source query: -path %s %s", root, ext_query)
+        out, code = _run_es(args, timeout=timeout)
+        if code != 0 or not out:
+            continue
+        for filepath in _parse_es_csv(out):
+            key = normalize_path_identity(filepath)
+            if key in seen:
+                continue
+            seen.add(key)
+            files.append(filepath)
+            if limit and len(files) >= limit:
+                break
     return files
 
 
@@ -468,23 +559,16 @@ def _discover_incremental_files(limit=None, prefer_everything=True, verbose=Fals
     if prefer_everything:
         inst = _detect_instance()
         if inst != "__FAIL__":
-            ext_list = [e.lstrip(".") for e in ALL_EXTENSIONS]
-            ext_query = "ext:%s" % ";".join(ext_list)
+            ext_query = _build_everything_source_query()
             logger.info("增量扫描 Everything 查询: %s" % ext_query)
             timeout = es_timeout or getattr(get_settings(), "everything_timeout_seconds", 20)
-            out, code = _run_es(["-csv", "-no-header", ext_query], timeout=timeout)
-            if code == 0 and out:
-                files = _parse_es_csv(out)
-                if files:
-                    files = [_canonicalize_discovered_path(fp) for fp in files]
-                    if limit:
-                        files = files[:limit]
-                    logger.info("增量扫描 Everything 返回 %s 个媒体文件" % len(files))
-                    return files, "everything"
-                if verbose:
-                    logger.info("Everything 返回结果未命中配置的照片源目录, 回退目录遍历")
-            elif verbose:
-                logger.info("Everything 查询失败或为空, 回退目录遍历")
+            files = _query_everything_source_files(limit=limit, timeout=timeout)
+            if files:
+                files = [_canonicalize_discovered_path(fp) for fp in files]
+                logger.info("增量扫描 Everything 返回 %s 个媒体文件" % len(files))
+                return files, "everything"
+            if verbose:
+                logger.info("Everything 返回结果未命中配置的照片源目录, 回退目录遍历")
         elif verbose:
             logger.info("Everything IPC 不可用, 回退目录遍历")
 

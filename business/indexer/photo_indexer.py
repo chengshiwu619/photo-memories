@@ -1,9 +1,11 @@
 import os
 import json
 import sqlite3
+import contextlib
+import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageFile
 import exifread
 import imagehash
 
@@ -25,8 +27,34 @@ from infra.image.thumbnail_cache import (
 
 _db = Database()
 _cp = CheckpointManager(_db, "index")
+_BAD_IMAGE_WARNING_COUNT = 0
+_THUMBNAIL_WARNING_COUNT = 0
+WARNING_SAMPLE_LIMIT = 10
 
 IndexState = CheckpointState
+
+
+def _limited_warning(kind, message):
+    global _BAD_IMAGE_WARNING_COUNT, _THUMBNAIL_WARNING_COUNT
+    if kind == "bad_image":
+        _BAD_IMAGE_WARNING_COUNT += 1
+        count = _BAD_IMAGE_WARNING_COUNT
+    else:
+        _THUMBNAIL_WARNING_COUNT += 1
+        count = _THUMBNAIL_WARNING_COUNT
+
+    if count <= WARNING_SAMPLE_LIMIT:
+        logger.warning(message)
+    elif count == WARNING_SAMPLE_LIMIT + 1:
+        logger.warning(f"{kind} warning 样本超过 {WARNING_SAMPLE_LIMIT} 个，后续同类日志降级为 debug")
+    else:
+        logger.debug(message)
+
+
+def _reset_warning_counters():
+    global _BAD_IMAGE_WARNING_COUNT, _THUMBNAIL_WARNING_COUNT
+    _BAD_IMAGE_WARNING_COUNT = 0
+    _THUMBNAIL_WARNING_COUNT = 0
 
 
 def clear_checkpoint():
@@ -55,13 +83,39 @@ def set_stopped():
     _cp.request_stop()
 
 
-def get_unindexed_photos():
+def get_unindexed_photos(force_retry=False):
     with _db.connect() as conn:
+        if force_retry:
+            rows = conn.execute("""
+                SELECT f.id, f.file_path FROM files f
+                LEFT JOIN photo_metadata pm ON f.id = pm.file_id
+                WHERE f.is_image = 1
+                  AND (
+                      pm.file_id IS NULL
+                      OR pm.thumbnail_path IS NULL
+                      OR pm.thumbnail_path = '__FAILED__'
+                      OR pm.thumbnail_status IN ('failed', 'skipped')
+                  )
+            """).fetchall()
+            return rows
+
         rows = conn.execute("""
             SELECT f.id, f.file_path FROM files f
             LEFT JOIN photo_metadata pm ON f.id = pm.file_id
             WHERE f.is_image = 1
-              AND (pm.file_id IS NULL OR pm.thumbnail_path IS NULL OR pm.thumbnail_path = '__FAILED__')
+              AND (
+                  pm.file_id IS NULL
+                  OR pm.thumbnail_path IS NULL
+                  OR (
+                      pm.thumbnail_path = '__FAILED__'
+                      AND (
+                          pm.source_file_size IS NULL
+                          OR pm.source_file_mtime IS NULL
+                          OR pm.source_file_size != f.file_size
+                          OR pm.source_file_mtime != f.file_mtime
+                      )
+                  )
+              )
         """).fetchall()
     return rows
 
@@ -85,7 +139,8 @@ def extract_exif(filepath):
 
     try:
         with open(filepath, "rb") as f:
-            tags = exifread.process_file(f, details=False)
+            with contextlib.redirect_stderr(io.StringIO()):
+                tags = exifread.process_file(f, details=False)
 
         for tag, value in tags.items():
             result["raw"][tag] = str(value)
@@ -140,6 +195,29 @@ def _convert_gps(value):
     return degrees + minutes / 60 + seconds / 3600
 
 
+def _classify_image_error(exc):
+    text = str(exc).lower()
+    if "cannot identify image file" in text:
+        return "corrupted_or_unreadable"
+    if "image file is truncated" in text or "broken data stream" in text:
+        return "truncated_or_broken_stream"
+    return "thumbnail_error"
+
+
+def _create_thumbnail_tolerant(filepath, thumb_path, thumbnail_size):
+    previous = ImageFile.LOAD_TRUNCATED_IMAGES
+    try:
+        ImageFile.LOAD_TRUNCATED_IMAGES = True
+        return create_thumbnail_file(
+            filepath,
+            thumb_path,
+            thumbnail_size=thumbnail_size,
+            quality=THUMBNAIL_JPEG_QUALITY,
+        )
+    finally:
+        ImageFile.LOAD_TRUNCATED_IMAGES = previous
+
+
 def generate_thumbnail(filepath, thumbnail_name):
     _thumb_dir = get_settings().thumbnail_dir
     os.makedirs(_thumb_dir, exist_ok=True)
@@ -150,37 +228,72 @@ def generate_thumbnail(filepath, thumbnail_name):
         thumb_path = os.path.join(_thumb_dir, thumbnail_name)
 
     if os.path.exists(thumb_path):
-        return thumb_path, None, None
+        return thumb_path, None, None, "ok", None
 
+    thumb_size = get_settings().thumbnail_size
     try:
-        thumb_size = get_settings().thumbnail_size
         orig_w, orig_h = create_thumbnail_file(
             filepath,
             thumb_path,
             thumbnail_size=thumb_size,
             quality=THUMBNAIL_JPEG_QUALITY,
         )
-        return thumb_path, orig_w, orig_h
+        return thumb_path, orig_w, orig_h, "ok", None
     except Exception as e:
-        logger.error(f"缩略图生成失败 {filepath}: {e}")
-        return None, None, None
+        error_type = _classify_image_error(e)
+        if error_type == "truncated_or_broken_stream":
+            try:
+                orig_w, orig_h = _create_thumbnail_tolerant(filepath, thumb_path, thumb_size)
+                logger.info(f"截断图片容错生成缩略图成功: {filepath}")
+                return thumb_path, orig_w, orig_h, "recovered", None
+            except Exception as retry_exc:
+                retry_type = _classify_image_error(retry_exc)
+                error_text = f"{retry_type}: {retry_exc}"
+                _limited_warning("thumbnail", f"截断图片容错生成缩略图失败 {filepath}: {retry_exc}")
+                return None, None, None, "failed", error_text
+        error_text = f"{error_type}: {e}"
+        _limited_warning("thumbnail", f"缩略图生成失败 {filepath}: {e}")
+        return None, None, None, "failed", error_text
 
 
 INDEX_COMMIT_EVERY = 20
 INDEX_WORKERS = 2
 
 
-def compute_phash(filepath):
+def _compute_phash_once(filepath):
+    with Image.open(filepath) as img:
+        img = _auto_rotate(img)
+        img.thumbnail((256, 256), Image.LANCZOS)
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        return str(imagehash.phash(img))
+
+
+def compute_phash_result(filepath):
     try:
-        with Image.open(filepath) as img:
-            img = _auto_rotate(img)
-            img.thumbnail((256, 256), Image.LANCZOS)
-            if img.mode in ("RGBA", "P"):
-                img = img.convert("RGB")
-            return str(imagehash.phash(img))
+        return _compute_phash_once(filepath), "ok", None
     except Exception as e:
-        logger.warning(f"pHash计算失败 {filepath}: {e}")
-        return None
+        error_type = _classify_image_error(e)
+        if error_type == "truncated_or_broken_stream":
+            previous = ImageFile.LOAD_TRUNCATED_IMAGES
+            try:
+                ImageFile.LOAD_TRUNCATED_IMAGES = True
+                return _compute_phash_once(filepath), "recovered", None
+            except Exception as retry_exc:
+                retry_type = _classify_image_error(retry_exc)
+                error_text = f"{retry_type}: {retry_exc}"
+                _limited_warning("thumbnail", f"pHash容错计算失败 {filepath}: {retry_exc}")
+                return None, "failed", error_text
+            finally:
+                ImageFile.LOAD_TRUNCATED_IMAGES = previous
+        error_text = f"{error_type}: {e}"
+        _limited_warning("thumbnail", f"pHash计算失败 {filepath}: {e}")
+        return None, "failed", error_text
+
+
+def compute_phash(filepath):
+    phash, _status, _error = compute_phash_result(filepath)
+    return phash
 
 
 def dedup_by_phash(progress_callback=None):
@@ -230,7 +343,56 @@ def dedup_by_phash(progress_callback=None):
     return {"checked": len(rows), "duplicates": duplicate_count}
 
 
+def _metadata_row(
+    file_id,
+    date_taken=None,
+    camera_model=None,
+    gps_lat=None,
+    gps_lon=None,
+    width=None,
+    height=None,
+    thumbnail_path=None,
+    exif_json=None,
+    indexed_at=None,
+    phash=None,
+    phash_status="ok",
+    phash_error=None,
+    thumbnail_status="ok",
+    thumbnail_error=None,
+    source_file_size=None,
+    source_file_mtime=None,
+):
+    return (
+        file_id,
+        date_taken,
+        camera_model,
+        gps_lat,
+        gps_lon,
+        width,
+        height,
+        thumbnail_path,
+        exif_json,
+        indexed_at or datetime.now().isoformat(),
+        phash,
+        phash_status,
+        phash_error,
+        thumbnail_status,
+        thumbnail_error,
+        source_file_size,
+        source_file_mtime,
+    )
+
+
+def _source_stat(filepath):
+    try:
+        stat = os.stat(filepath)
+        return stat.st_size, datetime.fromtimestamp(stat.st_mtime).isoformat()
+    except OSError:
+        return None, None
+
+
 def _index_single_photo(file_id, file_path):
+    source_file_size, source_file_mtime = _source_stat(file_path)
     if not os.path.exists(file_path):
         logger.warning(f"文件不存在, 跳过: {file_path}")
         return None
@@ -239,16 +401,25 @@ def _index_single_photo(file_id, file_path):
         with Image.open(file_path) as _test:
             _test.load()  # 强制解码像素数据，提前捕获截断文件
     except Exception as e:
-        logger.warning(f"无法识别图片, 标记跳过: {file_path}: {e}")
-        return (
-            file_id, None, None, None, None,
-            None, None, "__FAILED__", None,
-            datetime.now().isoformat(), None,
-        )
+        error_type = _classify_image_error(e)
+        if error_type == "corrupted_or_unreadable":
+            _limited_warning("bad_image", f"无法识别图片, 标记跳过: {file_path}: {e}")
+            return _metadata_row(
+                file_id,
+                thumbnail_path="__FAILED__",
+                phash_status="skipped",
+                phash_error="thumbnail_failed",
+                thumbnail_status="skipped",
+                thumbnail_error=f"{error_type}: {e}",
+                source_file_size=source_file_size,
+                source_file_mtime=source_file_mtime,
+            )
+        if error_type != "truncated_or_broken_stream":
+            _limited_warning("bad_image", f"图片解码失败, 尝试缩略图链路: {file_path}: {e}")
 
     exif_data = extract_exif(file_path)
     thumbnail_name = build_thumbnail_filename(file_id)
-    thumb_path, orig_w, orig_h = generate_thumbnail(file_path, thumbnail_name)
+    thumb_path, orig_w, orig_h, thumb_status, thumb_error = generate_thumbnail(file_path, thumbnail_name)
 
     import json as json_mod
     exif_json = (
@@ -257,9 +428,12 @@ def _index_single_photo(file_id, file_path):
         else None
     )
 
-    phash = compute_phash(file_path)
+    if thumb_path:
+        phash, phash_status, phash_error = compute_phash_result(file_path)
+    else:
+        phash, phash_status, phash_error = None, "skipped", "thumbnail_failed"
 
-    return (
+    return _metadata_row(
         file_id,
         exif_data["date_taken"],
         exif_data["camera_model"],
@@ -267,10 +441,16 @@ def _index_single_photo(file_id, file_path):
         exif_data["gps_lon"],
         orig_w,
         orig_h,
-        thumb_path,
+        thumb_path or "__FAILED__",
         exif_json,
         datetime.now().isoformat(),
         phash,
+        phash_status,
+        phash_error,
+        thumb_status,
+        thumb_error,
+        source_file_size,
+        source_file_mtime,
     )
 
 
@@ -282,8 +462,10 @@ def _flush_pending_writes(pending_writes, limit=None):
         conn.executemany(
             """INSERT OR REPLACE INTO photo_metadata
                (file_id, date_taken, camera_model, gps_lat, gps_lon,
-                width, height, thumbnail_path, exif_json, indexed_at, phash)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                width, height, thumbnail_path, exif_json, indexed_at, phash,
+                phash_status, phash_error,
+                thumbnail_status, thumbnail_error, source_file_size, source_file_mtime)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             rows_to_write,
         )
     flushed = len(rows_to_write)
@@ -314,12 +496,13 @@ def _process_index_batch(batch_rows, workers):
     return ordered_results
 
 
-def index_photos(progress_callback=None, batch_limit=None, workers=INDEX_WORKERS, batch_size=INDEX_COMMIT_EVERY):
+def index_photos(progress_callback=None, batch_limit=None, workers=INDEX_WORKERS, batch_size=INDEX_COMMIT_EVERY, force_retry=False):
     _db.init_tables()
+    _reset_warning_counters()
     workers = max(int(workers), 1)
     batch_size = max(int(batch_size), 1)
 
-    photos = get_unindexed_photos()
+    photos = get_unindexed_photos(force_retry=force_retry)
     total = len(photos)
     logger.info(f"开始索引照片: 共 {total} 张待索引, workers={workers}, batch_size={batch_size}")
     cp = _cp.load()

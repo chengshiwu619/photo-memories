@@ -360,6 +360,27 @@ def _fingerprint_is_current(row, fingerprint_info):
     return row.get("status") == "ok"
 
 
+def _backfill_fingerprint_if_trusted(folder_path, row, fingerprint_info):
+    if not row:
+        return False
+    if row.get("fingerprint"):
+        return False
+    if row.get("category") not in (CATEGORY_LIFE, CATEGORY_SAMPLE):
+        return False
+    status = row.get("status") or "ok"
+    confidence = row.get("confidence") or ""
+    if status in {"pending", "error"} or "pending" in confidence or "error" in confidence:
+        return False
+    set_folder_category(
+        folder_path,
+        row["category"],
+        confidence,
+        fingerprint=fingerprint_info["fingerprint"],
+        status="ok",
+    )
+    return True
+
+
 def set_folder_category(
     folder_path,
     category,
@@ -571,6 +592,17 @@ def classify_folders(progress_callback=None):
             fp_info = build_folder_fingerprint(bp)
             current = _get_folder_category_row(bp)
             if current and _is_manual_confidence(current.get("confidence")):
+                if not current.get("fingerprint"):
+                    set_folder_category(
+                        bp,
+                        current["category"],
+                        current.get("confidence"),
+                        fingerprint=fp_info["fingerprint"],
+                        status="ok",
+                    )
+                skipped_count += 1
+                continue
+            if _backfill_fingerprint_if_trusted(bp, current, fp_info):
                 skipped_count += 1
                 continue
             if _fingerprint_is_current(current, fp_info):

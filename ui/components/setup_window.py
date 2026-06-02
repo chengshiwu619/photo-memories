@@ -62,6 +62,13 @@ _SCROLL_STYLE = """
 """
 
 
+def _normalize_source_input_path(path: str) -> str:
+    path = (path or "").strip()
+    if path and len(path) >= 2 and path[0] == "\\" and path[1] != "\\":
+        return "\\" + path
+    return path
+
+
 class SetupWindow(QWidget):
     config_saved = pyqtSignal()
 
@@ -413,10 +420,14 @@ class SetupWindow(QWidget):
         if not src:
             errors.append("请指定照片库文件夹")
         else:
+            normalized_sources = []
             for p in src.split(";"):
-                p = p.strip()
+                p = _normalize_source_input_path(p)
+                if p:
+                    normalized_sources.append(p)
                 if p and not os.path.exists(p):
                     errors.append(f"照片库路径不存在: {p}")
+            src = ";".join(normalized_sources)
         if not data:
             errors.append("请指定缓存数据文件夹")
         if not api_key:

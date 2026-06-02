@@ -184,3 +184,43 @@ def test_incremental_scan_reports_paused_state(tmp_path, monkeypatch):
     assert result["state"] == "paused"
     assert result["paused"] is True
     assert result["scanned"] == 1
+
+
+def test_everything_query_is_limited_to_source_root(tmp_path, monkeypatch):
+    scan_mod, _db, settings, source_dir = _configure(tmp_path, monkeypatch)
+
+    query = scan_mod._build_everything_source_query(settings)
+
+    assert str(source_dir) in query
+    assert "-path" in query
+    assert "ext:" in query
+
+
+def test_everything_path_query_uses_path_option_and_normalizes_drive_alias(tmp_path, monkeypatch):
+    scan_mod, _db, settings, _source_dir = _configure(tmp_path, monkeypatch)
+    monkeypatch.setattr(scan_mod, "_everything_source_search_paths", lambda settings=None: [r"Y:\\"])
+    monkeypatch.setattr(scan_mod, "_match_source_dir", lambda filepath: settings.source_drive if filepath.startswith("Y:") else None)
+    monkeypatch.setattr(scan_mod, "_normalize_filepath", lambda filepath, source_dir: filepath.replace("Y:", source_dir, 1))
+
+    calls = []
+
+    def fake_run_es(args, timeout=120):
+        calls.append(args)
+        return '"Y:\\\\NW\\\\file?.jpg"', 0
+
+    monkeypatch.setattr(scan_mod, "_run_es", fake_run_es)
+
+    files = scan_mod._query_everything_source_files(limit=10, timeout=5, settings=settings)
+
+    assert calls[0][:2] == ["-path", r"Y:\\"]
+    assert "ext:" in calls[0][-1]
+    assert files == [settings.source_drive + r"\\NW\\file?.jpg"]
+
+
+def test_parse_es_csv_keeps_literal_question_mark_paths(tmp_path, monkeypatch):
+    scan_mod, _db, settings, _source_dir = _configure(tmp_path, monkeypatch)
+    path = os.path.normpath(os.path.join(settings.source_drive, "NW", "file?.jpg"))
+
+    files = scan_mod._parse_es_csv(f'"{path}"')
+
+    assert files == [path]

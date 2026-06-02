@@ -857,6 +857,7 @@ def main():
         _bg_scan_started = [False]
         _bg_index_started = [False]
         _bg_classify_started = [False]
+        _bg_classify_completed = [False]
 
         def show_main_window():
             logger.info("show_main_window 开始, 优先构建主界面...")
@@ -901,7 +902,7 @@ def main():
             logger.info("回忆发现线程已启动")
 
         def start_background_folder_classify():
-            if _bg_classify_started[0]:
+            if _bg_classify_started[0] or _bg_classify_completed[0]:
                 logger.info("后台文件夹分类已在运行，跳过重复启动")
                 return
             _bg_classify_started[0] = True
@@ -929,6 +930,7 @@ def main():
                         logger.exception("后台文件夹分类失败")
                     finally:
                         _bg_classify_started[0] = False
+                        _bg_classify_completed[0] = True
 
             bg = BgClassifyWorker()
             bg.finished.connect(lambda: logger.info("后台文件夹分类线程结束"))
