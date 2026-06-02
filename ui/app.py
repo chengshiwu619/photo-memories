@@ -1005,7 +1005,11 @@ def main():
             logger.info("后台标签生成线程已启动")
 
         def start_background_faces():
-            """后台人脸检测 + 嵌入提取 + 聚类"""
+            """后台人脸检测 + 嵌入提取 + 聚类（需启用 ENABLE_FACE_DETECTION）。"""
+            settings = get_settings()
+            if not getattr(settings, "enable_face_detection", False):
+                logger.debug("人脸检测未启用 (ENABLE_FACE_DETECTION=false), 跳过后台人脸处理")
+                return
             if _bg_faces_started[0]:
                 logger.info("后台人脸处理已在运行，跳过重复启动")
                 return
@@ -1086,7 +1090,7 @@ def main():
                     result = incremental_scan(
                         progress_callback=lambda cur, tot: None,
                         dry_run=False,
-                        limit=max(int(getattr(settings, "background_scan_limit", 1000)), 0) or None,
+                        limit=max(int(getattr(settings, "background_scan_limit", 1000)), 1),
                         es_timeout=max(int(getattr(settings, "everything_timeout_seconds", 20)), 1),
                         status_callback=manager.update_from_scan_result,
                     )

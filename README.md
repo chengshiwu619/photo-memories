@@ -17,6 +17,7 @@
 - SQLite
 - 可选：Everything / `es.exe`
 - 可选：SigLIP 依赖（仅增强标签，不阻塞基础流程）
+- 可选：deepface（人脸检测/聚类，默认关闭，设置 `ENABLE_FACE_DETECTION=true` 启用）
 
 ## 安装
 

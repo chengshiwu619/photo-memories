@@ -1,0 +1,12 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^d:/photo-memories-source/\\.venv/Scripts/python\\.exe -m pytest tests/test_path_resolver\\.py -v --tb=short 2>&1$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^d:/photo-memories-source/\\.venv/Scripts/python\\.exe -m pytest tests/ -v --tb=short --ignore=tests/test_path_resolver\\.py -x 2>&1$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

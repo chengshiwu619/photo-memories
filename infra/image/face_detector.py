@@ -5,22 +5,43 @@ from logger_setup import logger
 from infra.image.thumbnail_loader import get_thumbnail_loader
 
 _detector = None
+_initialized = False
+_warning_issued = False
+
+
+def _is_enabled() -> bool:
+    """检查是否启用人脸检测（默认关闭）。"""
+    try:
+        from config import get_settings
+        return bool(getattr(get_settings(), "enable_face_detection", False))
+    except Exception:
+        return False
 
 
 def _load_detector():
-    global _detector
-    if _detector is not None:
-        return True
+    global _detector, _initialized, _warning_issued
+    if _initialized:
+        return _detector is not None
+    _initialized = True
+
+    if not _is_enabled():
+        logger.debug("人脸检测未启用 (ENABLE_FACE_DETECTION=false), 跳过 DeepFace 加载")
+        return False
+
     try:
         from deepface import DeepFace
         _detector = DeepFace
         logger.info("DeepFace 加载完成")
         return True
     except ImportError:
-        logger.warning("deepface 未安装, 人脸检测不可用. 安装: pip install deepface")
+        if not _warning_issued:
+            logger.warning("deepface 未安装, 人脸检测不可用. 安装: pip install deepface")
+            _warning_issued = True
         return False
     except Exception as e:
-        logger.error(f"DeepFace 加载失败: {e}")
+        if not _warning_issued:
+            logger.error(f"DeepFace 加载失败: {e}")
+            _warning_issued = True
         return False
 
 

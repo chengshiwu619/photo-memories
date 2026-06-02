@@ -577,7 +577,11 @@ def _iter_walk_files(limit=None, verbose=False):
                     continue
                 yield result.normalized_path
                 yielded += 1
+                if yielded % 500 == 0:
+                    logger.info(f"  目录遍历进度: 已发现 {yielded} 个媒体文件" +
+                                (f" (limit={limit})" if limit else ""))
                 if limit and yielded >= limit:
+                    logger.info(f"  目录遍历已达 limit={limit}，停止遍历")
                     return
 
 
@@ -679,12 +683,19 @@ def incremental_scan(
     scan_db = db or _db
     scan_db.init_tables()
 
+    # 后台/安全模式：limit 为 None 或 0 时强制改为安全默认值 1000
+    DEFAULT_SAFE_LIMIT = 1000
+    if limit is None or (isinstance(limit, int) and limit <= 0):
+        limit = DEFAULT_SAFE_LIMIT
+        logger.info("limit 缺失或无效，强制使用安全默认值: %s", limit)
+
     logger.info(
-        "增量扫描开始: source_drive=%s limit=%s dry_run=%s prefer_everything=%s",
+        "增量扫描开始: source_drive=%s limit=%s dry_run=%s prefer_everything=%s background_scan_limit=%s",
         _s.source_drive,
         limit,
         dry_run,
         prefer_everything,
+        limit,
     )
 
     file_list, discovery_source = _discover_incremental_files(
@@ -880,6 +891,13 @@ def incremental_scan(
     stats["samples"]["bad_paths"] = final_bad_path_samples
     if status_callback:
         status_callback(dict(stats))
+    logger.info(
+        "增量扫描完成: scanned=%s new=%s existing=%s changed=%s skipped=%s errors=%s "
+        "bad_paths=%s discovery=%s batch_limit_reached=%s limit=%s",
+        stats["scanned"], stats["new"], stats["existing"], stats["changed"],
+        stats["skipped"], stats["errors"], final_bad_path_count,
+        discovery_source, stats["batch_limit_reached"], limit,
+    )
     logger.info("增量扫描写库完成: %s", stats)
     return stats
 

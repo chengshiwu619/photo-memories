@@ -525,3 +525,100 @@ class TestIndexerPathFilter:
         ids = {p[0] for p in photos}
         assert 1 in ids
         assert 2 not in ids  # missing status excluded
+
+
+# ============================================================================
+# 后台扫描 limit 安全测试
+# ============================================================================
+
+class TestBackgroundScanLimitSafety:
+    """后台扫描 limit 缺失时不会触发无限全量扫描。"""
+
+    def test_incremental_scan_limit_none_falls_back_to_default(self, tmp_path, monkeypatch):
+        """limit=None 时 incremental_scan 强制使用安全默认值。"""
+        scan_mod, db, settings, source_dir = _configure(tmp_path, monkeypatch)
+        (source_dir / "a.jpg").write_bytes(b"a")
+
+        result = scan_mod.incremental_scan(
+            limit=None,
+            dry_run=False,
+            prefer_everything=False,
+            db=db,
+            settings=settings,
+        )
+        # limit=None 应该被替换为 DEFAULT_SAFE_LIMIT (1000)，不应报错
+        assert result["scanned"] >= 1
+        assert result["batch_limit_reached"] is False  # 1 个文件 < 1000
+
+    def test_incremental_scan_limit_zero_falls_back_to_default(self, tmp_path, monkeypatch):
+        """limit=0 时 incremental_scan 强制使用安全默认值。"""
+        scan_mod, db, settings, source_dir = _configure(tmp_path, monkeypatch)
+        (source_dir / "b.jpg").write_bytes(b"b")
+
+        result = scan_mod.incremental_scan(
+            limit=0,
+            dry_run=False,
+            prefer_everything=False,
+            db=db,
+            settings=settings,
+        )
+        assert result["scanned"] >= 1
+        assert result["batch_limit_reached"] is False
+
+    def test_incremental_scan_limit_negative_falls_back_to_default(self, tmp_path, monkeypatch):
+        """limit 为负数时强制使用安全默认值。"""
+        scan_mod, db, settings, source_dir = _configure(tmp_path, monkeypatch)
+        (source_dir / "c.jpg").write_bytes(b"c")
+
+        result = scan_mod.incremental_scan(
+            limit=-1,
+            dry_run=False,
+            prefer_everything=False,
+            db=db,
+            settings=settings,
+        )
+        assert result["scanned"] >= 1
+
+    def test_incremental_scan_respects_small_limit(self, tmp_path, monkeypatch):
+        """正常的小 limit 值被正确遵守，处理到 limit 后停止。"""
+        scan_mod, db, settings, source_dir = _configure(tmp_path, monkeypatch)
+        for i in range(15):
+            (source_dir / f"img_{i:04d}.jpg").write_bytes(b"x")
+
+        result = scan_mod.incremental_scan(
+            limit=5,
+            dry_run=False,
+            prefer_everything=False,
+            db=db,
+            settings=settings,
+        )
+        # 发现 15 个文件，但 limit=5，应该只处理到 5 个
+        assert result["scanned"] <= 5
+        assert result["batch_limit_reached"] is True or result["scanned"] == 5
+
+    def test_walk_fallback_respects_limit(self, tmp_path, monkeypatch):
+        """目录遍历 fallback 在达到 limit 后停止，不先收集全部文件。"""
+        scan_mod, db, settings, source_dir = _configure(tmp_path, monkeypatch)
+
+        # 创建 50 个文件，遍历应停在 limit=10
+        for i in range(50):
+            (source_dir / f"img_{i:04d}.jpg").write_bytes(b"x")
+
+        # 直接测试 _iter_walk_files 的行为
+        files = list(scan_mod._iter_walk_files(limit=10, verbose=False))
+        assert len(files) <= 10
+        # 50 个文件，但 limit=10 意味着只 yield 了 10 个
+        assert 0 < len(files) <= 10
+
+    def test_config_background_scan_limit_default_1000(self):
+        """config 中 background_scan_limit 默认值为 1000（非 0）。"""
+        from config import Settings
+        s = Settings()
+        assert s.background_scan_limit == 1000
+
+    def test_config_background_scan_limit_not_zero(self):
+        """config 默认值不是 0（0 会导致 or None 表达式返回 None）。"""
+        from config import Settings
+        s = Settings()
+        assert s.background_scan_limit > 0
+
