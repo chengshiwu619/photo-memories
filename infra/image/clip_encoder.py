@@ -1,4 +1,5 @@
 import numpy as np
+import sys
 from typing import Optional, List, Tuple
 
 from logger_setup import logger
@@ -11,6 +12,7 @@ _tokenizer = None
 _device = None
 _model_name = "ViT-SO400M-14-SigLIP-384"
 _pretrained = "webli"
+_missing_open_clip_warned = False
 
 
 def _reset_model():
@@ -25,12 +27,71 @@ def get_active_device() -> str:
     return _device or "unloaded"
 
 
+def _torch_runtime_info():
+    info = {"torch_version": None, "cuda_available": None}
+    try:
+        import torch
+
+        info["torch_version"] = getattr(torch, "__version__", None)
+        info["cuda_available"] = bool(torch.cuda.is_available())
+    except Exception as exc:
+        info["torch_error"] = repr(exc)
+    return info
+
+
+def _warn_open_clip_missing_once(exc):
+    global _missing_open_clip_warned
+    if _missing_open_clip_warned:
+        return
+    _missing_open_clip_warned = True
+    logger.warning("open_clip 未安装, SigLIP 不可用. 安装: pip install open-clip-torch; exception=%r", exc)
+
+
+def _log_model_load_failed(exc, target_device, open_clip_imported):
+    runtime = _torch_runtime_info()
+    logger.error(
+        "SigLIP model_load_failed: executable=%s device=%s torch_version=%s "
+        "cuda_available=%s open_clip_imported=%s model=%s pretrained=%s exception=%r",
+        sys.executable,
+        target_device,
+        runtime.get("torch_version"),
+        runtime.get("cuda_available"),
+        open_clip_imported,
+        _model_name,
+        _pretrained,
+        exc,
+    )
+
+
+def _import_open_clip():
+    try:
+        import open_clip
+
+        return open_clip
+    except ModuleNotFoundError as exc:
+        if exc.name == "open_clip":
+            _warn_open_clip_missing_once(exc)
+            return None
+        raise
+    except ImportError as exc:
+        if "open_clip" in str(exc):
+            _warn_open_clip_missing_once(exc)
+            return None
+        raise
+
+
 def _load_model(preferred_device: Optional[str] = None):
     global _model, _preprocess, _tokenizer, _device
     if _model is not None:
         return True
+    open_clip = None
+    target_device = preferred_device or "unknown"
     try:
-        import open_clip
+        open_clip = _import_open_clip()
+        if open_clip is None:
+            _reset_model()
+            return False
+
         import torch
         from services.ai_device import resolve_ai_device
 
@@ -51,12 +112,22 @@ def _load_model(preferred_device: Optional[str] = None):
         _device = target_device
         logger.info(f"SigLIP 模型加载完成: {_model_name}, device={_device}, cuda_available={torch.cuda.is_available()}")
         return True
-    except ImportError:
-        logger.warning("open_clip 未安装, SigLIP 不可用. 安装: pip install open-clip-torch")
+    except ModuleNotFoundError as exc:
+        if exc.name == "open_clip":
+            _warn_open_clip_missing_once(exc)
+        else:
+            _log_model_load_failed(exc, target_device, open_clip is not None)
+        _reset_model()
+        return False
+    except ImportError as exc:
+        if "open_clip" in str(exc) and open_clip is None:
+            _warn_open_clip_missing_once(exc)
+        else:
+            _log_model_load_failed(exc, target_device, open_clip is not None)
         _reset_model()
         return False
     except Exception as e:
-        logger.error(f"SigLIP 模型加载失败: {e}")
+        _log_model_load_failed(e, target_device, open_clip is not None)
         _reset_model()
         return False
 
@@ -64,11 +135,7 @@ def _load_model(preferred_device: Optional[str] = None):
 def is_available() -> bool:
     if _model is not None:
         return True
-    try:
-        import open_clip
-        return True
-    except ImportError:
-        return False
+    return _import_open_clip() is not None
 
 
 def encode_image(file_id: int) -> Optional[np.ndarray]:
