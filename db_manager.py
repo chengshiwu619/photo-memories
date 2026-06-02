@@ -175,11 +175,17 @@ class Database:
                 file_hash TEXT,
                 is_image INTEGER DEFAULT 1,
                 scanned_at TEXT,
-                source_dir TEXT
+                source_dir TEXT,
+                canonical_key TEXT,
+                normalized_path TEXT,
+                path_status TEXT DEFAULT 'pending',
+                path_error TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_files_folder ON files(folder_path);
             CREATE INDEX IF NOT EXISTS idx_files_hash ON files(file_hash);
             CREATE INDEX IF NOT EXISTS idx_files_source_dir ON files(source_dir);
+            CREATE INDEX IF NOT EXISTS idx_files_canonical_key ON files(canonical_key);
+            CREATE INDEX IF NOT EXISTS idx_files_path_status ON files(path_status);
 
             CREATE TABLE IF NOT EXISTS folder_categories (
                 folder_path TEXT PRIMARY KEY,
@@ -460,6 +466,25 @@ class Database:
                 if not self._column_exists(conn, "photo_metadata", col):
                     conn.execute(f"ALTER TABLE photo_metadata ADD COLUMN {col} {ddl}")
                     logger.info(f"补建缺失字段: photo_metadata.{col}")
+        files_columns = [
+            ("canonical_key", "TEXT"),
+            ("normalized_path", "TEXT"),
+            ("path_status", "TEXT DEFAULT 'pending'"),
+            ("path_error", "TEXT"),
+        ]
+        if self._table_exists(conn, "files"):
+            for col, ddl in files_columns:
+                if not self._column_exists(conn, "files", col):
+                    conn.execute(f"ALTER TABLE files ADD COLUMN {col} {ddl}")
+                    logger.info(f"补建缺失字段: files.{col}")
+            for idx_name, idx_sql in [
+                ("idx_files_canonical_key", "CREATE INDEX IF NOT EXISTS idx_files_canonical_key ON files(canonical_key)"),
+                ("idx_files_path_status", "CREATE INDEX IF NOT EXISTS idx_files_path_status ON files(path_status)"),
+            ]:
+                try:
+                    conn.execute(idx_sql)
+                except Exception:
+                    pass
         conn.commit()
 
     def _check_and_clear_thumbnails(self, conn):

@@ -84,12 +84,18 @@ def set_stopped():
 
 
 def get_unindexed_photos(force_retry=False):
+    """获取待索引照片列表，排除路径状态异常的文件。"""
+    # 路径状态过滤：排除 damaged/missing/stat_failed/outside_root
+    path_filter = """AND (f.path_status IS NULL OR f.path_status NOT IN
+        ('damaged_path', 'missing', 'stat_failed', 'outside_root'))"""
+
     with _db.connect() as conn:
         if force_retry:
-            rows = conn.execute("""
+            rows = conn.execute(f"""
                 SELECT f.id, f.file_path FROM files f
                 LEFT JOIN photo_metadata pm ON f.id = pm.file_id
                 WHERE f.is_image = 1
+                  {path_filter}
                   AND (
                       pm.file_id IS NULL
                       OR pm.thumbnail_path IS NULL
@@ -99,10 +105,11 @@ def get_unindexed_photos(force_retry=False):
             """).fetchall()
             return rows
 
-        rows = conn.execute("""
+        rows = conn.execute(f"""
             SELECT f.id, f.file_path FROM files f
             LEFT JOIN photo_metadata pm ON f.id = pm.file_id
             WHERE f.is_image = 1
+              {path_filter}
               AND (
                   pm.file_id IS NULL
                   OR pm.thumbnail_path IS NULL

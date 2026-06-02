@@ -3,6 +3,13 @@ import random
 
 from db_manager import Database
 
+# 路径健康状态过滤条件：排除 damaged/missing/stat_failed/outside_root
+# 旧数据 path_status 为 NULL 的仍然可见（兼容）
+_PATH_STATUS_FILTER = (
+    "AND (f.path_status IS NULL OR f.path_status NOT IN "
+    "('damaged_path', 'missing', 'stat_failed', 'outside_root'))"
+)
+
 CATEGORY_COLORS = {
     1: "#27ae60", 2: "#2980b9",
 }
@@ -178,6 +185,7 @@ def load_photos_from_ids(db, all_ids, require_thumbnail=False):
             FROM files f
             LEFT JOIN photo_metadata pm ON f.id = pm.file_id
             WHERE f.id IN ({placeholders})
+                  {_PATH_STATUS_FILTER}
                   AND (pm.thumbnail_path IS NULL OR pm.thumbnail_path != '__FAILED__')""",
         unique_ids,
     ).fetchall()
@@ -237,7 +245,7 @@ def _supplement_memory_photos(db, cat_id, photos, excluded_ids, needed):
             if needed <= 0:
                 break
 
-    base_select = """
+    base_select = f"""
         SELECT f.id, f.file_path, f.file_name, f.folder_path,
                f.folder_name as folder_display, f.file_mtime, pm.thumbnail_path,
                pm.width, pm.height, pm.date_taken
@@ -245,6 +253,7 @@ def _supplement_memory_photos(db, cat_id, photos, excluded_ids, needed):
         JOIN folder_categories fc ON f.folder_path = fc.folder_path
         JOIN photo_metadata pm ON f.id = pm.file_id
         WHERE fc.category = ?
+          {_PATH_STATUS_FILTER}
           AND f.is_image IN (0, 1)
           AND pm.thumbnail_path IS NOT NULL
           AND pm.thumbnail_path != '__FAILED__'
@@ -318,7 +327,7 @@ def _load_ranked_memory_photos(db, cat_id):
 
 
 def load_category_photos_batch(db, cat_id, offset, limit=PAGE_SIZE):
-    rows = db.execute("""
+    rows = db.execute(f"""
         SELECT f.id, f.file_path, f.file_name, f.folder_path,
                f.folder_name as folder_display, f.file_mtime, pm.thumbnail_path,
                pm.width, pm.height, pm.date_taken
@@ -326,6 +335,7 @@ def load_category_photos_batch(db, cat_id, offset, limit=PAGE_SIZE):
         LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
         LEFT JOIN photo_metadata pm ON f.id = pm.file_id
         WHERE COALESCE(fc.category, 1) = ? AND f.is_image IN (0, 1)
+              {_PATH_STATUS_FILTER}
               AND (pm.thumbnail_path IS NULL OR pm.thumbnail_path != '__FAILED__')
               AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
         ORDER BY pm.date_taken DESC
@@ -334,13 +344,14 @@ def load_category_photos_batch(db, cat_id, offset, limit=PAGE_SIZE):
     if not rows and offset == 0:
         total_cats = db.execute("SELECT COUNT(*) FROM folder_categories").fetchone()[0]
         if total_cats == 0:
-            rows = db.execute("""
+            rows = db.execute(f"""
                 SELECT f.id, f.file_path, f.file_name, f.folder_path,
                        f.folder_name as folder_display, f.file_mtime, pm.thumbnail_path,
                        pm.width, pm.height, pm.date_taken
                 FROM files f
                 LEFT JOIN photo_metadata pm ON f.id = pm.file_id
                 WHERE f.is_image IN (0, 1)
+                      {_PATH_STATUS_FILTER}
                       AND (pm.thumbnail_path IS NULL OR pm.thumbnail_path != '__FAILED__')
                       AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
                 ORDER BY pm.date_taken DESC
@@ -355,14 +366,16 @@ def load_category_photos_batch(db, cat_id, offset, limit=PAGE_SIZE):
 
 
 def load_starred_photos(db, cat_id):
-    rows = db.execute("""
+    rows = db.execute(f"""
         SELECT f.id, f.file_path, f.file_name, f.folder_path,
                f.folder_name as folder_display, f.file_mtime, pm.thumbnail_path,
                pm.width, pm.height, pm.date_taken
         FROM files f
         JOIN photo_metadata pm ON f.id = pm.file_id
         JOIN folder_categories fc ON f.folder_path = fc.folder_path
-        WHERE pm.is_starred = 1 AND f.is_image = 1 AND fc.category = ? AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
+        WHERE pm.is_starred = 1 AND f.is_image = 1 AND fc.category = ?
+              {_PATH_STATUS_FILTER}
+              AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
         ORDER BY pm.date_taken DESC
     """, (cat_id,)).fetchall()
     import os as _os

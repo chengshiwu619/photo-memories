@@ -6,6 +6,14 @@ from logger_setup import logger
 from config import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, get_settings
 from db_manager import Database
 from checkpoint_manager import CheckpointManager, CheckpointState
+from services.path_resolver import (
+    resolve_file_path,
+    compute_canonical_key,
+    normalize_path_slashes,
+    PathStatus,
+    PathResolveResult,
+    is_media_extension,
+)
 
 ALL_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -15,7 +23,7 @@ FALLBACK_ES = os.path.join(os.environ.get("TEMP", os.path.expanduser("~")), "es_
 _ES_INSTANCE = None
 _BAD_PATH_COUNT = 0
 _BAD_PATH_SAMPLES = []
-BAD_PATH_SAMPLE_LIMIT = 10
+BAD_PATH_SAMPLE_LIMIT = 20
 
 _db = Database()
 _cp = CheckpointManager(_db, "scan")
@@ -381,21 +389,32 @@ def _list_all_image_files():
 
 
 def _parse_es_csv(text):
+    """解析 Everything CSV 输出，解析并过滤每条路径。
+
+    使用 path_resolver 检测损坏路径、outside_root、不支持的扩展名。
+    损坏路径直接丢弃（后续依赖目录遍历 fallback 发现真实 Unicode 路径）。
+    """
     files = []
+    source_dirs = get_settings().source_dirs
     for line in text.strip().split("\n"):
         line = line.strip()
         filepath = line.strip("\"")
-        if "\ufffd" in filepath:
-            if _looks_like_source_path(filepath):
-                _record_bad_path_sample(filepath, "encoding_damaged")
+        if not filepath:
             continue
-        sd = _match_source_dir(filepath)
-        if sd is None:
+
+        # 使用 path_resolver 做路径级检查（不 stat，减少 IO）
+        result = resolve_file_path(filepath, source_dirs, stat_file=False)
+        if result.status == PathStatus.DAMAGED_PATH:
+            _record_bad_path_sample(filepath, f"damaged_path: {result.reason}")
             continue
-        filepath = _normalize_filepath(filepath, sd)
-        ext = os.path.splitext(filepath)[1].lower()
-        if ext in ALL_EXTENSIONS:
-            files.append(filepath)
+        if result.status == PathStatus.OUTSIDE_ROOT:
+            # 不在配置的源目录下，静默跳过
+            continue
+        if result.status == PathStatus.UNSUPPORTED_EXT:
+            continue
+
+        # 通过规范化后的路径
+        files.append(result.normalized_path)
     return files
 
 
@@ -536,19 +555,27 @@ def _canonicalize_discovered_path(filepath):
 
 def _iter_walk_files(limit=None, verbose=False):
     _s = get_settings()
+    source_dirs = _s.source_dirs
     yielded = 0
-    for source_dir in _s.source_dirs:
+    for source_dir in source_dirs:
         if not os.path.isdir(source_dir):
             logger.warning(f"照片库路径不存在, 跳过: {source_dir}")
             continue
         for root, dirs, files in os.walk(source_dir):
             for fname in files:
-                ext = os.path.splitext(fname)[1].lower()
-                if ext not in ALL_EXTENSIONS:
+                raw_path = os.path.join(root, fname)
+                # 目录遍历结果也走 path_resolver（检测损坏路径、扩展名等）
+                result = resolve_file_path(raw_path, source_dirs, stat_file=False)
+                if result.status == PathStatus.UNSUPPORTED_EXT:
                     if verbose:
-                        logger.debug(f"跳过非媒体扩展名: {os.path.join(root, fname)}")
+                        logger.debug(f"跳过非媒体扩展名: {raw_path}")
                     continue
-                yield _canonicalize_discovered_path(os.path.join(root, fname))
+                if result.status == PathStatus.DAMAGED_PATH:
+                    _record_bad_path_sample(raw_path, f"damaged_path: {result.reason}")
+                    continue
+                if result.status == PathStatus.OUTSIDE_ROOT:
+                    continue
+                yield result.normalized_path
                 yielded += 1
                 if limit and yielded >= limit:
                     return
@@ -564,7 +591,7 @@ def _discover_incremental_files(limit=None, prefer_everything=True, verbose=Fals
             timeout = es_timeout or getattr(get_settings(), "everything_timeout_seconds", 20)
             files = _query_everything_source_files(limit=limit, timeout=timeout)
             if files:
-                files = [_canonicalize_discovered_path(fp) for fp in files]
+                # _parse_es_csv 已返回规范化路径，无需再次 canonicalize
                 logger.info("增量扫描 Everything 返回 %s 个媒体文件" % len(files))
                 return files, "everything"
             if verbose:
@@ -577,36 +604,60 @@ def _discover_incremental_files(limit=None, prefer_everything=True, verbose=Fals
     return files, "walk"
 
 
-def _build_file_row(filepath, settings):
-    stat = os.stat(filepath)
+def _build_file_row(filepath, settings, resolve_result=None):
+    """构建 files 表插入行。
+
+    Args:
+        filepath: 规范化后的文件路径
+        settings: 配置
+        resolve_result: 可选的 PathResolveResult（如果已有 stat 结果）
+    """
     folder = os.path.normpath(os.path.dirname(filepath))
     source_dir = _match_source_dir(filepath)
     if source_dir is None and settings.source_dirs:
         source_dir = settings.source_dirs[0]
     is_image = os.path.splitext(filepath)[1].lower() in IMAGE_EXTENSIONS
+
+    if resolve_result is not None and resolve_result.file_size is not None:
+        file_size = resolve_result.file_size
+        file_mtime = resolve_result.file_mtime
+    else:
+        stat = os.stat(filepath)
+        file_size = stat.st_size
+        file_mtime = datetime.fromtimestamp(stat.st_mtime).isoformat()
+
     return {
         "file_path": filepath,
         "file_name": os.path.basename(filepath),
         "folder_path": folder,
         "folder_name": os.path.basename(folder),
-        "file_size": stat.st_size,
-        "file_mtime": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+        "file_size": file_size,
+        "file_mtime": file_mtime,
         "file_hash": None,
         "is_image": 1 if is_image else 0,
         "scanned_at": datetime.now().isoformat(),
         "source_dir": source_dir,
+        "canonical_key": compute_canonical_key(filepath),
+        "normalized_path": filepath,
+        "path_status": PathStatus.OK.value,
+        "path_error": None,
     }
 
 
 def _load_existing_file_index(db):
+    """加载已有文件索引，按 canonical_key 索引用于去重匹配。
+
+    如果 canonical_key 为空（旧数据），fallback 到 normalize_path_identity(file_path)。
+    """
     existing = {}
     with db.connect() as conn:
         rows = conn.execute(
-            "SELECT id, file_path, file_size, file_mtime, source_dir FROM files"
+            "SELECT id, file_path, file_size, file_mtime, source_dir, canonical_key FROM files"
         ).fetchall()
     for row in rows:
-        canonical_path = _canonicalize_discovered_path(row["file_path"])
-        existing[normalize_path_identity(canonical_path)] = row
+        ck = row["canonical_key"] if row["canonical_key"] else compute_canonical_key(row["file_path"])
+        if ck:
+            existing[ck] = row
     return existing
 
 
@@ -680,6 +731,7 @@ def incremental_scan(
     seen_keys = set()
 
     total = len(file_list)
+    source_dirs = _s.source_dirs
     for i, raw_path in enumerate(file_list):
         if _cp.is_pause_or_stop_requested() or (should_stop and should_stop()):
             stats["state"] = "paused" if _cp.is_pause_or_stop_requested() else "stopped"
@@ -693,52 +745,76 @@ def incremental_scan(
             logger.info("增量扫描收到暂停请求")
             break
 
-        filepath = _canonicalize_discovered_path(raw_path)
-        key = normalize_path_identity(filepath)
+        # 对每条路径做完整 resolve（含 stat），捕获 stat_failed/missing
+        resolve_result = resolve_file_path(raw_path, source_dirs, stat_file=True)
+        filepath = resolve_result.normalized_path
+        canonical_key = resolve_result.canonical_key
         stats["scanned"] += 1
 
-        if key in seen_keys:
+        # 过滤不可入库的状态
+        if resolve_result.status in (PathStatus.DAMAGED_PATH, PathStatus.OUTSIDE_ROOT,
+                                       PathStatus.UNSUPPORTED_EXT):
             stats["skipped"] += 1
-            if verbose and len(stats["samples"]["skipped"]) < 10:
-                stats["samples"]["skipped"].append({"path": filepath, "reason": "duplicate_in_discovery"})
-            continue
-        seen_keys.add(key)
-
-        ext = os.path.splitext(filepath)[1].lower()
-        if ext not in ALL_EXTENSIONS:
-            stats["skipped"] += 1
-            if verbose and len(stats["samples"]["skipped"]) < 10:
-                stats["samples"]["skipped"].append({"path": filepath, "reason": "unsupported_extension"})
+            if verbose and len(stats["samples"]["skipped"]) < 20:
+                stats["samples"]["skipped"].append({
+                    "path": raw_path,
+                    "reason": f"{resolve_result.status.value}: {resolve_result.reason}",
+                })
+            _record_bad_path_sample(raw_path, f"{resolve_result.status.value}: {resolve_result.reason}")
             continue
 
+        if resolve_result.status in (PathStatus.MISSING, PathStatus.STAT_FAILED):
+            stats["errors"] += 1
+            if len(stats["samples"]["errors"]) < 20:
+                stats["samples"]["errors"].append({
+                    "path": filepath,
+                    "error": resolve_result.reason,
+                })
+            _record_bad_path_sample(filepath, f"{resolve_result.status.value}: {resolve_result.reason}")
+            logger.warning(f"增量扫描文件状态异常: {filepath}: {resolve_result.reason}")
+            continue
+
+        # seen_keys 去重（使用 canonical_key）
+        if canonical_key in seen_keys:
+            stats["skipped"] += 1
+            if verbose and len(stats["samples"]["skipped"]) < 20:
+                stats["samples"]["skipped"].append({"path": filepath, "reason": "duplicate_canonical_key"})
+            continue
+        seen_keys.add(canonical_key)
+
+        # 构建文件行（传入已完成的 resolve_result 避免重复 stat）
         try:
-            row = _build_file_row(filepath, _s)
+            row = _build_file_row(filepath, _s, resolve_result=resolve_result)
         except OSError as exc:
             stats["errors"] += 1
-            if len(stats["samples"]["errors"]) < 10:
+            if len(stats["samples"]["errors"]) < 20:
                 stats["samples"]["errors"].append({"path": filepath, "error": str(exc)})
+            _record_bad_path_sample(filepath, f"stat_failed: {exc}")
             logger.warning(f"增量扫描读取文件状态失败: {filepath}: {exc}")
             continue
 
-        old = existing.get(key)
+        old = existing.get(canonical_key)
         if old is None:
             stats["new"] += 1
             stats["thumbnail_pending"] += 1 if row["is_image"] else 0
             stats["tag_pending"] += 1 if row["is_image"] else 0
-            if len(stats["samples"]["new"]) < 10:
+            if len(stats["samples"]["new"]) < 20:
                 stats["samples"]["new"].append(filepath)
             pending_inserts.append(row)
         elif old["file_size"] != row["file_size"] or old["file_mtime"] != row["file_mtime"]:
             stats["changed"] += 1
             stats["thumbnail_pending"] += 1 if row["is_image"] else 0
             stats["tag_pending"] += 1 if row["is_image"] else 0
-            if len(stats["samples"]["changed"]) < 10:
+            if len(stats["samples"]["changed"]) < 20:
                 stats["samples"]["changed"].append(filepath)
             pending_updates.append((row, old["id"]))
         else:
             stats["existing"] += 1
-            if verbose and stats["existing"] <= 10:
-                logger.debug(f"增量扫描已存在且未变化: {filepath}")
+            # 即使文件未变，也更新 path_status / canonical_key（如果旧记录缺少）
+            old_ck = old["canonical_key"] if "canonical_key" in old.keys() else None
+            old_ps = old["path_status"] if "path_status" in old.keys() else None
+            if not old_ck or old_ps != PathStatus.OK.value:
+                pending_updates.append((row, old["id"]))
 
         if progress_callback:
             progress_callback(i + 1, total)
@@ -756,12 +832,14 @@ def incremental_scan(
             result = conn.execute(
                 """INSERT OR IGNORE INTO files
                    (file_path, file_name, folder_path, folder_name, file_size, file_mtime,
-                    file_hash, is_image, scanned_at, source_dir)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    file_hash, is_image, scanned_at, source_dir,
+                    canonical_key, normalized_path, path_status, path_error)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     row["file_path"], row["file_name"], row["folder_path"], row["folder_name"],
                     row["file_size"], row["file_mtime"], row["file_hash"], row["is_image"],
                     row["scanned_at"], row["source_dir"],
+                    row["canonical_key"], row["normalized_path"], row["path_status"], row["path_error"],
                 ),
             )
             stats["db_inserted"] += result.rowcount
@@ -770,12 +848,15 @@ def incremental_scan(
             result = conn.execute(
                 """UPDATE files
                    SET file_path = ?, file_name = ?, folder_path = ?, folder_name = ?,
-                       file_size = ?, file_mtime = ?, is_image = ?, scanned_at = ?, source_dir = ?
+                       file_size = ?, file_mtime = ?, is_image = ?, scanned_at = ?, source_dir = ?,
+                       canonical_key = ?, normalized_path = ?, path_status = ?, path_error = ?
                    WHERE id = ?""",
                 (
                     row["file_path"], row["file_name"], row["folder_path"], row["folder_name"],
                     row["file_size"], row["file_mtime"], row["is_image"], row["scanned_at"],
-                    row["source_dir"], file_id,
+                    row["source_dir"],
+                    row["canonical_key"], row["normalized_path"], row["path_status"], row["path_error"],
+                    file_id,
                 ),
             )
             stats["db_updated"] += result.rowcount
@@ -793,6 +874,10 @@ def incremental_scan(
 
     if stats["state"] == "running":
         stats["state"] = "done"
+    # 更新 bad_path 统计（包含扫描循环中发现的）
+    final_bad_path_count, final_bad_path_samples = _get_bad_path_stats()
+    stats["bad_path_count"] = final_bad_path_count
+    stats["samples"]["bad_paths"] = final_bad_path_samples
     if status_callback:
         status_callback(dict(stats))
     logger.info("增量扫描写库完成: %s", stats)

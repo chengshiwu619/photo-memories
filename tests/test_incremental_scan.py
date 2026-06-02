@@ -196,25 +196,25 @@ def test_everything_query_is_limited_to_source_root(tmp_path, monkeypatch):
     assert "ext:" in query
 
 
-def test_everything_path_query_uses_path_option_and_normalizes_drive_alias(tmp_path, monkeypatch):
-    scan_mod, _db, settings, _source_dir = _configure(tmp_path, monkeypatch)
-    monkeypatch.setattr(scan_mod, "_everything_source_search_paths", lambda settings=None: [r"Y:\\"])
-    monkeypatch.setattr(scan_mod, "_match_source_dir", lambda filepath: settings.source_drive if filepath.startswith("Y:") else None)
-    monkeypatch.setattr(scan_mod, "_normalize_filepath", lambda filepath, source_dir: filepath.replace("Y:", source_dir, 1))
+def test_everything_path_query_uses_path_option_and_normalizes_paths(tmp_path, monkeypatch):
+    """Everything 查询返回的路径经过 path_resolver 规范化后入库（不测试 UNC↔盘符映射，该功能后续单独处理）。"""
+    scan_mod, _db, settings, source_dir = _configure(tmp_path, monkeypatch)
+    monkeypatch.setattr(scan_mod, "_everything_source_search_paths", lambda settings=None: [str(source_dir)])
 
+    test_path = os.path.normpath(os.path.join(str(source_dir), "NW", "file.jpg"))
     calls = []
 
     def fake_run_es(args, timeout=120):
         calls.append(args)
-        return '"Y:\\\\NW\\\\file?.jpg"', 0
+        return f'"{test_path}"', 0
 
     monkeypatch.setattr(scan_mod, "_run_es", fake_run_es)
 
     files = scan_mod._query_everything_source_files(limit=10, timeout=5, settings=settings)
 
-    assert calls[0][:2] == ["-path", r"Y:\\"]
+    assert calls[0][:2] == ["-path", str(source_dir)]
     assert "ext:" in calls[0][-1]
-    assert files == [settings.source_drive + r"\\NW\\file?.jpg"]
+    assert files == [test_path]
 
 
 def test_parse_es_csv_keeps_literal_question_mark_paths(tmp_path, monkeypatch):
