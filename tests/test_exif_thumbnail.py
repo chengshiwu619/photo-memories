@@ -1,6 +1,7 @@
 import os
 import tempfile
 import shutil
+from types import SimpleNamespace
 from PIL import Image
 
 
@@ -43,10 +44,8 @@ def test_generate_thumbnail_creates_file():
         thumb_dir = os.path.join(tmp, "thumbs")
         os.makedirs(thumb_dir, exist_ok=True)
 
-        import config
-        fake_settings = config.get_settings()
+        fake_settings = SimpleNamespace(thumbnail_dir=thumb_dir, thumbnail_size=(600, 600))
         with patch("business.indexer.photo_indexer.get_settings", return_value=fake_settings):
-            fake_settings.__dict__["thumbnail_dir"] = thumb_dir
             try:
                 thumb_path, w, h, status, error = generate_thumbnail(src, "1.jpg")
                 assert thumb_path is not None
@@ -69,10 +68,8 @@ def test_generate_thumbnail_skips_existing():
         thumb_dir = os.path.join(tmp, "thumbs")
         os.makedirs(thumb_dir, exist_ok=True)
 
-        import config
-        fake_settings = config.get_settings()
+        fake_settings = SimpleNamespace(thumbnail_dir=thumb_dir, thumbnail_size=(600, 600))
         with patch("business.indexer.photo_indexer.get_settings", return_value=fake_settings):
-            fake_settings.__dict__["thumbnail_dir"] = thumb_dir
             try:
                 thumb_path1, w1, h1, status1, error1 = generate_thumbnail(src, "2.jpg")
                 assert thumb_path1 is not None
@@ -81,7 +78,7 @@ def test_generate_thumbnail_skips_existing():
                 thumb_path2, w2, h2, status2, error2 = generate_thumbnail(src, "2.jpg")
                 assert w2 is None
                 assert h2 is None
-                assert status2 == "ok"
+                assert status2 == "existing"
                 assert error2 is None
             finally:
                 pass
@@ -99,10 +96,8 @@ def test_generate_thumbnail_respects_max_size():
         thumb_dir = os.path.join(tmp, "thumbs")
         os.makedirs(thumb_dir, exist_ok=True)
 
-        import config
-        fake_settings = config.get_settings()
+        fake_settings = SimpleNamespace(thumbnail_dir=thumb_dir, thumbnail_size=(600, 600))
         with patch("business.indexer.photo_indexer.get_settings", return_value=fake_settings):
-            fake_settings.__dict__["thumbnail_dir"] = thumb_dir
             try:
                 thumb_path, w, h, status, error = generate_thumbnail(src, "3.jpg")
                 assert status == "ok"
@@ -120,6 +115,31 @@ def test_generate_thumbnail_respects_max_size():
                     assert abs(actual_ratio - expected_ratio) < 0.01
             finally:
                 pass
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_generate_thumbnail_fails_when_output_file_missing(monkeypatch):
+    from business.indexer.photo_indexer import generate_thumbnail
+    from unittest.mock import patch
+    tmp = tempfile.mkdtemp()
+    try:
+        src = os.path.join(tmp, "src.jpg")
+        _create_test_jpeg(src)
+        thumb_dir = os.path.join(tmp, "thumbs")
+        os.makedirs(thumb_dir, exist_ok=True)
+
+        fake_settings = SimpleNamespace(thumbnail_dir=thumb_dir, thumbnail_size=(600, 600))
+        with patch("business.indexer.photo_indexer.get_settings", return_value=fake_settings):
+            monkeypatch.setattr(
+                "business.indexer.photo_indexer.create_thumbnail_file",
+                lambda *args, **kwargs: (200, 150),
+            )
+            thumb_path, w, h, status, error = generate_thumbnail(src, "99.jpg")
+
+        assert thumb_path is None
+        assert status == "failed"
+        assert error == "thumbnail_file_missing_after_create"
     finally:
         shutil.rmtree(tmp)
 

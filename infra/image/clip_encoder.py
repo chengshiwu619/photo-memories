@@ -1,5 +1,6 @@
 import numpy as np
 import sys
+import warnings
 from typing import Optional, List, Tuple
 
 from logger_setup import logger
@@ -13,6 +14,16 @@ _device = None
 _model_name = "ViT-SO400M-14-SigLIP-384"
 _pretrained = "webli"
 _missing_open_clip_warned = False
+_hf_warning_filters_installed = False
+
+
+def _install_hf_warning_filters():
+    global _hf_warning_filters_installed
+    if _hf_warning_filters_installed:
+        return
+    _hf_warning_filters_installed = True
+    warnings.filterwarnings("once", message=".*unauthenticated.*", module="huggingface_hub.*")
+    warnings.filterwarnings("once", message=".*symlink.*", module="huggingface_hub.*")
 
 
 def _reset_model():
@@ -97,6 +108,7 @@ def _load_model(preferred_device: Optional[str] = None):
 
         info = resolve_ai_device()
         target_device = preferred_device or info.device
+        _install_hf_warning_filters()
         _model, _, _preprocess = open_clip.create_model_and_transforms(_model_name, pretrained=_pretrained)
         _tokenizer = open_clip.get_tokenizer(_model_name)
         try:

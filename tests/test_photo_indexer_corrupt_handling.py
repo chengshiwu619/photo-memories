@@ -153,12 +153,12 @@ def test_failed_thumbnail_is_not_requeued_until_file_changes_or_force_retry(monk
         )
 
     assert [tuple(row) for row in mod.get_unindexed_photos()] == []
-    assert [tuple(row) for row in mod.get_unindexed_photos(force_retry=True)] == [(10, str(src))]
+    assert [tuple(row) for row in mod.get_unindexed_photos(force_retry=True)] == [(10, str(src), "recover_needed")]
 
     with db.connect() as conn:
         conn.execute("UPDATE files SET file_size = ? WHERE id = ?", (20, 10))
 
-    assert [tuple(row) for row in mod.get_unindexed_photos()] == [(10, str(src))]
+    assert [tuple(row) for row in mod.get_unindexed_photos()] == [(10, str(src), "create_needed")]
 
 
 def test_phash_truncated_image_uses_tolerant_retry(monkeypatch):

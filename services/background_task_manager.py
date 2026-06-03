@@ -229,11 +229,16 @@ class BackgroundTaskManager:
             t.wait(timeout_ms)
             if t.isRunning():
                 logger.warning(f"后台线程 {t} 未能在 {timeout_ms}ms 内结束")
-        self._threads.clear()
+        self._threads = [t for t in self._threads if t.isRunning()]
 
     def cancel_all(self):
         for t in self._threads[:]:
             if t.isRunning():
+                stopper = getattr(t, "request_stop", None)
+                if callable(stopper):
+                    stopper()
+                elif hasattr(t, "requestInterruption"):
+                    t.requestInterruption()
                 t.quit()
                 t.wait(500)
         self.update_status(state="paused", running=False, paused=True, current_task="")

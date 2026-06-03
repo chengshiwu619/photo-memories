@@ -136,14 +136,15 @@ def test_run_startup_integrity_check_reports_expected_issues(tmp_path):
     assert report["has_errors"] is True
     assert "repair_plan" not in report
     assert report["thumbnail_cache_signature"] == current_sig
-    assert report["summary"]["error_count"] == 4
-    assert report["summary"]["warning_count"] == 5
+    assert report["summary"]["error_count"] == 2  # memories_unrenderable now warning (was 4)
+    assert report["summary"]["warning_count"] == 7  # was 5, +2 from unrenderable_ui
     assert checks["photo_data_dir_exists"]["severity"] == "info"
     assert checks["thumbnail_dir_exists"]["severity"] == "info"
     assert checks["thumbnail_cache_version_missing"]["count"] == 0
     assert checks["thumbnail_cache_version_stale"]["count"] == 0
     assert checks["memories_missing_file_refs"]["count"] == 2
     assert checks["memories_unrenderable_in_ui"]["count"] == 2
+    assert checks["memories_unrenderable_in_ui"]["severity"] == "warning"
     assert checks["memories_partially_unrenderable"]["count"] == 1
     assert checks["memories_invalid_cover_file"]["count"] == 1
     assert checks["thumbnail_path_empty"]["count"] == 1

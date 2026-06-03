@@ -91,6 +91,7 @@ class Memory:
     click_count: int = 0
     dismissed_at: Optional[str] = None
     payload: Optional[str] = None
+    is_hidden: int = 0
 
     def as_row(self) -> tuple:
         return (

@@ -58,3 +58,45 @@ def test_database_basic_operations():
 
     finally:
         shutil.rmtree(temp_dir)
+
+
+def test_photo_tag_status_excludes_processed_and_requeues_changed_file():
+    from db_manager import Database
+    from infra.db.repositories.photo_tags_repo import PhotoTagsRepository
+
+    temp_dir = tempfile.mkdtemp()
+    try:
+        temp_db = os.path.join(temp_dir, "test.db")
+        db = Database(temp_db)
+        db.init_tables()
+        with db.connect() as conn:
+            for fid in (1, 2, 3):
+                conn.execute(
+                    """INSERT INTO files
+                       (id, file_path, file_name, folder_path, folder_name, file_size, file_mtime, is_image)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 1)""",
+                    (fid, os.path.join(temp_dir, f"{fid}.jpg"), f"{fid}.jpg", temp_dir, "tmp", 100, "mtime-1"),
+                )
+                conn.execute(
+                    "INSERT INTO photo_metadata (file_id, thumbnail_path, is_duplicate_of) VALUES (?, ?, NULL)",
+                    (fid, os.path.join(temp_dir, "thumbs", f"{fid}.jpg")),
+                )
+            conn.execute("INSERT INTO photo_tags (file_id, tag, source) VALUES (3, 'old', 'siglip')")
+
+        repo = PhotoTagsRepository(db)
+        pending, total = repo.get_pending_file_ids("siglip", limit=10)
+        assert pending == [1, 2]
+        assert total == 2
+
+        assert repo.update_status_many([(1, "ok", None), (2, "failed", "bad image")], "siglip") == 2
+        pending, total = repo.get_pending_file_ids("siglip", limit=10)
+        assert pending == []
+        assert total == 0
+
+        with db.connect() as conn:
+            conn.execute("UPDATE files SET file_size = 101 WHERE id = 2")
+        pending, total = repo.get_pending_file_ids("siglip", limit=10)
+        assert pending == [2]
+        assert total == 1
+    finally:
+        shutil.rmtree(temp_dir)

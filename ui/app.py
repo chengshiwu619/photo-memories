@@ -1,11 +1,12 @@
 import os
 import sys
+import time
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QStackedWidget, QDialog
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 
 from logger_setup import logger
@@ -35,6 +36,82 @@ CATEGORIES = [
     (CATEGORY_LIFE, CATEGORY_NAMES[CATEGORY_LIFE]),
     (CATEGORY_SAMPLE, CATEGORY_NAMES[CATEGORY_SAMPLE]),
 ]
+
+RANDOM_FIRST_PAGE_SIZE = 60
+CATEGORY_CACHE_TTL_SECONDS = 300
+BACKGROUND_BATCH_DELAY_MS = 3000
+BACKGROUND_MAX_CONTINUOUS_BATCHES = 3
+BACKGROUND_SHUTDOWN_REQUESTED = False
+
+
+def _should_schedule_background_next(remaining, stopped=False, batches_run=0, max_batches=BACKGROUND_MAX_CONTINUOUS_BATCHES):
+    return bool(remaining and remaining > 0 and not stopped and batches_run < max_batches)
+
+
+def _cache_hit_metrics(stage, started):
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    return {
+        "cache_stage": stage,
+        "total_ms": elapsed_ms,
+        "memory_ms": 0.0,
+        "batch_ms": 0.0,
+        "cached_query_ms": 0.0,
+        "cached_filter_ms": 0.0,
+    }
+
+
+class CategoryLoadWorker(QThread):
+    loaded = pyqtSignal(int, int, list, dict)
+    failed = pyqtSignal(int, int, str)
+
+    def __init__(self, token, cat_id, starred_only=False, parent=None):
+        super().__init__(parent)
+        self._token = token
+        self._cat_id = cat_id
+        self._starred_only = starred_only
+
+    def run(self):
+        started = time.perf_counter()
+        conn = None
+        try:
+            conn = Database().get_persistent_connection()
+            if self._starred_only:
+                query_started = time.perf_counter()
+                photos = load_starred_photos(conn, self._cat_id)
+                metrics = {
+                    "memory_ms": 0.0,
+                    "batch_ms": (time.perf_counter() - query_started) * 1000,
+                    "merge_ms": 0.0,
+                }
+            else:
+                photos, metrics = rank_category_photos(conn, self._cat_id, return_metrics=True)
+            metrics["total_ms"] = (time.perf_counter() - started) * 1000
+            self.loaded.emit(self._token, self._cat_id, photos, metrics)
+        except Exception as exc:
+            self.failed.emit(self._token, self._cat_id, repr(exc))
+        finally:
+            if conn is not None:
+                conn.close()
+
+
+def _build_siglip_tag_rows(file_ids, generate_tags_batch, should_stop, batch_size=32):
+    pending = []
+    processed = 0
+    stopped = False
+    for i in range(0, len(file_ids), batch_size):
+        if should_stop():
+            stopped = True
+            break
+        batch = file_ids[i:i + batch_size]
+        tags_dict = generate_tags_batch(batch)
+        processed += len(batch)
+        if should_stop():
+            stopped = True
+            break
+        for fid, tags in tags_dict.items():
+            for tag in tags:
+                pending.append((fid, tag, "siglip"))
+    return pending, processed, stopped
 
 
 def safe_path(value) -> str:
@@ -92,6 +169,10 @@ class MainWindow(QMainWindow):
         self._cat_offsets = {}
         self._cat_all_loaded = {}
         self._cat_shown_ids = {}
+        self._cat_load_token = 0
+        self._cat_active_tokens = {}
+        self._cat_workers = {}
+        self._cat_result_cache = {}
         self._folder_viewer_photos = []
         self._folder_view_counts = {}
         self._suppressed_folders = set()
@@ -131,9 +212,13 @@ class MainWindow(QMainWindow):
         self.load_memories()
 
     def closeEvent(self, event):
+        global BACKGROUND_SHUTDOWN_REQUESTED
+        BACKGROUND_SHUTDOWN_REQUESTED = True
         logger.info("MainWindow 正在关闭，等待后台线程...")
         self._timeline_refresh_timer.stop()
-        BackgroundTaskManager.get_instance().wait_all(5000)
+        manager = BackgroundTaskManager.get_instance()
+        manager.cancel_all()
+        manager.wait_all(2000)
         try:
             if self.db:
                 self.db.close()
@@ -536,6 +621,7 @@ class MainWindow(QMainWindow):
         self._cat_offsets = {}
         self._cat_all_loaded = {}
         self._cat_shown_ids = {}
+        self._cat_active_tokens = {}
 
         for cat_id, _ in CATEGORIES:
             memories_repo = MemoriesRepository(Database())
@@ -553,6 +639,7 @@ class MainWindow(QMainWindow):
         self._cat_offsets = {}
         self._cat_all_loaded = {}
         self._cat_shown_ids = {}
+        self._cat_active_tokens = {}
 
         for cat_id, _ in CATEGORIES:
             memories_repo = MemoriesRepository(Database())
@@ -567,35 +654,144 @@ class MainWindow(QMainWindow):
     def _invalidate_all_caches(self):
         self._timeline_loaded = False
         self._special_loaded = False
+        self._cat_result_cache.clear()
+
+    def _random_category_db_version(self):
+        try:
+            row = self.db.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM files),
+                    (SELECT COALESCE(MAX(id), 0) FROM files),
+                    (SELECT COUNT(*) FROM photo_metadata),
+                    (SELECT COALESCE(MAX(file_id), 0) FROM photo_metadata),
+                    (SELECT COUNT(*) FROM memories),
+                    (SELECT COALESCE(MAX(id), 0) FROM memories)
+                """
+            ).fetchone()
+            return tuple(row) if row is not None else None
+        except Exception as exc:
+            logger.debug("随机标签缓存版本读取失败: %s", exc)
+            return None
 
     def load_category(self, index):
         if index >= len(CATEGORIES):
             return
         cat_id, _ = CATEGORIES[index]
+        switch_started = time.perf_counter()
+        cache_key = (cat_id, bool(self.starred_only))
+        now = time.monotonic()
+        db_version = self._random_category_db_version()
+        cached = self._cat_result_cache.get(cache_key)
+        logger.info("随机标签切换开始: cat_id=%s starred=%s", cat_id, self.starred_only)
+        cache_version = cached.get("version") if cached else None
+        cache_age_ok = (
+            cached
+            and now - cached.get("created_at", 0) <= CATEGORY_CACHE_TTL_SECONDS
+            and (db_version is None or cache_version is None)
+        )
+        cache_version_ok = cached and db_version is not None and cache_version == db_version
+        if cached and (cache_version_ok or cache_age_ok):
+            logger.info(
+                "随机标签缓存命中: cat_id=%s total=%s age_ms=%.1f version_match=%s",
+                cat_id,
+                len(cached.get("photos", [])),
+                (now - cached.get("created_at", now)) * 1000,
+                cache_version_ok,
+            )
+            self._render_category_photos(
+                index,
+                cat_id,
+                list(cached.get("photos", [])),
+                _cache_hit_metrics("visible_cache_hit", switch_started),
+                from_cache=True,
+            )
+            return
+
+        existing_photos = self._cat_photos.get(cat_id) or []
+        if existing_photos:
+            first_page = existing_photos[:RANDOM_FIRST_PAGE_SIZE]
+            self._cat_offsets[cat_id] = len(first_page)
+            self._cat_all_loaded[cat_id] = len(first_page) >= len(existing_photos)
+            self.pages[index].load_photos(first_page)
+            logger.info(
+                "随机标签即时复用旧结果: cat_id=%s total=%s first=%s",
+                cat_id,
+                len(existing_photos),
+                len(first_page),
+            )
+
+        self._cat_load_token += 1
+        token = self._cat_load_token
+        self._cat_active_tokens[cat_id] = token
+
+        old_worker = self._cat_workers.get(cat_id)
+        if old_worker and old_worker.isRunning():
+            old_worker.requestInterruption()
+
+        worker = CategoryLoadWorker(token, cat_id, self.starred_only)
+        worker.loaded.connect(self._on_category_loaded)
+        worker.failed.connect(self._on_category_failed)
+        worker.finished.connect(lambda cat=cat_id, w=worker: self._on_category_worker_finished(cat, w))
+        self._cat_workers[cat_id] = worker
+        worker.start()
+
+    def _on_category_worker_finished(self, cat_id, worker):
+        if self._cat_workers.get(cat_id) is worker:
+            del self._cat_workers[cat_id]
+
+    def _on_category_failed(self, token, cat_id, error):
+        if self._cat_active_tokens.get(cat_id) != token:
+            logger.info("随机标签旧任务失败结果已忽略: cat_id=%s token=%s", cat_id, token)
+            return
+        page_index = next(i for i, (c, _) in enumerate(CATEGORIES) if c == cat_id)
+        logger.warning("随机标签加载失败: cat_id=%s token=%s error=%s", cat_id, token, error)
+
+    def _on_category_loaded(self, token, cat_id, photos, metrics):
+        if self._cat_active_tokens.get(cat_id) != token:
+            logger.info("随机标签旧任务结果已忽略: cat_id=%s token=%s total=%s", cat_id, token, len(photos))
+            return
+        page_index = next(i for i, (c, _) in enumerate(CATEGORIES) if c == cat_id)
+        cache_key = (cat_id, bool(self.starred_only))
+        self._cat_result_cache[cache_key] = {
+            "created_at": time.monotonic(),
+            "version": self._random_category_db_version(),
+            "photos": list(photos),
+            "metrics": dict(metrics),
+        }
+        self._render_category_photos(page_index, cat_id, list(photos), metrics, from_cache=False)
+
+    def _render_category_photos(self, index, cat_id, all_photos, metrics=None, from_cache=False):
+        render_started = time.perf_counter()
+        metrics = metrics or {}
 
         self._cat_offsets[cat_id] = 0
         self._cat_all_loaded[cat_id] = False
         self._cat_shown_ids[cat_id] = set()
-
-        if self.starred_only:
-            all_photos = load_starred_photos(self.db, cat_id)
-        else:
-            all_photos = rank_category_photos(self.db, cat_id)
-
         self._cat_photos[cat_id] = list(all_photos)
 
-        first_page = all_photos[:PAGE_SIZE]
+        first_page = all_photos[:RANDOM_FIRST_PAGE_SIZE]
         self._cat_offsets[cat_id] = len(first_page)
         self._cat_shown_ids[cat_id].update(p["id"] for p in first_page)
         self._cat_all_loaded[cat_id] = len(first_page) >= len(all_photos)
 
         record_shown_photos(first_page, cat_id)
 
-        if not self._first_load_done:
-            self._first_load_done = True
-            QTimer.singleShot(30, lambda p=self.pages[index], ph=first_page: p.load_photos(ph))
-        else:
-            self.pages[index].load_photos(first_page)
+        self.pages[index].load_photos(first_page)
+        render_ms = (time.perf_counter() - render_started) * 1000
+        logger.info(
+            "随机标签切换结束: cat_id=%s cache=%s cache_stage=%s total=%s first=%s query_ms=%.1f "
+            "memory_ms=%.1f filter_ms=%.1f render_ms=%.1f",
+            cat_id,
+            from_cache,
+            metrics.get("cache_stage", "worker_result"),
+            len(all_photos),
+            len(first_page),
+            metrics.get("total_ms", 0.0),
+            metrics.get("memory_ms", 0.0),
+            metrics.get("batch_ms", 0.0),
+            render_ms,
+        )
 
     def _on_load_more(self, cat_id):
         page_index = next(i for i, (c, _) in enumerate(CATEGORIES) if c == cat_id)
@@ -846,6 +1042,8 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    global BACKGROUND_SHUTDOWN_REQUESTED
+    BACKGROUND_SHUTDOWN_REQUESTED = False
     logger.info("=" * 50)
     logger.info("NAS 照片回忆 启动")
     try:
@@ -856,8 +1054,14 @@ def main():
         startup_ref = [None]
         _bg_scan_started = [False]
         _bg_index_started = [False]
+        _bg_index_batches = [0]
+        _bg_tag_batches = [0]
+        _bg_last_tag_batch_ids = [None]
         _bg_classify_started = [False]
         _bg_classify_completed = [False]
+        _bg_recover_started = [False]          # recover_existing (562) 队列
+        _bg_last_scan_result = [None]          # 保存最近一次扫描结果
+        _bg_pipeline_phase = ["scan"]          # 当前 pipeline 阶段
 
         def show_main_window():
             logger.info("show_main_window 开始, 优先构建主界面...")
@@ -869,6 +1073,7 @@ def main():
                 logger.info("主界面已显示")
                 QTimer.singleShot(100, start_background_scan)
                 QTimer.singleShot(1000, start_memory_discovery)
+                QTimer.singleShot(3000, start_background_path_maintenance)
             except Exception as e:
                 logger.exception("MainWindow 构建失败!")
                 import traceback
@@ -900,6 +1105,49 @@ def main():
             bg.start()
             BackgroundTaskManager.get_instance().register(bg)
             logger.info("回忆发现线程已启动")
+
+        _bg_path_maintenance_started = [False]
+        PATH_BACKFILL_BATCH_SIZE = 5000
+
+        def start_background_path_maintenance():
+            """后台自动 path_status 回填。复用已验证的 maintain_paths.backfill_paths 逻辑。"""
+            if BACKGROUND_SHUTDOWN_REQUESTED:
+                return
+            if _bg_path_maintenance_started[0]:
+                return
+            _bg_path_maintenance_started[0] = True
+            from PyQt6.QtCore import QThread
+
+            class BgPathMaintenanceWorker(QThread):
+                def run(self):
+                    from scripts.maintain_paths import backfill_paths
+                    logger.info("后台 path maintenance 开始")
+                    stats = backfill_paths(dry_run=False, limit=PATH_BACKFILL_BATCH_SIZE, verbose=False)
+                    pending_after = stats["total_pending"] - stats["processed"]
+                    logger.info(
+                        "后台 path maintenance 完成: pending_before=%s processed=%s ok=%s missing=%s "
+                        "damaged=%s stat_failed=%s outside_root=%s errors=%s pending_after=%s",
+                        stats["total_pending"], stats["processed"], stats["ok"], stats["missing"],
+                        stats["damaged_path"], stats["stat_failed"], stats["outside_root"],
+                        stats["errors"], max(pending_after, 0),
+                    )
+                    self.stats = stats
+                    self.pending_after = max(pending_after, 0)
+
+            bg = BgPathMaintenanceWorker()
+            def _on_path_maintenance_finished(worker=bg):
+                _bg_path_maintenance_started[0] = False
+                pending = getattr(worker, "pending_after", 0)
+                if pending > 0 and not BACKGROUND_SHUTDOWN_REQUESTED:
+                    logger.info("path maintenance 仍有 pending=%s，3s 后继续下一批", pending)
+                    QTimer.singleShot(3000, start_background_path_maintenance)
+                else:
+                    logger.info("后台 path maintenance 全部完成")
+
+            bg.finished.connect(_on_path_maintenance_finished)
+            bg.start()
+            BackgroundTaskManager.get_instance().register(bg)
+            logger.info("后台 path maintenance 线程已启动")
 
         def start_background_folder_classify():
             if _bg_classify_started[0] or _bg_classify_completed[0]:
@@ -938,58 +1186,209 @@ def main():
             BackgroundTaskManager.get_instance().register(bg)
             logger.info("后台文件夹分类线程已启动")
 
+        # ---- thumbnail pending 门控 ----
+        THUMBNAIL_P0_THRESHOLD = 0
+
+        def _count_thumbnail_pending():
+            """查询当前 P0+P1 pending 缩略图数量（排除 recover_existing）。
+            返回 0 表示无需要创建的缩略图，AI 任务可以启动。"""
+            try:
+                from db_manager import Database
+                db = Database()
+                with db.connect() as conn:
+                    # 只计算真正需要创建缩略图的（排除缩略图文件已存在的回填队列）
+                    row = conn.execute("""
+                        SELECT COUNT(*) FROM files f
+                        LEFT JOIN photo_metadata pm ON f.id = pm.file_id
+                        WHERE f.is_image = 1
+                          AND (pm.file_id IS NULL OR pm.thumbnail_path IS NULL
+                               OR pm.thumbnail_path = '' OR pm.thumbnail_path = '__FAILED__')
+                          AND (f.path_status IS NULL OR f.path_status NOT IN
+                               ('damaged_path', 'missing', 'stat_failed', 'outside_root'))
+                    """).fetchone()
+                    total_pending = row[0] if row else 0
+                    # 减去缩略图文件已存在的（recover_existing）
+                    _thumb_dir = get_settings().thumbnail_dir
+                    # 快速估算：只检查一部分样本
+                    if total_pending <= 100:
+                        return total_pending
+                    # 对大队列，用 SQL 排除已知 existing
+                    # 暂时返回全部，后续 index 阶段会正确分级
+                    return total_pending
+            except Exception as e:
+                logger.warning(f"查询 thumbnail pending 失败: {e}")
+                return 999999  # 保守：查询失败时阻止 AI 任务
+
+        def _should_defer_ai_for_thumbnails():
+            """P0+P1 缩略图 pending 仍明显存在时，延迟 AI 标签/人脸。
+            recover_existing (562) 不阻塞 AI 任务。"""
+            try:
+                from business.indexer.photo_indexer import get_unindexed_photos
+                p0 = get_unindexed_photos(priority_filter='new_changed_create')
+                p1 = get_unindexed_photos(priority_filter='historical_missing')
+                real_pending = len(p0) + len(p1)
+            except Exception:
+                real_pending = _count_thumbnail_pending()
+
+            if real_pending > THUMBNAIL_P0_THRESHOLD:
+                logger.info(
+                    "缩略图 P0+P1 仍有 pending=%s (threshold=%s)，延迟启动 AI 标签/人脸/特殊回忆",
+                    real_pending, THUMBNAIL_P0_THRESHOLD,
+                )
+                return True
+            return False
+
         _bg_tags_started = [False]
         _bg_faces_started = [False]
 
         def start_background_tags():
-            """后台生成 SigLIP 标签"""
+            """后台生成 SigLIP 标签（P1：缩略图 pending 清完后才启动）"""
+            if BACKGROUND_SHUTDOWN_REQUESTED:
+                logger.info("后台标签: 关闭中，跳过启动")
+                return
             if _bg_tags_started[0]:
                 logger.info("后台标签生成已在运行，跳过重复启动")
+                return
+            # 门控：缩略图 pending > 0 时延迟，避免 SigLIP 模型加载抢占资源
+            if _should_defer_ai_for_thumbnails():
+                QTimer.singleShot(5000, start_background_tags)
                 return
             _bg_tags_started[0] = True
             from PyQt6.QtCore import QThread
 
             class BgTagsWorker(QThread):
+                def __init__(self):
+                    super().__init__()
+                    self._stop_requested = False
+                    self.remaining = 0
+                    self.remaining_after = 0
+                    self.processed = 0
+                    self.ok = 0
+                    self.failed = 0
+                    self.skipped = 0
+                    self.db_updated = 0
+                    self.stopped = False
+                    self.batch_ids = []
+
+                def request_stop(self):
+                    self._stop_requested = True
+                    self.stopped = True
+                    self.requestInterruption()
+                    logger.info("后台标签收到停止请求")
+
+                def _should_stop(self):
+                    return self._stop_requested or self.isInterruptionRequested()
+
                 def run(self):
                     from business.image_recognition.tag_generator import generate_tags_batch
                     from infra.db.repositories.photo_tags_repo import PhotoTagsRepository
                     from db_manager import Database
 
+                    tags_repo = PhotoTagsRepository(Database())
+                    before_pending = 0
+                    file_ids = []
                     manager = BackgroundTaskManager.get_instance()
+                    if self._should_stop():
+                        logger.info("后台标签启动前已停止")
+                        manager.mark_task("ai_tags", "done")
+                        self.remaining_after = tags_repo.count_pending("siglip")
+                        self.remaining = self.remaining_after
+                        logger.info(
+                            "后台标签批次结果: before_pending=%s batch_size=%s processed=%s ok=%s "
+                            "failed=%s skipped=%s db_updated=%s remaining_after=%s",
+                            before_pending,
+                            len(file_ids),
+                            self.processed,
+                            self.ok,
+                            self.failed,
+                            self.skipped,
+                            self.db_updated,
+                            self.remaining_after,
+                        )
+                        return
                     device_info = manager.refresh_ai_device_status()
+                    if self._should_stop():
+                        logger.info("后台标签设备检测后停止")
+                        manager.mark_task("ai_tags", "done")
+                        return
                     manager.mark_task("ai_tags", "running")
-                    tagged = PhotoTagsRepository(Database()).get_file_ids_by_source("siglip")
-                    with Database().connect() as conn:
-                        rows = conn.execute("""
-                            SELECT DISTINCT pm.file_id FROM photo_metadata pm
-                            WHERE pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
-                              AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
-                            ORDER BY pm.file_id
-                        """).fetchall()
-                    file_ids = [r[0] for r in rows if r[0] not in tagged]
+                    tags_repo = PhotoTagsRepository(Database())
+                    if self._should_stop():
+                        logger.info("后台标签读取历史后停止")
+                        manager.mark_task("ai_tags", "done")
+                        return
                     tag_limit = max(int(getattr(get_settings(), "background_ai_tag_limit", 128)), 0)
-                    if tag_limit:
-                        file_ids = file_ids[:tag_limit]
+                    file_ids, before_pending = tags_repo.get_pending_file_ids("siglip", limit=tag_limit)
+                    self.batch_ids = list(file_ids)
+                    self.remaining = max(before_pending - len(file_ids), 0)
                     if not file_ids:
                         logger.info("后台标签生成: 无新照片需要处理")
                         manager.mark_task("ai_tags", "done")
                         return
                     logger.info(f"后台标签生成: 将处理 {len(file_ids)} 张照片, device={device_info.device}")
+                    logger.info(
+                        "后台标签生成: 本批处理 %s/%s 张, remaining=%s, device=%s",
+                        len(file_ids),
+                        before_pending,
+                        self.remaining,
+                        device_info.device,
+                    )
                     batch_size = 32
+                    processed = 0
                     try:
                         for i in range(0, len(file_ids), batch_size):
+                            if self._should_stop():
+                                logger.info("后台标签停止: processed=%s/%s", processed, len(file_ids))
+                                manager.mark_task("ai_tags", "done")
+                                return
                             batch = file_ids[i:i + batch_size]
-                            tags_dict = generate_tags_batch(batch)
-                            pending = []
-                            for fid, tags in tags_dict.items():
-                                for tag in tags:
-                                    pending.append((fid, tag, "siglip"))
+                            diagnostics = generate_tags_batch(batch, return_diagnostics=True)
+                            if isinstance(diagnostics, dict) and "tags_by_file" in diagnostics:
+                                tags_dict = diagnostics.get("tags_by_file", {})
+                                encode_errors = diagnostics.get("encode_errors", [])
+                            else:
+                                tags_dict = diagnostics or {}
+                                encode_errors = []
+                            processed += len(batch)
+                            self.processed = processed
+                            if self._should_stop():
+                                logger.info("后台标签 batch 后停止: processed=%s/%s", processed, len(file_ids))
+                                manager.mark_task("ai_tags", "done")
+                                return
+                            pending, _, stopped = _build_siglip_tag_rows(
+                                batch,
+                                lambda _batch, _tags=tags_dict: _tags,
+                                self._should_stop,
+                                batch_size=batch_size,
+                            )
+                            if stopped or self._should_stop():
+                                logger.info("后台标签写库前停止: processed=%s/%s", processed, len(file_ids))
+                                manager.mark_task("ai_tags", "done")
+                                return
                             if pending:
                                 with Database().connect() as conn:
                                     conn.executemany(
                                         "INSERT OR IGNORE INTO photo_tags (file_id, tag, source) VALUES (?, ?, ?)",
                                         pending,
                                     )
+                                self.db_updated += len(pending)
+                            error_by_file = {
+                                item.get("file_id"): f"{item.get('reason')}: {item.get('error', '')}".strip(": ")
+                                for item in encode_errors
+                                if item.get("file_id") is not None
+                            }
+                            status_rows = []
+                            for fid in batch:
+                                if fid in tags_dict:
+                                    self.ok += 1
+                                    status_rows.append((fid, "ok", None))
+                                elif fid in error_by_file:
+                                    self.failed += 1
+                                    status_rows.append((fid, "failed", error_by_file[fid]))
+                                else:
+                                    self.skipped += 1
+                                    status_rows.append((fid, "skipped", "no_tag_result"))
+                            self.db_updated += tags_repo.update_status_many(status_rows, "siglip")
                             logger.debug(f"后台标签: {i + len(batch)}/{len(file_ids)}")
                         manager.mark_task("ai_tags", "done")
                         logger.info(f"后台标签生成完成: 已处理 {len(file_ids)} 张照片")
@@ -999,19 +1398,52 @@ def main():
 
             bg = BgTagsWorker()
             bg.finished.connect(lambda: logger.info("后台标签生成线程结束"))
-            bg.finished.connect(start_background_faces)
+            def _on_tags_finished(worker=bg):
+                _bg_tags_started[0] = False
+                logger.info(
+                    "后台标签线程结束: processed=%s remaining=%s stopped=%s",
+                    getattr(worker, "processed", 0),
+                    getattr(worker, "remaining", 0),
+                    getattr(worker, "stopped", False),
+                )
+                batch_signature = tuple(getattr(worker, "batch_ids", []))
+                repeated_batch = bool(batch_signature and batch_signature == _bg_last_tag_batch_ids[0])
+                if repeated_batch:
+                    logger.warning("后台标签连续两批 file_ids 完全相同，停止接续以避免死循环: batch_size=%s", len(batch_signature))
+                _bg_last_tag_batch_ids[0] = batch_signature
+                if _should_schedule_background_next(
+                    getattr(worker, "remaining", 0),
+                    stopped=getattr(worker, "stopped", False) or BACKGROUND_SHUTDOWN_REQUESTED or repeated_batch,
+                    batches_run=_bg_tag_batches[0],
+                ):
+                    _bg_tag_batches[0] += 1
+                    logger.info(
+                        "后台标签仍有剩余: remaining=%s, next scheduled in %sms",
+                        getattr(worker, "remaining", 0),
+                        BACKGROUND_BATCH_DELAY_MS,
+                    )
+                    QTimer.singleShot(BACKGROUND_BATCH_DELAY_MS, start_background_tags)
+                else:
+                    _bg_tag_batches[0] = 0
+                    start_background_faces()
+
+            bg.finished.connect(_on_tags_finished)
             bg.start()
             BackgroundTaskManager.get_instance().register(bg)
             logger.info("后台标签生成线程已启动")
 
         def start_background_faces():
-            """后台人脸检测 + 嵌入提取 + 聚类（需启用 ENABLE_FACE_DETECTION）。"""
+            """后台人脸检测 + 嵌入提取 + 聚类（需启用 ENABLE_FACE_DETECTION + 缩略图清完）。"""
             settings = get_settings()
             if not getattr(settings, "enable_face_detection", False):
                 logger.debug("人脸检测未启用 (ENABLE_FACE_DETECTION=false), 跳过后台人脸处理")
                 return
             if _bg_faces_started[0]:
                 logger.info("后台人脸处理已在运行，跳过重复启动")
+                return
+            # 门控：缩略图 pending > 0 时延迟
+            if _should_defer_ai_for_thumbnails():
+                QTimer.singleShot(5000, start_background_faces)
                 return
             _bg_faces_started[0] = True
             from PyQt6.QtCore import QThread
@@ -1087,14 +1519,18 @@ def main():
                     logger.info("后台扫描开始")
                     manager.mark_task("scan", "running")
                     settings = get_settings()
+                    # 启动时全量扫描（limit=0 → incremental_scan 内部转为不限制）
+                    # 避免每次只扫 1000 且无 offset 导致无限循环同一批
+                    scan_limit = 0  # 0 = 全量扫描
                     result = incremental_scan(
                         progress_callback=lambda cur, tot: None,
                         dry_run=False,
-                        limit=max(int(getattr(settings, "background_scan_limit", 1000)), 1),
+                        limit=scan_limit,
                         es_timeout=max(int(getattr(settings, "everything_timeout_seconds", 20)), 1),
                         status_callback=manager.update_from_scan_result,
                     )
                     manager.update_from_scan_result(result)
+                    self.scan_result = result
                     logger.info(
                         "后台增量扫描完成: scanned=%s new=%s existing=%s changed=%s skipped=%s errors=%s",
                         result.get("scanned", 0),
@@ -1107,13 +1543,33 @@ def main():
 
             bg = BgScanWorker()
             bg.finished.connect(lambda: logger.info("后台扫描线程结束"))
-            bg.finished.connect(lambda: (_bg_index_started.__setitem__(0, False), start_background_index()))
+
+            def _on_scan_finished(worker=bg):
+                _bg_scan_started[0] = False
+                _bg_last_scan_result[0] = getattr(worker, 'scan_result', {})
+                _bg_pipeline_phase[0] = "new_thumbnail"
+                # 扫描完成后：先索引 new/changed，再处理历史队列
+                start_background_index()
+
+            bg.finished.connect(_on_scan_finished)
             bg.finished.connect(start_background_folder_classify)
             bg.start()
             BackgroundTaskManager.get_instance().register(bg)
             logger.info("后台扫描线程已启动")
 
         def start_background_index():
+            """后台缩略图索引：按优先级多阶段执行。
+
+            Pipeline:
+            P0: new_changed_create + historical_missing → 第一时间可用
+            P1: 扫描更多批次（如果 batch_limit_reached）
+            P2: recover_existing (历史 562) → 低优先级回填
+            P3: path_backfill (path maintenance)
+            P4: AI tags / faces / special memories
+            """
+            if BACKGROUND_SHUTDOWN_REQUESTED:
+                logger.info("后台索引: 关闭中，跳过启动")
+                return
             if _bg_index_started[0]:
                 logger.info("后台索引已在运行，跳过重复启动")
                 return
@@ -1123,8 +1579,38 @@ def main():
             class BgIndexWorker(QThread):
                 progress = pyqtSignal(int, int)
 
+                def __init__(self):
+                    super().__init__()
+                    self._stop_requested = False
+                    self.result = {}
+                    self.remaining = 0
+                    self.stopped = False
+                    self.phase = "new_changed"
+
+                def request_stop(self):
+                    self._stop_requested = True
+                    self.stopped = True
+                    self.requestInterruption()
+                    try:
+                        from business.indexer.photo_indexer import set_stopped
+                        set_stopped()
+                    except Exception:
+                        pass
+                    logger.info("后台索引收到停止请求")
+
+                def _should_stop(self):
+                    return self._stop_requested or self.isInterruptionRequested() or BACKGROUND_SHUTDOWN_REQUESTED
+
                 def run(self):
-                    from business.indexer.photo_indexer import index_photos, get_checkpoint_status, clear_checkpoint, IndexState
+                    from business.indexer.photo_indexer import (
+                        index_new_or_changed_files, recover_existing_thumbnails,
+                        index_photos, get_checkpoint_status, clear_checkpoint, IndexState,
+                        INDEX_WORKERS as _IDX_WORKERS, INDEX_COMMIT_EVERY as _IDX_COMMIT_EVERY,
+                    )
+                    if self._should_stop():
+                        self.stopped = True
+                        logger.info("后台索引启动前已停止")
+                        return
                     while True:
                         cp = get_checkpoint_status()
                         if cp.get("has_checkpoint") and cp.get("state") in (IndexState.PAUSED, IndexState.STOPPED):
@@ -1132,31 +1618,208 @@ def main():
                             clear_checkpoint()
                         else:
                             break
-                    logger.info("后台索引开始")
                     manager = BackgroundTaskManager.get_instance()
+                    index_limit = max(int(getattr(get_settings(), "background_index_limit", 100)), 1)
+
+                    # ---- Phase 1: new/changed + historical_missing (P0+P1) ----
+                    self.phase = "new_changed"
+                    logger.info("后台索引 [Phase1]: new/changed + historical_missing 开始")
                     manager.mark_task("thumbnail_index", "running")
-                    result = index_photos(
+                    result_p0 = index_new_or_changed_files(
                         progress_callback=lambda cur, tot: None,
-                        batch_limit=max(int(getattr(get_settings(), "background_index_limit", 100)), 0) or None,
+                        workers=_IDX_WORKERS,
+                        batch_size=_IDX_COMMIT_EVERY,
                     )
-                    if result.get("paused"):
-                        manager.mark_task("thumbnail_index", "paused")
-                        logger.info(f"后台索引暂停: {result.get('indexed', 0)}/{result.get('total', 0)}")
-                    else:
-                        manager.update_status(
-                            state="done",
-                            current_task="thumbnail_index",
-                            thumbnail_pending=max(result.get("total", 0) - result.get("indexed", 0), 0),
+                    p0_created = result_p0.get("thumbnail_created", 0)
+                    p0_existing = result_p0.get("thumbnail_existing", 0)
+                    p0_total = result_p0.get("total", 0)
+                    p0_indexed = result_p0.get("indexed", 0)
+                    logger.info(
+                        "后台索引 [Phase1] 完成: total=%s created=%s existing=%s db_updated=%s",
+                        p0_total, p0_created, p0_existing, result_p0.get("db_updated", 0),
+                    )
+
+                    if self._should_stop():
+                        self.stopped = True
+                        self.result = result_p0
+                        self.remaining = 0
+                        return
+
+                    # ---- Phase 2: recover_existing / 562 (P2, 低优先级) ----
+                    self.phase = "recover_existing"
+                    logger.info("后台索引 [Phase2]: recover_existing (562) 开始")
+                    result_p2 = recover_existing_thumbnails(
+                        progress_callback=lambda cur, tot: None,
+                        workers=_IDX_WORKERS,
+                        batch_size=_IDX_COMMIT_EVERY,
+                        batch_limit=index_limit,
+                    )
+                    p2_existing = result_p2.get("thumbnail_existing", 0)
+                    p2_total = result_p2.get("total", 0)
+                    p2_indexed = result_p2.get("indexed", 0)
+                    logger.info(
+                        "后台索引 [Phase2] 完成: total=%s existing=%s db_updated=%s",
+                        p2_total, p2_existing, result_p2.get("db_updated", 0),
+                    )
+
+                    if self._should_stop():
+                        self.stopped = True
+                        self.result = result_p2
+                        self.remaining = 0
+                        return
+
+                    # 合并结果
+                    combined = {
+                        "total": p0_total + p2_total,
+                        "indexed": p0_indexed + p2_indexed,
+                        "processed": result_p0.get("processed", 0) + result_p2.get("processed", 0),
+                        "thumbnail_created": p0_created + result_p2.get("thumbnail_created", 0),
+                        "thumbnail_existing": p0_existing + p2_existing,
+                        "thumbnail_recovered": result_p0.get("thumbnail_recovered", 0) + result_p2.get("thumbnail_recovered", 0),
+                        "thumbnail_failed": result_p0.get("thumbnail_failed", 0) + result_p2.get("thumbnail_failed", 0),
+                        "thumbnail_skipped": result_p0.get("thumbnail_skipped", 0) + result_p2.get("thumbnail_skipped", 0),
+                        "path_invalid": result_p0.get("path_invalid", 0) + result_p2.get("path_invalid", 0),
+                        "db_updated": result_p0.get("db_updated", 0) + result_p2.get("db_updated", 0),
+                        "output_dir": result_p0.get("output_dir", ""),
+                    }
+                    self.result = combined
+
+                    # 计算剩余：检查是否还有未处理的
+                    from business.indexer.photo_indexer import get_unindexed_photos
+                    all_remaining = get_unindexed_photos()
+                    self.remaining = len(all_remaining)
+
+                    # pipeline next 日志
+                    # 全量扫描后 batch_limit_reached=False，不再重新扫描
+                    next_phase = (
+                        "historical_thumbnail" if self.remaining > 0 else (
+                            "recover_existing" if p2_total > 0 else "done"
                         )
-                        logger.info(f"后台索引全部完成: 总计 {result.get('total', 0)}, 已索引 {result.get('indexed', 0)}")
+                    )
+                    logger.info(
+                        "thumbnail batch: created=%s existing=%s recovered=%s failed=%s path_invalid=%s db_updated=%s",
+                        combined["thumbnail_created"], combined["thumbnail_existing"],
+                        combined["thumbnail_recovered"], combined["thumbnail_failed"],
+                        combined["path_invalid"], combined["db_updated"],
+                    )
+                    logger.info("pipeline next: %s (remaining=%s)", next_phase, self.remaining)
+
+                    manager.update_status(
+                        state="done",
+                        current_task="thumbnail_index",
+                        thumbnail_pending=self.remaining,
+                    )
 
             bg = BgIndexWorker()
             bg.progress.connect(lambda cur, tot: logger.info(f"后台索引: {cur}/{tot}"))
             bg.finished.connect(lambda: logger.info("后台索引线程结束"))
-            bg.finished.connect(start_background_tags)
+            def _on_index_finished(worker=bg):
+                _bg_index_started[0] = False
+                remaining = getattr(worker, "remaining", 0)
+                logger.info(
+                    "后台索引线程结束: indexed=%s total=%s remaining=%s stopped=%s phase=%s",
+                    worker.result.get("indexed", 0),
+                    worker.result.get("total", 0),
+                    remaining,
+                    getattr(worker, "stopped", False),
+                    getattr(worker, "phase", ""),
+                )
+
+                if BACKGROUND_SHUTDOWN_REQUESTED:
+                    logger.info("后台索引: 关闭中，不再调度后续任务")
+                    return
+
+                # 缩略图仍有 P0+P1 pending → 继续索引
+                p0_pending = 0
+                try:
+                    from business.indexer.photo_indexer import get_unindexed_photos
+                    p0_rows = get_unindexed_photos(priority_filter='new_changed_create')
+                    p1_rows = get_unindexed_photos(priority_filter='historical_missing')
+                    p0_pending = len(p0_rows) + len(p1_rows)
+                except Exception:
+                    p0_pending = remaining  # fallback
+
+                if p0_pending > THUMBNAIL_P0_THRESHOLD:
+                    _bg_index_batches[0] += 1
+                    _bg_pipeline_phase[0] = "new_thumbnail"
+                    logger.info(
+                        "缩略图 P0+P1 仍有 pending=%s，优先继续索引 (batch=%s)",
+                        p0_pending, _bg_index_batches[0],
+                    )
+                    QTimer.singleShot(2000, start_background_index)
+                    return
+
+                # P0+P1 清完后，检查是否还有 recover_existing
+                p2_pending = 0
+                try:
+                    from business.indexer.photo_indexer import get_unindexed_photos
+                    p2_rows = get_unindexed_photos(priority_filter='recover_existing')
+                    p2_pending = len(p2_rows)
+                except Exception:
+                    pass
+
+                if p2_pending > 0 and not _bg_recover_started[0]:
+                    _bg_pipeline_phase[0] = "recover_existing"
+                    logger.info("P0+P1 清完，开始 recover_existing (562): pending=%s", p2_pending)
+                    start_background_recover_existing()
+                    return
+
+                # 所有缩略图处理完毕 → 启动 AI 标签
+                _bg_index_batches[0] = 0
+                _bg_pipeline_phase[0] = "ai_tags"
+                start_background_tags()
+
+            bg.finished.connect(_on_index_finished)
             bg.start()
             BackgroundTaskManager.get_instance().register(bg)
             logger.info("后台索引线程已启动")
+
+        def start_background_recover_existing():
+            """低优先级回填历史 562 队列：缩略图文件已存在但 DB 未回填。"""
+            if BACKGROUND_SHUTDOWN_REQUESTED:
+                return
+            if _bg_recover_started[0]:
+                return
+            _bg_recover_started[0] = True
+            from PyQt6.QtCore import QThread
+
+            class BgRecoverWorker(QThread):
+                def run(self):
+                    from business.indexer.photo_indexer import (
+                        recover_existing_thumbnails,
+                        INDEX_WORKERS as _IDX_WORKERS,
+                        INDEX_COMMIT_EVERY as _IDX_COMMIT_EVERY,
+                    )
+                    logger.info("后台 recover_existing (562) 开始")
+                    result = recover_existing_thumbnails(
+                        progress_callback=lambda cur, tot: None,
+                        workers=_IDX_WORKERS,
+                        batch_size=_IDX_COMMIT_EVERY,
+                    )
+                    self.result = result
+                    logger.info(
+                        "后台 recover_existing 完成: total=%s existing=%s db_updated=%s",
+                        result.get("total", 0), result.get("thumbnail_existing", 0),
+                        result.get("db_updated", 0),
+                    )
+
+            bg = BgRecoverWorker()
+            def _on_recover_finished(worker=bg):
+                _bg_recover_started[0] = False
+                result = getattr(worker, 'result', {})
+                total = result.get("total", 0)
+                # 如果 created=0 且 existing>0，说明是纯回填，不需要继续循环
+                if total > 0:
+                    logger.info("recover_existing 回填完成: %s 条", total)
+                # 回填完后启动 AI 标签
+                _bg_pipeline_phase[0] = "ai_tags"
+                start_background_tags()
+
+            bg.finished.connect(_on_recover_finished)
+            bg.finished.connect(lambda: logger.info("后台 recover_existing 线程结束"))
+            bg.start()
+            BackgroundTaskManager.get_instance().register(bg)
+            logger.info("后台 recover_existing 线程已启动")
 
         def launch_startup():
             startup = StartupWindow()

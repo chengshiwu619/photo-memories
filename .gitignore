@@ -5,9 +5,13 @@ __pycache__/
 *.pyc
 .DS_Store
 venv/
+.venv/
+.venv*/
+.vscode/
 *.code-workspace
 PROJECT_FULL_DUMP.txt
 error.log
+启动GPU相册.bat
 *.log
 *.tmp
 *.bak

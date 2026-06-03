@@ -52,7 +52,7 @@ class Database:
             with self.connect() as conn:
                 required_tables = [
                     "files", "folder_categories", "photo_metadata", "memories",
-                    "click_history", "photo_tags", "sample_keywords", "life_keywords",
+                    "click_history", "photo_tags", "photo_tag_status", "sample_keywords", "life_keywords",
                     "photo_shown_history", "face_clusters", "face_embeddings",
                     "events", "memory_reasoning", "migration_log", "task_checkpoints"
                 ]
@@ -238,7 +238,8 @@ class Database:
                 last_shown_at TEXT,
                 click_count INTEGER DEFAULT 0,
                 dismissed_at TEXT,
-                payload TEXT
+                payload TEXT,
+                is_hidden INTEGER DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
             CREATE INDEX IF NOT EXISTS idx_memories_starred ON memories(is_starred);
@@ -267,6 +268,19 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_tags_file ON photo_tags(file_id);
             CREATE INDEX IF NOT EXISTS idx_tags_source ON photo_tags(source);
+
+            CREATE TABLE IF NOT EXISTS photo_tag_status (
+                file_id INTEGER NOT NULL,
+                source TEXT NOT NULL DEFAULT 'siglip',
+                status TEXT NOT NULL DEFAULT 'pending',
+                error TEXT,
+                source_file_size INTEGER,
+                source_file_mtime TEXT,
+                updated_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (file_id, source),
+                FOREIGN KEY (file_id) REFERENCES files(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tag_status_source_status ON photo_tag_status(source, status);
 
             CREATE TABLE IF NOT EXISTS sample_keywords (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -434,6 +448,21 @@ class Database:
                     value TEXT NOT NULL
                 )
             """, []),
+            ("photo_tag_status", """
+                CREATE TABLE IF NOT EXISTS photo_tag_status (
+                    file_id INTEGER NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'siglip',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    error TEXT,
+                    source_file_size INTEGER,
+                    source_file_mtime TEXT,
+                    updated_at TEXT DEFAULT (datetime('now')),
+                    PRIMARY KEY (file_id, source),
+                    FOREIGN KEY (file_id) REFERENCES files(id)
+                )
+            """, [
+                "CREATE INDEX IF NOT EXISTS idx_tag_status_source_status ON photo_tag_status(source, status)",
+            ]),
         ]
         for table_name, create_sql, indexes in missing:
             if not self._table_exists(conn, table_name):
@@ -466,6 +495,14 @@ class Database:
                 if not self._column_exists(conn, "photo_metadata", col):
                     conn.execute(f"ALTER TABLE photo_metadata ADD COLUMN {col} {ddl}")
                     logger.info(f"补建缺失字段: photo_metadata.{col}")
+        memories_columns = [
+            ("is_hidden", "INTEGER DEFAULT 0"),
+        ]
+        if self._table_exists(conn, "memories"):
+            for col, ddl in memories_columns:
+                if not self._column_exists(conn, "memories", col):
+                    conn.execute(f"ALTER TABLE memories ADD COLUMN {col} {ddl}")
+                    logger.info(f"补建缺失字段: memories.{col}")
         files_columns = [
             ("canonical_key", "TEXT"),
             ("normalized_path", "TEXT"),

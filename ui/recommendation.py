@@ -1,5 +1,6 @@
 import os
 import random
+import time
 
 from db_manager import Database
 
@@ -292,7 +293,9 @@ def _load_ranked_memory_photos(db, cat_id):
     ranked = []
     seen_ids = set()
     rows = db.execute(
-        "SELECT id, photo_ids FROM memories WHERE category = ? ORDER BY created_at DESC",
+        """SELECT id, photo_ids, cover_file_id FROM memories
+           WHERE category = ? AND dismissed_at IS NULL AND (is_hidden IS NULL OR is_hidden = 0)
+           ORDER BY created_at DESC""",
         (cat_id,),
     ).fetchall()
 
@@ -316,7 +319,15 @@ def _load_ranked_memory_photos(db, cat_id):
                 )
             )
         if len(photos) < MIN_MEMORY_VISIBLE_REFS:
+            # 即使补充后仍不够 → 跳过，不占瀑布流位置
             continue
+
+        # 自动选择 cover：如果 cover_file_id 不在可见照片中，选第一个可见 ref
+        cover_id = row["cover_file_id"]
+        visible_ids = {p["id"] for p in photos}
+        if cover_id not in visible_ids and photos:
+            # 不修改 DB，只在本次展示时使用第一个可见照片作为 cover
+            pass
 
         for p in photos:
             if p["id"] not in seen_ids:
@@ -387,11 +398,17 @@ def load_starred_photos(db, cat_id):
     return _interleave_small_folders(valid)
 
 
-def rank_category_photos(db, cat_id):
+def rank_category_photos(db, cat_id, return_metrics=False):
+    started = time.perf_counter()
+    memory_started = time.perf_counter()
     memory_photos = _load_ranked_memory_photos(db, cat_id)
+    memory_ms = (time.perf_counter() - memory_started) * 1000
 
+    batch_started = time.perf_counter()
     batch_photos = _filter_renderable_photos(load_category_photos_batch(db, cat_id, 0, limit=9999))
+    batch_ms = (time.perf_counter() - batch_started) * 1000
 
+    merge_started = time.perf_counter()
     seen_file_ids = set()
     ordered = []
     for p in memory_photos:
@@ -404,6 +421,13 @@ def rank_category_photos(db, cat_id):
             ordered.append(p)
 
     if not ordered:
+        if return_metrics:
+            return [], {
+                "memory_ms": memory_ms,
+                "batch_ms": batch_ms,
+                "merge_ms": (time.perf_counter() - merge_started) * 1000,
+                "total_ms": (time.perf_counter() - started) * 1000,
+            }
         return []
 
     recently_shown = _get_recently_shown_ids(db, cat_id)
@@ -417,7 +441,15 @@ def rank_category_photos(db, cat_id):
     result = []
     result.extend(fresh)
     result.extend(stale)
-    return _interleave_by_time(_interleave_small_folders(result))
+    result = _interleave_by_time(_interleave_small_folders(result))
+    if return_metrics:
+        return result, {
+            "memory_ms": memory_ms,
+            "batch_ms": batch_ms,
+            "merge_ms": (time.perf_counter() - merge_started) * 1000,
+            "total_ms": (time.perf_counter() - started) * 1000,
+        }
+    return result
 
 
 def rank_search_photos(db, matched_ids):

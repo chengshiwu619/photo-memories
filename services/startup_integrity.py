@@ -97,9 +97,57 @@ def _query_memory_reference_issues(conn: sqlite3.Connection) -> List[sqlite3.Row
     ).fetchall()
 
 
+def _is_memory_hidden(conn: sqlite3.Connection, memory_id: int) -> bool:
+    """检查 memory 是否已被标记为 hidden（is_hidden=1 或已 dismissed）。"""
+    try:
+        row = conn.execute(
+            "SELECT is_hidden, dismissed_at FROM memories WHERE id = ?",
+            (memory_id,),
+        ).fetchone()
+        if row is None:
+            return True
+        if row["dismissed_at"] is not None:
+            return True
+        if row["is_hidden"] == 1:
+            return True
+        return False
+    except Exception:
+        # is_hidden 列可能不存在（旧 schema）
+        return False
+
+
 def _query_memory_visibility(conn: sqlite3.Connection) -> List[sqlite3.Row]:
-    return conn.execute(
-        """
+    """查询 memory 可见性。兼容旧 schema 无 is_hidden 列的情况。"""
+    query_with_hidden = """
+        WITH valid_memories AS (
+            SELECT id, memory_type, cover_file_id, photo_ids
+            FROM memories
+            WHERE dismissed_at IS NULL
+              AND (is_hidden IS NULL OR is_hidden = 0)
+              AND photo_ids IS NOT NULL
+              AND json_valid(photo_ids) = 1
+        )
+        SELECT vm.id AS memory_id,
+               vm.memory_type AS memory_type,
+               vm.cover_file_id AS cover_file_id,
+               COUNT(*) AS total_refs,
+               SUM(
+                   CASE
+                       WHEN f.id IS NOT NULL
+                        AND pm.thumbnail_path IS NOT NULL
+                        AND pm.thumbnail_path != ''
+                        AND pm.thumbnail_path != '__FAILED__'
+                        AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
+                       THEN 1
+                       ELSE 0
+                   END
+               ) AS visible_refs
+        FROM valid_memories vm, json_each(vm.photo_ids) j
+        LEFT JOIN files f ON f.id = CAST(j.value AS INTEGER)
+        LEFT JOIN photo_metadata pm ON pm.file_id = CAST(j.value AS INTEGER)
+        GROUP BY vm.id, vm.memory_type, vm.cover_file_id
+    """
+    query_without_hidden = """
         WITH valid_memories AS (
             SELECT id, memory_type, cover_file_id, photo_ids
             FROM memories
@@ -126,8 +174,12 @@ def _query_memory_visibility(conn: sqlite3.Connection) -> List[sqlite3.Row]:
         LEFT JOIN files f ON f.id = CAST(j.value AS INTEGER)
         LEFT JOIN photo_metadata pm ON pm.file_id = CAST(j.value AS INTEGER)
         GROUP BY vm.id, vm.memory_type, vm.cover_file_id
-        """
-    ).fetchall()
+    """
+    try:
+        return conn.execute(query_with_hidden).fetchall()
+    except sqlite3.OperationalError:
+        # 旧 schema 没有 is_hidden 列
+        return conn.execute(query_without_hidden).fetchall()
 
 
 def _query_invalid_cover_refs(conn: sqlite3.Connection) -> List[sqlite3.Row]:
@@ -516,10 +568,19 @@ def build_startup_integrity_report(
             row for row in visibility_rows
             if row["total_refs"] > 0 and 0 < row["visible_refs"] < row["total_refs"]
         ]
+        # 同时排除 is_hidden=1 的 memory（已被维护命令标记隐藏，不重复报）
+        fully_hidden = [
+            row for row in fully_hidden
+            if not _is_memory_hidden(conn, row["memory_id"])
+        ]
+        partially_hidden = [
+            row for row in partially_hidden
+            if not _is_memory_hidden(conn, row["memory_id"])
+        ]
         report["checks"].append(
             _sample_check(
                 "memories_unrenderable_in_ui",
-                "error" if fully_hidden else "info",
+                "warning" if fully_hidden else "info",
                 len(fully_hidden),
                 sample_ids=[
                     {

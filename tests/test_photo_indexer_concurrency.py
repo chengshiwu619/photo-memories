@@ -148,6 +148,31 @@ class _FakeDb:
         yield _FakeConnection(self)
 
 
+class _Rows:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+class _FakeCandidateConnection:
+    def __init__(self, result_sets):
+        self.result_sets = list(result_sets)
+
+    def execute(self, *_args, **_kwargs):
+        return _Rows(self.result_sets.pop(0))
+
+
+class _FakeCandidateDb:
+    def __init__(self, result_sets):
+        self.result_sets = result_sets
+
+    @contextmanager
+    def connect(self):
+        yield _FakeCandidateConnection(self.result_sets)
+
+
 class _FakeCheckpoint:
     def __init__(self):
         self.saves = []
@@ -172,7 +197,7 @@ def test_index_photos_workers_1_matches_serial_semantics(monkeypatch):
 
     fake_db = _FakeDb()
     fake_cp = _FakeCheckpoint()
-    photos = [(1, "a.jpg"), (2, "b.jpg"), (3, "c.jpg")]
+    photos = [(1, "a.jpg", "create_needed"), (2, "b.jpg", "create_needed"), (3, "c.jpg", "create_needed")]
 
     monkeypatch.setattr(mod, "_db", fake_db)
     monkeypatch.setattr(mod, "_cp", fake_cp)
@@ -184,7 +209,10 @@ def test_index_photos_workers_1_matches_serial_semantics(monkeypatch):
     progress = []
     result = mod.index_photos(progress_callback=lambda cur, tot: progress.append((cur, tot)), workers=1, batch_size=2)
 
-    assert result == {"total": 3, "indexed": 3}
+    assert result["total"] == 3
+    assert result["indexed"] == 3
+    assert result["processed"] == 3
+    assert result["db_updated"] == 3
     assert fake_db.init_tables_called == 1
     assert len(fake_db.executed_batches) == 2
     assert fake_db.executed_batches[0][1] == [_make_row(1), _make_row(2)]
@@ -201,7 +229,7 @@ def test_index_photos_workers_2_process_multiple_items_and_keep_db_writes_on_mai
 
     fake_db = _FakeDb()
     fake_cp = _FakeCheckpoint()
-    photos = [(1, "a.jpg"), (2, "b.jpg"), (3, "c.jpg"), (4, "d.jpg")]
+    photos = [(1, "a.jpg", "create_needed"), (2, "b.jpg", "create_needed"), (3, "c.jpg", "create_needed"), (4, "d.jpg", "create_needed")]
     worker_thread_ids = []
     barrier = threading.Barrier(2)
     main_thread_id = threading.get_ident()
@@ -221,7 +249,10 @@ def test_index_photos_workers_2_process_multiple_items_and_keep_db_writes_on_mai
 
     result = mod.index_photos(workers=2, batch_size=2)
 
-    assert result == {"total": 4, "indexed": 4}
+    assert result["total"] == 4
+    assert result["indexed"] == 4
+    assert result["processed"] == 4
+    assert result["db_updated"] == 4
     assert len(set(worker_thread_ids)) >= 2
     assert len(fake_db.executed_batches) == 2
     assert all(thread_id == main_thread_id for thread_id, _rows in fake_db.executed_batches)
@@ -234,7 +265,7 @@ def test_index_photos_single_failure_does_not_block_other_rows_and_failed_marker
 
     fake_db = _FakeDb()
     fake_cp = _FakeCheckpoint()
-    photos = [(1, "a.jpg"), (2, "b.jpg"), (3, "c.jpg")]
+    photos = [(1, "a.jpg", "create_needed"), (2, "b.jpg", "create_needed"), (3, "c.jpg", "create_needed")]
 
     def _fake_index_single_photo(file_id, file_path):
         if file_id == 2:
@@ -252,7 +283,10 @@ def test_index_photos_single_failure_does_not_block_other_rows_and_failed_marker
 
     result = mod.index_photos(workers=2, batch_size=2)
 
-    assert result == {"total": 3, "indexed": 2}
+    assert result["total"] == 3
+    assert result["indexed"] == 2
+    assert result["processed"] == 3
+    assert result["thumbnail_failed"] >= 1
     written_rows = [row for _thread_id, rows in fake_db.executed_batches for row in rows]
     assert _make_row(1) in written_rows
     assert _make_row(3, thumbnail_path="__FAILED__") in written_rows
@@ -264,7 +298,7 @@ def test_index_photos_batch_limit_saves_checkpoint_after_batch(monkeypatch):
 
     fake_db = _FakeDb()
     fake_cp = _FakeCheckpoint()
-    photos = [(1, "a.jpg"), (2, "b.jpg"), (3, "c.jpg"), (4, "d.jpg")]
+    photos = [(1, "a.jpg", "create_needed"), (2, "b.jpg", "create_needed"), (3, "c.jpg", "create_needed"), (4, "d.jpg", "create_needed")]
 
     monkeypatch.setattr(mod, "_db", fake_db)
     monkeypatch.setattr(mod, "_cp", fake_cp)
@@ -279,3 +313,18 @@ def test_index_photos_batch_limit_saves_checkpoint_after_batch(monkeypatch):
     assert result["batch_limit_reached"] is True
     assert result["indexed"] == 2
     assert fake_cp.saves[-1][1]["current_index"] == 2
+
+
+def test_get_unindexed_requeues_ok_record_when_thumbnail_file_missing(monkeypatch):
+    from business.indexer import photo_indexer as mod
+
+    fake_db = _FakeCandidateDb([
+        [],
+        [(7, "photo.jpg", "missing-thumb.jpg")],
+    ])
+    monkeypatch.setattr(mod, "_db", fake_db)
+    monkeypatch.setattr(mod.os.path, "exists", lambda path: path != "missing-thumb.jpg")
+
+    rows = mod.get_unindexed_photos()
+
+    assert rows == [(7, "photo.jpg", "create_needed")]

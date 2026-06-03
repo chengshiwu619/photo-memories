@@ -683,11 +683,18 @@ def incremental_scan(
     scan_db = db or _db
     scan_db.init_tables()
 
-    # 后台/安全模式：limit 为 None 或 0 时强制改为安全默认值 1000
+    # limit 处理：
+    # - limit=-1 或 0 表示不限制（全量扫描）
+    # - limit=None 时使用安全默认值（避免意外全量扫描阻塞）
+    # - 正整数表示每批最大文件数
     DEFAULT_SAFE_LIMIT = 1000
-    if limit is None or (isinstance(limit, int) and limit <= 0):
+    if limit is None:
         limit = DEFAULT_SAFE_LIMIT
-        logger.info("limit 缺失或无效，强制使用安全默认值: %s", limit)
+        logger.info("limit 未指定，使用安全默认值: %s", limit)
+    elif isinstance(limit, int) and limit <= 0:
+        # limit=0 或负数 → 不限制，全量扫描
+        limit = None
+        logger.info("limit=%s → 全量扫描（不限制）", limit)
 
     logger.info(
         "增量扫描开始: source_drive=%s limit=%s dry_run=%s prefer_everything=%s background_scan_limit=%s",
@@ -697,6 +704,12 @@ def incremental_scan(
         prefer_everything,
         limit,
     )
+    # 扫描根目录诊断
+    for i, sd in enumerate(_s.source_dirs):
+        sd_exists = os.path.isdir(sd)
+        logger.info("  scan_root[%s]: %s exists=%s", i, sd, sd_exists)
+    use_everything = prefer_everything and _detect_instance() != "__FAIL__"
+    logger.info("  use_everything=%s everything_available=%s", prefer_everything, es_available())
 
     file_list, discovery_source = _discover_incremental_files(
         limit=limit,
@@ -738,11 +751,18 @@ def incremental_scan(
         stats["batch_limit_reached"] = True
 
     pending_inserts = []
-    pending_updates = []
+    pending_changed_updates = []   # 真正 size/mtime 变化的文件 → 需重置 thumbnail
+    pending_path_updates = []      # 仅 path_status/canonical_key 需补全 → 不重置 thumbnail
     seen_keys = set()
 
     total = len(file_list)
     source_dirs = _s.source_dirs
+    PROGRESS_LOG_INTERVAL = 5000  # 每 5000 条输出一次进度日志
+
+    logger.info(
+        "scan processing: starting path normalize for %s files (log every %s)",
+        total, PROGRESS_LOG_INTERVAL,
+    )
     for i, raw_path in enumerate(file_list):
         if _cp.is_pause_or_stop_requested() or (should_stop and should_stop()):
             stats["state"] = "paused" if _cp.is_pause_or_stop_requested() else "stopped"
@@ -757,7 +777,27 @@ def incremental_scan(
             break
 
         # 对每条路径做完整 resolve（含 stat），捕获 stat_failed/missing
-        resolve_result = resolve_file_path(raw_path, source_dirs, stat_file=True)
+        # 单文件异常不得卡住全局
+        try:
+            resolve_result = resolve_file_path(raw_path, source_dirs, stat_file=True)
+        except Exception as exc:
+            stats["errors"] += 1
+            if len(stats["samples"]["errors"]) < 20:
+                stats["samples"]["errors"].append({"path": raw_path, "error": f"resolve_exception: {exc}"})
+            _record_bad_path_sample(raw_path, f"resolve_exception: {exc}")
+            logger.debug("scan resolve 异常: %s: %s", raw_path, exc)
+            if (i + 1) % PROGRESS_LOG_INTERVAL == 0:
+                logger.info(
+                    "scan processing: processed=%s/%s new=%s changed=%s existing=%s skipped=%s errors=%s",
+                    i + 1, total, stats["new"], stats["changed"], stats["existing"],
+                    stats["skipped"], stats["errors"],
+                )
+            if progress_callback:
+                progress_callback(i + 1, total)
+            if status_callback:
+                status_callback(dict(stats))
+            continue
+
         filepath = resolve_result.normalized_path
         canonical_key = resolve_result.canonical_key
         stats["scanned"] += 1
@@ -772,6 +812,16 @@ def incremental_scan(
                     "reason": f"{resolve_result.status.value}: {resolve_result.reason}",
                 })
             _record_bad_path_sample(raw_path, f"{resolve_result.status.value}: {resolve_result.reason}")
+            if (i + 1) % PROGRESS_LOG_INTERVAL == 0:
+                logger.info(
+                    "scan processing: processed=%s/%s new=%s changed=%s existing=%s skipped=%s errors=%s",
+                    i + 1, total, stats["new"], stats["changed"], stats["existing"],
+                    stats["skipped"], stats["errors"],
+                )
+            if progress_callback:
+                progress_callback(i + 1, total)
+            if status_callback:
+                status_callback(dict(stats))
             continue
 
         if resolve_result.status in (PathStatus.MISSING, PathStatus.STAT_FAILED):
@@ -782,7 +832,17 @@ def incremental_scan(
                     "error": resolve_result.reason,
                 })
             _record_bad_path_sample(filepath, f"{resolve_result.status.value}: {resolve_result.reason}")
-            logger.warning(f"增量扫描文件状态异常: {filepath}: {resolve_result.reason}")
+            logger.debug("增量扫描文件状态异常: %s: %s", filepath, resolve_result.reason)
+            if (i + 1) % PROGRESS_LOG_INTERVAL == 0:
+                logger.info(
+                    "scan processing: processed=%s/%s new=%s changed=%s existing=%s skipped=%s errors=%s",
+                    i + 1, total, stats["new"], stats["changed"], stats["existing"],
+                    stats["skipped"], stats["errors"],
+                )
+            if progress_callback:
+                progress_callback(i + 1, total)
+            if status_callback:
+                status_callback(dict(stats))
             continue
 
         # seen_keys 去重（使用 canonical_key）
@@ -801,7 +861,14 @@ def incremental_scan(
             if len(stats["samples"]["errors"]) < 20:
                 stats["samples"]["errors"].append({"path": filepath, "error": str(exc)})
             _record_bad_path_sample(filepath, f"stat_failed: {exc}")
-            logger.warning(f"增量扫描读取文件状态失败: {filepath}: {exc}")
+            logger.debug("增量扫描读取文件状态失败: %s: %s", filepath, exc)
+            continue
+        except Exception as exc:
+            # 兜底：任何意外异常都记录并继续，不卡全局
+            stats["errors"] += 1
+            if len(stats["samples"]["errors"]) < 20:
+                stats["samples"]["errors"].append({"path": filepath, "error": f"build_row_exception: {exc}"})
+            logger.debug("增量扫描构建文件行异常: %s: %s", filepath, exc)
             continue
 
         old = existing.get(canonical_key)
@@ -818,19 +885,33 @@ def incremental_scan(
             stats["tag_pending"] += 1 if row["is_image"] else 0
             if len(stats["samples"]["changed"]) < 20:
                 stats["samples"]["changed"].append(filepath)
-            pending_updates.append((row, old["id"]))
+            pending_changed_updates.append((row, old["id"]))
         else:
             stats["existing"] += 1
             # 即使文件未变，也更新 path_status / canonical_key（如果旧记录缺少）
             old_ck = old["canonical_key"] if "canonical_key" in old.keys() else None
             old_ps = old["path_status"] if "path_status" in old.keys() else None
             if not old_ck or old_ps != PathStatus.OK.value:
-                pending_updates.append((row, old["id"]))
+                # 仅补全路径元数据，不重置缩略图
+                pending_path_updates.append((row, old["id"]))
 
+        # 进度日志 + 回调
+        if (i + 1) % PROGRESS_LOG_INTERVAL == 0:
+            logger.info(
+                "scan processing: processed=%s/%s new=%s changed=%s existing=%s skipped=%s errors=%s",
+                i + 1, total, stats["new"], stats["changed"], stats["existing"],
+                stats["skipped"], stats["errors"],
+            )
         if progress_callback:
             progress_callback(i + 1, total)
         if status_callback:
             status_callback(dict(stats))
+
+    logger.info(
+        "scan processing: path normalize complete. total=%s new=%s changed=%s existing=%s skipped=%s errors=%s",
+        stats["scanned"], stats["new"], stats["changed"], stats["existing"],
+        stats["skipped"], stats["errors"],
+    )
 
     if dry_run:
         if stats["state"] == "running":
@@ -839,49 +920,115 @@ def incremental_scan(
         return stats
 
     with scan_db.connect() as conn:
-        for row in pending_inserts:
-            result = conn.execute(
-                """INSERT OR IGNORE INTO files
-                   (file_path, file_name, folder_path, folder_name, file_size, file_mtime,
-                    file_hash, is_image, scanned_at, source_dir,
-                    canonical_key, normalized_path, path_status, path_error)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    row["file_path"], row["file_name"], row["folder_path"], row["folder_name"],
-                    row["file_size"], row["file_mtime"], row["file_hash"], row["is_image"],
-                    row["scanned_at"], row["source_dir"],
-                    row["canonical_key"], row["normalized_path"], row["path_status"], row["path_error"],
-                ),
-            )
-            stats["db_inserted"] += result.rowcount
+        DB_COMMIT_BATCH = 5000  # 每 5000 条 commit 一次，避免 9W 条一次性事务
 
-        for row, file_id in pending_updates:
-            result = conn.execute(
-                """UPDATE files
-                   SET file_path = ?, file_name = ?, folder_path = ?, folder_name = ?,
-                       file_size = ?, file_mtime = ?, is_image = ?, scanned_at = ?, source_dir = ?,
-                       canonical_key = ?, normalized_path = ?, path_status = ?, path_error = ?
-                   WHERE id = ?""",
-                (
-                    row["file_path"], row["file_name"], row["folder_path"], row["folder_name"],
-                    row["file_size"], row["file_mtime"], row["is_image"], row["scanned_at"],
-                    row["source_dir"],
-                    row["canonical_key"], row["normalized_path"], row["path_status"], row["path_error"],
-                    file_id,
-                ),
-            )
-            stats["db_updated"] += result.rowcount
-            if row["is_image"]:
-                conn.execute(
-                    """UPDATE photo_metadata
-                       SET thumbnail_path = NULL, indexed_at = NULL, phash = NULL, is_duplicate_of = NULL
-                       WHERE file_id = ?""",
-                    (file_id,),
+        # --- inserts ---
+        logger.info(
+            "scan db write: inserting %s new files (batch=%s)",
+            len(pending_inserts), DB_COMMIT_BATCH,
+        )
+        for idx, row in enumerate(pending_inserts):
+            try:
+                result = conn.execute(
+                    """INSERT OR IGNORE INTO files
+                       (file_path, file_name, folder_path, folder_name, file_size, file_mtime,
+                        file_hash, is_image, scanned_at, source_dir,
+                        canonical_key, normalized_path, path_status, path_error)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        row["file_path"], row["file_name"], row["folder_path"], row["folder_name"],
+                        row["file_size"], row["file_mtime"], row["file_hash"], row["is_image"],
+                        row["scanned_at"], row["source_dir"],
+                        row["canonical_key"], row["normalized_path"], row["path_status"], row["path_error"],
+                    ),
                 )
-                conn.execute(
-                    "DELETE FROM photo_tags WHERE file_id = ? AND source = 'siglip'",
-                    (file_id,),
+                stats["db_inserted"] += result.rowcount
+            except Exception as exc:
+                logger.debug("scan db insert 失败: %s: %s", row.get("file_path", "?"), exc)
+                continue
+            if (idx + 1) % DB_COMMIT_BATCH == 0:
+                conn.commit()
+                logger.info(
+                    "scan db write: inserts committed=%s/%s db_inserted=%s",
+                    idx + 1, len(pending_inserts), stats["db_inserted"],
                 )
+
+        # --- changed updates (重置 thumbnail) ---
+        logger.info(
+            "scan db write: updating %s changed files (batch=%s)",
+            len(pending_changed_updates), DB_COMMIT_BATCH,
+        )
+        for idx, (row, file_id) in enumerate(pending_changed_updates):
+            try:
+                result = conn.execute(
+                    """UPDATE files
+                       SET file_path = ?, file_name = ?, folder_path = ?, folder_name = ?,
+                           file_size = ?, file_mtime = ?, is_image = ?, scanned_at = ?, source_dir = ?,
+                           canonical_key = ?, normalized_path = ?, path_status = ?, path_error = ?
+                       WHERE id = ?""",
+                    (
+                        row["file_path"], row["file_name"], row["folder_path"], row["folder_name"],
+                        row["file_size"], row["file_mtime"], row["is_image"], row["scanned_at"],
+                        row["source_dir"],
+                        row["canonical_key"], row["normalized_path"], row["path_status"], row["path_error"],
+                        file_id,
+                    ),
+                )
+                stats["db_updated"] += result.rowcount
+                if row["is_image"]:
+                    conn.execute(
+                        """UPDATE photo_metadata
+                           SET thumbnail_path = NULL, indexed_at = NULL, phash = NULL, is_duplicate_of = NULL
+                           WHERE file_id = ?""",
+                        (file_id,),
+                    )
+                    conn.execute(
+                        "DELETE FROM photo_tags WHERE file_id = ? AND source = 'siglip'",
+                        (file_id,),
+                    )
+            except Exception as exc:
+                logger.debug("scan db changed update 失败: file_id=%s: %s", file_id, exc)
+                continue
+            if (idx + 1) % DB_COMMIT_BATCH == 0:
+                conn.commit()
+                logger.info(
+                    "scan db write: changed committed=%s/%s db_updated=%s",
+                    idx + 1, len(pending_changed_updates), stats["db_updated"],
+                )
+
+        # --- path-only updates (不重置 thumbnail) ---
+        logger.info(
+            "scan db write: updating %s path-only files (batch=%s)",
+            len(pending_path_updates), DB_COMMIT_BATCH,
+        )
+        for idx, (row, file_id) in enumerate(pending_path_updates):
+            try:
+                conn.execute(
+                    """UPDATE files
+                       SET canonical_key = ?, normalized_path = ?, path_status = ?, path_error = ?,
+                           scanned_at = ?
+                       WHERE id = ?""",
+                    (
+                        row["canonical_key"], row["normalized_path"], row["path_status"],
+                        row["path_error"], row["scanned_at"],
+                        file_id,
+                    ),
+                )
+                stats["db_updated"] += 1
+            except Exception as exc:
+                logger.debug("scan db path update 失败: file_id=%s: %s", file_id, exc)
+                continue
+            if (idx + 1) % DB_COMMIT_BATCH == 0:
+                conn.commit()
+                logger.info(
+                    "scan db write: path-only committed=%s/%s db_updated=%s",
+                    idx + 1, len(pending_path_updates), stats["db_updated"],
+                )
+
+    logger.info(
+        "scan db write: complete. db_inserted=%s db_updated=%s",
+        stats["db_inserted"], stats["db_updated"],
+    )
 
     if stats["state"] == "running":
         stats["state"] = "done"
@@ -891,6 +1038,22 @@ def incremental_scan(
     stats["samples"]["bad_paths"] = final_bad_path_samples
     if status_callback:
         status_callback(dict(stats))
+    # 路径合法性统计
+    path_ok = stats["scanned"] - stats["skipped"] - stats["errors"]
+    path_damaged = sum(1 for s in (stats["samples"].get("skipped", []) + stats["samples"].get("bad_paths", []))
+                       if "damaged_path" in str(s.get("reason", "")))
+    path_missing = sum(1 for s in stats["samples"].get("errors", [])
+                       if "missing" in str(s.get("error", "")).lower() or "MISSING" in str(s.get("error", "")))
+    logger.info(
+        "scan result: new=%s changed=%s existing=%s maybe_more=%s",
+        stats["new"], stats["changed"], stats["existing"], stats["batch_limit_reached"],
+    )
+    logger.info(
+        "path normalize: ok=%s damaged=%s missing=%s unsupported=%s stat_failed=%s",
+        path_ok, path_damaged, path_missing,
+        sum(1 for s in stats["samples"].get("skipped", []) if "unsupported" in str(s.get("reason", "")).lower()),
+        sum(1 for s in stats["samples"].get("errors", []) if "stat" in str(s.get("error", "")).lower()),
+    )
     logger.info(
         "增量扫描完成: scanned=%s new=%s existing=%s changed=%s skipped=%s errors=%s "
         "bad_paths=%s discovery=%s batch_limit_reached=%s limit=%s",

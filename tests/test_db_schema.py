@@ -97,6 +97,21 @@ def test_photo_tags_unique_constraint():
         shutil.rmtree(tmp)
 
 
+def test_photo_tag_status_table_exists():
+    from db_manager import Database
+    tmp = tempfile.mkdtemp()
+    try:
+        db_path = os.path.join(tmp, "photos.db")
+        db = Database(db_path)
+        db.init_tables()
+        conn = sqlite3.connect(db_path)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(photo_tag_status)").fetchall()}
+        conn.close()
+        assert {"file_id", "source", "status", "error", "source_file_size", "source_file_mtime"} <= cols
+    finally:
+        shutil.rmtree(tmp)
+
+
 def test_config_init_all_tables_delegates():
     from db_manager import Database
     tmp = tempfile.mkdtemp()
