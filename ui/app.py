@@ -1381,7 +1381,7 @@ def main():
                             for fid in batch:
                                 if fid in tags_dict:
                                     self.ok += 1
-                                    status_rows.append((fid, "ok", None))
+                                    status_rows.append((fid, "processed_ok", None))
                                 elif fid in error_by_file:
                                     self.failed += 1
                                     status_rows.append((fid, "failed", error_by_file[fid]))

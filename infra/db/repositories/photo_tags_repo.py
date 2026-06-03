@@ -51,16 +51,9 @@ class PhotoTagsRepository:
                 WHERE pm.thumbnail_path IS NOT NULL
                   AND pm.thumbnail_path != '__FAILED__'
                   AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
-                  AND NOT (
-                      ts.file_id IS NULL
-                      AND EXISTS (
-                          SELECT 1 FROM photo_tags pt
-                          WHERE pt.file_id = pm.file_id AND pt.source = ?
-                      )
-                  )
                   AND (
                       ts.file_id IS NULL
-                      OR ts.status NOT IN ('ok', 'done', 'skipped', 'failed')
+                      OR ts.status NOT IN ('processed_ok', 'ok', 'done', 'skipped', 'failed')
                       OR ts.source_file_size IS NULL
                       OR ts.source_file_mtime IS NULL
                       OR ts.source_file_size != f.file_size
@@ -68,7 +61,7 @@ class PhotoTagsRepository:
                   )
                 ORDER BY pm.file_id
                 """,
-                (source, source),
+                (source,),
             ).fetchall()
         pending = [r[0] for r in rows]
         if limit and limit > 0:

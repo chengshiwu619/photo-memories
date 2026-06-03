@@ -85,10 +85,13 @@ def test_photo_tag_status_excludes_processed_and_requeues_changed_file():
 
         repo = PhotoTagsRepository(db)
         pending, total = repo.get_pending_file_ids("siglip", limit=10)
-        assert pending == [1, 2]
-        assert total == 2
+        assert pending == [1, 2, 3]
+        assert total == 3
 
-        assert repo.update_status_many([(1, "ok", None), (2, "failed", "bad image")], "siglip") == 2
+        assert repo.update_status_many(
+            [(1, "processed_ok", None), (2, "failed", "bad image"), (3, "processed_ok", None)],
+            "siglip",
+        ) == 3
         pending, total = repo.get_pending_file_ids("siglip", limit=10)
         assert pending == []
         assert total == 0
