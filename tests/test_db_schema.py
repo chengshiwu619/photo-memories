@@ -58,6 +58,21 @@ def test_photo_metadata_has_is_starred():
         shutil.rmtree(tmp)
 
 
+def test_photo_metadata_has_category_override():
+    from db_manager import Database
+    tmp = tempfile.mkdtemp()
+    try:
+        db_path = os.path.join(tmp, "photos.db")
+        db = Database(db_path)
+        db.init_tables()
+        conn = sqlite3.connect(db_path)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(photo_metadata)").fetchall()}
+        conn.close()
+        assert "category" in cols
+    finally:
+        shutil.rmtree(tmp)
+
+
 def test_memories_has_is_starred():
     from db_manager import Database
     tmp = tempfile.mkdtemp()

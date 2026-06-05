@@ -27,7 +27,7 @@ from ui.components.timeline_view import TimelineView
 from ui.components.special_memories import SpecialMemoriesView
 from ui.recommendation import (
     rank_category_photos, load_starred_photos, load_category_photos_batch,
-    count_category_photos, reshuffle_photos,
+    count_category_photos,
 )
 from ui.recommendation import CATEGORY_COLORS, PAGE_SIZE, record_shown_photos
 
@@ -130,7 +130,8 @@ class CategoryPrefetchWorker(QThread):
             if self._starred_only:
                 photos = load_starred_photos(conn, self._cat_id, limit=self._limit)
             else:
-                photos = load_category_photos_batch(conn, self._cat_id, 0, limit=self._limit)
+                ranked = rank_category_photos(conn, self._cat_id)
+                photos = ranked[:self._limit]
             total = count_category_photos(conn, self._cat_id, starred_only=self._starred_only)
             if self.isInterruptionRequested():
                 return
@@ -143,6 +144,24 @@ class CategoryPrefetchWorker(QThread):
         finally:
             if conn is not None:
                 conn.close()
+
+
+class TimelineCategoryUpdateWorker(QThread):
+    completed = pyqtSignal(list, dict)
+    failed = pyqtSignal(list, str)
+
+    def __init__(self, file_ids, category=CATEGORY_SAMPLE, parent=None):
+        super().__init__(parent)
+        self._file_ids = list(file_ids or [])
+        self._category = category
+
+    def run(self):
+        try:
+            from business.classifier.photo_category_override import batch_set_photo_category
+            result = batch_set_photo_category(self._file_ids, self._category, user="user")
+            self.completed.emit(self._file_ids, result)
+        except Exception as exc:
+            self.failed.emit(self._file_ids, repr(exc))
 
 
 def _build_siglip_tag_rows(file_ids, generate_tags_batch, should_stop, batch_size=32):
@@ -229,6 +248,7 @@ class MainWindow(QMainWindow):
         self._cat_prefetch_workers = {}
         self._cat_prefetch_generation = 0
         self._current_random_cat_id = None
+        self._random_needs_reload = False
         self._folder_viewer_photos = []
         self._folder_view_counts = {}
         self._suppressed_folders = set()
@@ -240,6 +260,8 @@ class MainWindow(QMainWindow):
         self._timeline_photos = []
         self._timeline_known_ids = set()
         self._timeline_loaded = False
+        self._timeline_category_worker = None
+        self._current_timeline_category = CATEGORY_LIFE
         self._special_loaded = False
         self._special_stack_photos = []
 
@@ -272,6 +294,9 @@ class MainWindow(QMainWindow):
         BACKGROUND_SHUTDOWN_REQUESTED = True
         logger.info("MainWindow 正在关闭，等待后台线程...")
         self._timeline_refresh_timer.stop()
+        if self._timeline_category_worker and self._timeline_category_worker.isRunning():
+            self._timeline_category_worker.requestInterruption()
+            self._timeline_category_worker.wait(1000)
         manager = BackgroundTaskManager.get_instance()
         manager.cancel_all()
         manager.wait_all(2000)
@@ -422,6 +447,8 @@ class MainWindow(QMainWindow):
 
         self._timeline_view = TimelineView()
         self._timeline_view.photo_clicked.connect(self.on_photo_clicked)
+        self._timeline_view.set_category_requested.connect(self._on_timeline_set_category_requested)
+        self._timeline_view.category_changed.connect(self._on_timeline_category_changed)
         self._timeline_view._scroll.verticalScrollBar().valueChanged.connect(
             lambda v: self._on_page_scroll(self._timeline_view, v)
         )
@@ -456,6 +483,7 @@ class MainWindow(QMainWindow):
 
         # 暂停/恢复时间线刷新定时器
         if nav_id == "timeline":
+            self._timeline_view.set_category_bar_visible(True)
             if not self._timeline_loaded:
                 self._load_timeline()
             elif self.starred_only:
@@ -463,25 +491,31 @@ class MainWindow(QMainWindow):
             self._timeline_refresh_timer.start()
         else:
             self._timeline_refresh_timer.stop()
+            if nav_id == "random" and getattr(self, "_random_needs_reload", False):
+                self._random_needs_reload = False
+                self._reload_random()
             if nav_id == "special":
                 if not self._special_loaded:
                     self._load_special_memories()
 
     def _load_timeline(self):
         starred_clause = "AND pm.is_starred = 1" if self.starred_only else ""
+        from ui.recommendation import _category_match_sql
+        cat_id = getattr(self, "_current_timeline_category", CATEGORY_LIFE)
+        self._timeline_view.set_active_category(cat_id, emit=False)
         rows = self.db.execute(f"""
             SELECT pm.file_id as id, pm.thumbnail_path, pm.date_taken,
                    pm.width, pm.height, f.file_path, f.file_name,
                    f.folder_path, f.folder_name as folder_display, f.file_mtime
             FROM photo_metadata pm
             JOIN files f ON pm.file_id = f.id
-            JOIN folder_categories fc ON f.folder_path = fc.folder_path
+            LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
             WHERE pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
-                  AND fc.category = ?
+                  AND {_category_match_sql(cat_id)}
                   AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
                   {starred_clause}
             ORDER BY pm.date_taken DESC, f.file_mtime DESC
-        """, (CATEGORY_LIFE,)).fetchall()
+        """, (cat_id,)).fetchall()
         from ui.recommendation import _make_photo_dict
         self._timeline_photos = [_make_photo_dict(r) for r in rows]
         self._timeline_view.load_photos(self._timeline_photos)
@@ -493,18 +527,20 @@ class MainWindow(QMainWindow):
         if not self._timeline_loaded:
             return
         try:
+            from ui.recommendation import _category_match_sql
+            cat_id = getattr(self, "_current_timeline_category", CATEGORY_LIFE)
             rows = self.db.execute("""
                 SELECT pm.file_id as id, pm.thumbnail_path, pm.date_taken,
                        pm.width, pm.height, f.file_path, f.file_name,
                        f.folder_path, f.folder_name as folder_display, f.file_mtime
                 FROM photo_metadata pm
                 JOIN files f ON pm.file_id = f.id
-                JOIN folder_categories fc ON f.folder_path = fc.folder_path
+                LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
                 WHERE pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
-                      AND fc.category = ?
+                      AND """ + _category_match_sql(cat_id) + """
                       AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
                 ORDER BY pm.date_taken DESC, f.file_mtime DESC
-            """, (CATEGORY_LIFE,)).fetchall()
+            """, (cat_id,)).fetchall()
             from ui.recommendation import _make_photo_dict
             new_photos = []
             for r in rows:
@@ -538,15 +574,16 @@ class MainWindow(QMainWindow):
     def _get_life_photo_count(self) -> int:
         """获取已索引的生活照片数量（与随机回忆瀑布流口径一致）"""
         try:
+            from ui.recommendation import _category_match_sql
             row = self.db.execute("""
                 SELECT COUNT(*) FROM files f
-                JOIN folder_categories fc ON f.folder_path = fc.folder_path
+                LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
                 LEFT JOIN photo_metadata pm ON f.id = pm.file_id
-                WHERE fc.category = 1
+                WHERE """ + _category_match_sql(CATEGORY_LIFE) + """
                   AND f.is_image = 1
                   AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
                   AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
-            """).fetchone()
+            """, (CATEGORY_LIFE,)).fetchone()
             return row[0] if row else 0
         except Exception as e:
             logger.warning(f"获取生活照片数量失败: {e}")
@@ -658,6 +695,67 @@ class MainWindow(QMainWindow):
         self._timeline_loaded = False
         self._load_timeline()
 
+    def _on_timeline_category_changed(self, cat_id):
+        self._current_timeline_category = cat_id
+        self._timeline_loaded = False
+        self._timeline_view.clear_selection()
+        self._load_timeline()
+
+    def _on_timeline_set_category_requested(self, file_ids, category):
+        ids = [int(fid) for fid in file_ids or [] if fid]
+        if not ids:
+            return
+        category = CATEGORY_LIFE if int(category) == CATEGORY_LIFE else CATEGORY_SAMPLE
+        if self._timeline_category_worker and self._timeline_category_worker.isRunning():
+            logger.info("timeline batch category update already running; ignored new request count=%s", len(ids))
+            return
+
+        self._timeline_view.set_batch_busy(True)
+        worker = TimelineCategoryUpdateWorker(ids, category, self)
+        worker.completed.connect(self._on_timeline_category_update_done)
+        worker.failed.connect(self._on_timeline_category_update_failed)
+        worker.finished.connect(lambda w=worker: self._on_timeline_category_worker_finished(w))
+        self._timeline_category_worker = worker
+        logger.info("timeline batch category update start: count=%s category=样片", len(ids))
+        worker.start()
+
+    def _on_timeline_category_update_done(self, file_ids, result):
+        updated_ids = set(int(fid) for fid in file_ids or [] if fid)
+        scroll_bar = self._timeline_view._scroll.verticalScrollBar()
+        scroll_value = scroll_bar.value()
+        if updated_ids:
+            target_category = result.get("category", CATEGORY_SAMPLE)
+            if getattr(self, "_current_timeline_category", CATEGORY_LIFE) == target_category:
+                self._timeline_loaded = False
+                self._load_timeline()
+            else:
+                self._timeline_photos = [p for p in self._timeline_photos if p.get("id") not in updated_ids]
+                self._timeline_known_ids = {p["id"] for p in self._timeline_photos}
+                self._timeline_view.load_photos(self._timeline_photos)
+            QTimer.singleShot(0, lambda v=scroll_value: self._timeline_view._scroll.verticalScrollBar().setValue(
+                min(v, self._timeline_view._scroll.verticalScrollBar().maximum())
+            ))
+        self._timeline_view.clear_selection()
+        self._timeline_view.set_batch_busy(False)
+        self._invalidate_all_caches()
+        self._timeline_loaded = True
+        self._timeline_known_ids = {p["id"] for p in self._timeline_photos}
+        self._random_needs_reload = True
+        logger.info(
+            "timeline batch category update done: requested=%s updated=%s missing=%s category=样片",
+            result.get("requested", len(file_ids)),
+            result.get("updated", 0),
+            result.get("missing", 0),
+        )
+
+    def _on_timeline_category_update_failed(self, file_ids, error):
+        self._timeline_view.set_batch_busy(False)
+        logger.warning("timeline batch category update failed: count=%s error=%s", len(file_ids or []), error)
+
+    def _on_timeline_category_worker_finished(self, worker):
+        if self._timeline_category_worker is worker:
+            self._timeline_category_worker = None
+
     def _open_settings(self):
         from ui.components.setup_window import SetupWindow
         self._settings_window = SetupWindow(edit_mode=True)
@@ -679,6 +777,7 @@ class MainWindow(QMainWindow):
         self._cat_shown_ids = {}
         self._cat_active_tokens = {}
         self._cat_request_modes = {}
+        self._random_needs_reload = False
 
         for cat_id, _ in CATEGORIES:
             memories_repo = MemoriesRepository(Database())
@@ -697,6 +796,7 @@ class MainWindow(QMainWindow):
         self._cat_shown_ids = {}
         self._cat_active_tokens = {}
         self._cat_request_modes = {}
+        self._random_needs_reload = False
 
         for cat_id, _ in CATEGORIES:
             memories_repo = MemoriesRepository(Database())
@@ -711,8 +811,13 @@ class MainWindow(QMainWindow):
         self._timeline_loaded = False
         self._special_loaded = False
         self._cat_result_cache.clear()
+        self._cat_photos = {}
+        self._cat_offsets = {}
+        self._cat_all_loaded = {}
+        self._cat_shown_ids = {}
         if hasattr(self, "_cat_visible_cache"):
             self._cat_visible_cache.clear()
+        self._random_needs_reload = True
         self._cat_prefetch_generation = getattr(self, "_cat_prefetch_generation", 0) + 1
         if hasattr(self, "_cancel_category_prefetch_workers"):
             self._cancel_category_prefetch_workers()
@@ -729,6 +834,7 @@ class MainWindow(QMainWindow):
                     (SELECT COALESCE(MAX(id), 0) FROM files),
                     (SELECT COUNT(*) FROM photo_metadata),
                     (SELECT COALESCE(MAX(file_id), 0) FROM photo_metadata),
+                    (SELECT COALESCE(MAX(indexed_at), '') FROM photo_metadata),
                     (SELECT COUNT(*) FROM memories),
                     (SELECT COALESCE(MAX(id), 0) FROM memories)
                 """
@@ -751,20 +857,25 @@ class MainWindow(QMainWindow):
         cached = getattr(self, "_cat_visible_cache", {}).get(cache_key)
         logger.info("random switch: from=%s to=%s cache_hit=%s", previous_cat_id, cat_id, bool(cached))
 
-        self._cat_load_token += 1
-        token = self._cat_load_token
-        self._cat_active_tokens[cat_id] = token
-
         if cached:
             old_worker = self._cat_workers.get(cat_id)
             if old_worker and old_worker.isRunning():
-                old_worker.requestInterruption()
+                active_token = self._cat_active_tokens.get(cat_id)
+                active_mode = self._cat_request_modes.get(active_token)
+                if active_mode in {"foreground", "refresh"}:
+                    old_worker.requestInterruption()
+                    self._cat_active_tokens.pop(cat_id, None)
+                    if active_token is not None:
+                        self._cat_request_modes.pop(active_token, None)
             self._show_category_cache(index, cat_id, cached)
             self._start_silent_cache_refresh(cat_id, reason="cache_hit")
             self._start_offscreen_refresh(previous_cat_id, reason="left_tab")
             self._schedule_category_prefetch(index, delay_ms=0)
             return
 
+        self._cat_load_token += 1
+        token = self._cat_load_token
+        self._cat_active_tokens[cat_id] = token
         self._reset_category_page(index, cat_id)
         logger.info("random loading: cat_id=%s", cat_id)
         self._start_category_load(index, cat_id, token, mode="foreground")
@@ -1045,15 +1156,8 @@ class MainWindow(QMainWindow):
         all_photos = self._cat_photos.get(cat_id, [])
 
         if self._cat_all_loaded.get(cat_id, False):
-            reshuffled = reshuffle_photos(all_photos, self._cat_shown_ids.get(cat_id))
-            if not reshuffled:
-                self.pages[page_index].set_all_loaded(has_thumbnails_remaining=True)
-                return
-            self._cat_photos[cat_id] = reshuffled
-            self._cat_offsets[cat_id] = 0
-            self._cat_all_loaded[cat_id] = False
-            self.pages[page_index].reset_for_shuffle()
-            next_page = reshuffled[:PAGE_SIZE]
+            self.pages[page_index].set_all_loaded(has_thumbnails_remaining=True)
+            return
         else:
             next_page = all_photos[offset:offset + PAGE_SIZE]
             if not next_page:
@@ -1068,11 +1172,15 @@ class MainWindow(QMainWindow):
         self._cat_shown_ids.setdefault(cat_id, set()).update(p["id"] for p in next_page)
         record_shown_photos(next_page, cat_id)
         self.pages[page_index].append_photos(next_page)
+        if self._cat_all_loaded.get(cat_id, False):
+            self.pages[page_index].set_all_loaded(has_thumbnails_remaining=True)
 
     def _on_page_scroll(self, page, value):
         if value > 10:
             if hasattr(page, 'memory_summary'):
                 page.memory_summary.hide()
+        if hasattr(page, "is_year_dragging") and page.is_year_dragging():
+            return
 
         page_key = id(page)
         last_val = self._last_scroll_vals.get(page_key, 0)
@@ -1082,10 +1190,14 @@ class MainWindow(QMainWindow):
                 self.top_bar.hide()
                 if hasattr(self, 'nav_bar'):
                     self.nav_bar.hide()
+                if hasattr(page, "set_category_bar_visible"):
+                    page.set_category_bar_visible(False)
             elif delta < 0:
                 self.top_bar.show()
                 if hasattr(self, 'nav_bar'):
                     self.nav_bar.show()
+                if hasattr(page, "set_category_bar_visible"):
+                    page.set_category_bar_visible(True)
             self._last_scroll_vals[page_key] = value
 
     def on_photo_clicked(self, photo_data):

@@ -311,6 +311,35 @@ def test_sample_keyword_in_parent_folder_path_overrides_child_life_category(tmp_
     assert life_count == 0
 
 
+def test_photo_category_override_moves_single_photo_to_sample(tmp_path):
+    from config import CATEGORY_LIFE, CATEGORY_SAMPLE
+    from ui.recommendation import count_category_photos, load_category_photos_batch
+
+    db = Database(str(tmp_path / "photos.db"))
+    db.init_tables()
+    with db.connect() as conn:
+        _insert_photo(conn, tmp_path, 1, category=CATEGORY_LIFE, thumbnail=True, folder="Mixed")
+        _insert_photo(conn, tmp_path, 2, category=CATEGORY_LIFE, thumbnail=True, folder="Mixed")
+        conn.execute(
+            "UPDATE photo_metadata SET category = ? WHERE file_id = 1",
+            (CATEGORY_SAMPLE,),
+        )
+
+    conn = db.get_persistent_connection()
+    try:
+        sample_photos = load_category_photos_batch(conn, CATEGORY_SAMPLE, 0, limit=10)
+        life_photos = load_category_photos_batch(conn, CATEGORY_LIFE, 0, limit=10)
+        sample_count = count_category_photos(conn, CATEGORY_SAMPLE)
+        life_count = count_category_photos(conn, CATEGORY_LIFE)
+    finally:
+        conn.close()
+
+    assert [p["id"] for p in sample_photos] == [1]
+    assert [p["id"] for p in life_photos] == [2]
+    assert sample_count == 1
+    assert life_count == 1
+
+
 def test_rank_category_prefers_unshown_random_pool_when_enough_candidates(tmp_path):
     from ui.recommendation import rank_category_photos
 

@@ -1,10 +1,11 @@
 from datetime import datetime
 from typing import Optional
 
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QScrollArea, QLabel, QFrame, QPushButton
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QSize, QPoint
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel, QFrame, QPushButton, QApplication
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QSize, QPoint, QEvent
 from PyQt6.QtGui import QPixmap, QFont
 
+from config import CATEGORY_LIFE, CATEGORY_NAMES, CATEGORY_SAMPLE
 from logger_setup import logger
 
 _COLS = 5
@@ -57,6 +58,12 @@ class _PhotoCard(QFrame):
             cropped = scaled.copy(crop_x, crop_y, self._size, self._size)
             self._thumb.setPixmap(cropped)
 
+    def set_selected(self, selected: bool):
+        if selected:
+            self.setStyleSheet("background: #222; border: 3px solid #3498db; border-radius: 2px;")
+        else:
+            self.setStyleSheet("background: #222; border-radius: 2px;")
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit(self._file_id)
@@ -97,7 +104,7 @@ class _YearIndex(QWidget):
         self._total_dots: int = 0
         self._dot_spacing: float = 10.0
         self._ball_y: float = 10.0     # 默认顶部位置，避免初始 0 导致 ym 计算失败
-        self._ball_visible: bool = False
+        self._ball_visible: bool = True
         self._is_dragging: bool = False
         self._hover_ym: tuple[int, int] = (0, 0)
         self._indicator: Optional[QLabel] = None
@@ -186,7 +193,7 @@ class _YearIndex(QWidget):
             painter.setBrush(QBrush(ball_color))
             painter.drawEllipse(cent_x - 10, ball_y - 10, 20, 20)
 
-        if self._ball_visible and self._hover_ym and self._hover_ym[0]:
+        if self._is_dragging and self._hover_ym and self._hover_ym[0]:
             self._show_indicator(self._hover_ym)
 
         painter.end()
@@ -248,8 +255,9 @@ class _YearIndex(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            if abs(event.pos().y() - self._ball_y) > 18:
+                return
             self._is_dragging = True
-            self._ball_visible = True
             self._ball_y = max(10, min(self.height() - 10, event.pos().y()))
             ym = self._ball_y_to_ym(self._ball_y)
             self._hover_ym = ym
@@ -260,9 +268,8 @@ class _YearIndex(QWidget):
 
     def mouseMoveEvent(self, event):
         h = self.height()
-        self._ball_y = max(10, min(h - 10, event.pos().y()))
-
         if self._is_dragging:
+            self._ball_y = max(10, min(h - 10, event.pos().y()))
             ym = self._ball_y_to_ym(self._ball_y)
             if ym != self._hover_ym:
                 self._hover_ym = ym
@@ -270,9 +277,8 @@ class _YearIndex(QWidget):
             self.scroll_continuous.emit(sv)
             self.update()
         else:
-            self._ball_visible = True
-            self._hover_ym = self._ball_y_to_ym(self._ball_y)
-            self.update()
+            hover_y = max(10, min(h - 10, event.pos().y()))
+            self._hover_ym = self._ball_y_to_ym(hover_y)
 
     def mouseReleaseEvent(self, event):
         if self._is_dragging:
@@ -282,19 +288,20 @@ class _YearIndex(QWidget):
         self.update()
 
     def enterEvent(self, event):
-        self._ball_visible = True
         self._hover_ym = self._ball_y_to_ym(self._ball_y)
         self.update()
 
     def leaveEvent(self, event):
         if not self._is_dragging:
-            self._ball_visible = False
             self._hide_indicator()
         self.update()
 
 
 class TimelineView(QWidget):
     photo_clicked = pyqtSignal(int)
+    selection_changed = pyqtSignal(list)
+    set_category_requested = pyqtSignal(list, int)
+    category_changed = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -305,7 +312,14 @@ class TimelineView(QWidget):
         self._card_size = 80
         self._visible_cards: dict[tuple, _PhotoCard] = {}
         self._visible_headers: dict[int, QLabel] = {}
+        self._selected_ids: set[int] = set()
+        self._selection_anchor_id: Optional[int] = None
+        self._shift_active = False
+        self._active_category = CATEGORY_LIFE
         self._setup_ui()
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
     def _setup_ui(self):
         self.setStyleSheet("background: #111;")
@@ -313,6 +327,58 @@ class TimelineView(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
+
+        self._category_bar = QWidget()
+        self._category_bar.setStyleSheet("background: #ecf0f1;")
+        self._category_bar.setFixedHeight(40)
+        category_layout = QHBoxLayout(self._category_bar)
+        category_layout.setContentsMargins(8, 4, 8, 4)
+        category_layout.setSpacing(4)
+        self._timeline_category_buttons = {}
+        timeline_categories = (
+            (CATEGORY_LIFE, CATEGORY_NAMES[CATEGORY_LIFE]),
+            (CATEGORY_SAMPLE, CATEGORY_NAMES[CATEGORY_SAMPLE]),
+        )
+        for cat_id, label in timeline_categories:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet("""
+                QPushButton { background: transparent; border: none;
+                    padding: 8px 16px; border-radius: 4px; font-size: 13px; color: #666; }
+                QPushButton:hover { background: #ddd; }
+                QPushButton:checked { background: #3498db; color: white; font-weight: bold; }
+            """)
+            btn.clicked.connect(lambda checked, c=cat_id: self._on_category_button_clicked(c))
+            category_layout.addWidget(btn)
+            self._timeline_category_buttons[cat_id] = btn
+        category_layout.addStretch()
+        outer.addWidget(self._category_bar)
+        self.set_active_category(self._active_category, emit=False)
+
+        self._selection_bar = QWidget()
+        self._selection_bar.setStyleSheet("background: #1b2433;")
+        selection_layout = QHBoxLayout(self._selection_bar)
+        selection_layout.setContentsMargins(12, 6, 12, 6)
+        selection_layout.setSpacing(8)
+        self._selection_label = QLabel("已选 0 张")
+        self._selection_label.setStyleSheet("color: #d8dee9; font-size: 12px;")
+        selection_layout.addWidget(self._selection_label)
+        selection_layout.addStretch()
+        self._set_sample_btn = QPushButton("设为样片")
+        self._set_sample_btn.setEnabled(False)
+        self._set_sample_btn.setStyleSheet("""
+            QPushButton { background: #2980b9; color: white; border: none; border-radius: 4px; padding: 5px 12px; }
+            QPushButton:disabled { background: #3a3f4b; color: #808996; }
+        """)
+        self._set_sample_btn.clicked.connect(self._emit_category_request)
+        selection_layout.addWidget(self._set_sample_btn)
+        clear_btn = QPushButton("清除")
+        clear_btn.setStyleSheet("QPushButton { background: #34495e; color: white; border: none; border-radius: 4px; padding: 5px 10px; }")
+        clear_btn.clicked.connect(self.clear_selection)
+        selection_layout.addWidget(clear_btn)
+        outer.addWidget(self._selection_bar)
+        self._selection_bar.hide()
 
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(False)
@@ -372,6 +438,32 @@ class TimelineView(QWidget):
         # 滚动时决定按钮显示/隐藏
         self._scroll.verticalScrollBar().valueChanged.connect(self._on_scroll_for_top_btn)
 
+    def _on_category_button_clicked(self, cat_id: int):
+        if cat_id == self._active_category:
+            self.set_active_category(cat_id, emit=False)
+            return
+        self.set_active_category(cat_id, emit=True)
+
+    def set_active_category(self, cat_id: int, emit=True):
+        self._active_category = cat_id
+        for cid, btn in getattr(self, "_timeline_category_buttons", {}).items():
+            btn.setChecked(cid == cat_id)
+        if hasattr(self, "_set_sample_btn"):
+            self._set_sample_btn.setText("设为生活" if cat_id == 2 else "设为样片")
+        if emit:
+            self.category_changed.emit(cat_id)
+
+    def _emit_category_request(self):
+        target = CATEGORY_LIFE if self._active_category == CATEGORY_SAMPLE else CATEGORY_SAMPLE
+        ids = self.selected_file_ids()
+        self.set_category_requested.emit(ids, target)
+
+    def set_category_bar_visible(self, visible: bool):
+        self._category_bar.setVisible(visible)
+
+    def is_year_dragging(self) -> bool:
+        return bool(getattr(self._year_index, "_is_dragging", False))
+
     def _build_year_index(self):
         """构建年月索引，传入 [(year, month, photo_count), ...] 给拉球组件"""
         month_counts: dict[tuple[int, int], int] = {}
@@ -418,8 +510,81 @@ class TimelineView(QWidget):
     def load_photos(self, photos: list[dict]):
         self._clear_all()
         self._photos = photos
+        self.clear_selection(emit=False)
         self._build_groups()
         self._recompute()
+
+    def selected_file_ids(self):
+        order = {p.get("id"): idx for idx, p in enumerate(self._photos)}
+        return sorted(self._selected_ids, key=lambda fid: order.get(fid, 10**12))
+
+    def set_batch_busy(self, busy: bool):
+        self._set_sample_btn.setEnabled((not busy) and bool(self._selected_ids))
+
+    def clear_selection(self, emit=True):
+        self._selected_ids.clear()
+        self._selection_anchor_id = None
+        self._update_selection_ui(emit=emit)
+        self._sync_visible_selection()
+
+    def _photo_index_by_id(self, file_id):
+        for idx, photo in enumerate(self._photos):
+            if photo.get("id") == file_id:
+                return idx
+        return None
+
+    def _on_card_clicked(self, file_id):
+        modifiers = QApplication.keyboardModifiers()
+        is_shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+        is_ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+        if not is_shift and not is_ctrl:
+            self.photo_clicked.emit(file_id)
+            return
+
+        current_idx = self._photo_index_by_id(file_id)
+        if current_idx is None:
+            return
+
+        if is_shift and self._selection_anchor_id is not None:
+            anchor_idx = self._photo_index_by_id(self._selection_anchor_id)
+            if anchor_idx is None:
+                anchor_idx = current_idx
+            start, end = sorted((anchor_idx, current_idx))
+            range_ids = {p.get("id") for p in self._photos[start:end + 1] if p.get("id")}
+            if is_ctrl:
+                self._selected_ids.update(range_ids)
+            else:
+                self._selected_ids = set(range_ids)
+        else:
+            if is_ctrl and file_id in self._selected_ids:
+                self._selected_ids.remove(file_id)
+            else:
+                self._selected_ids.add(file_id)
+            self._selection_anchor_id = file_id
+
+        self._update_selection_ui()
+        self._sync_visible_selection()
+
+    def _update_selection_ui(self, emit=True):
+        count = len(self._selected_ids)
+        self._selection_label.setText(f"已选 {count} 张")
+        self._set_sample_btn.setEnabled(count > 0)
+        self._selection_bar.setVisible(self._shift_active or count > 0)
+        if emit:
+            self.selection_changed.emit(self.selected_file_ids())
+
+    def _sync_visible_selection(self):
+        for card in self._visible_cards.values():
+            card.set_selected(card._file_id in self._selected_ids)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Shift:
+            self._shift_active = True
+            self._update_selection_ui(emit=False)
+        elif event.type() == QEvent.Type.KeyRelease and event.key() == Qt.Key.Key_Shift:
+            self._shift_active = False
+            self._update_selection_ui(emit=False)
+        return super().eventFilter(obj, event)
 
     def _build_groups(self):
         groups: dict[str, list[dict]] = {}
@@ -518,10 +683,11 @@ class TimelineView(QWidget):
                             card.move(card_x, card_y)
                             card.setParent(self._container)
                             card.show()
-                            card.clicked.connect(self.photo_clicked.emit)
+                            card.clicked.connect(self._on_card_clicked)
                             thumb = photo.get("thumbnail_path", "")
                             if thumb:
                                 card.load_thumbnail(thumb)
+                            card.set_selected(photo_id in self._selected_ids)
                             self._visible_cards[key] = card
 
             y = group_bottom + 8

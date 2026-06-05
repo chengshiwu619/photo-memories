@@ -50,11 +50,24 @@ class _FakePrefetchWorker(_FakeWorker):
 class _FakePage:
     def __init__(self):
         self.loaded_photos = None
+        self.appended_photos = []
+        self.all_loaded = False
+        self.reset_for_shuffle_called = False
         self._scroll_bar = type("ScrollBar", (), {"value": 99, "setValue": lambda self, value: setattr(self, "value", value)})()
         self.scroll = type("Scroll", (), {"verticalScrollBar": lambda _self: self._scroll_bar})()
 
     def load_photos(self, photos):
         self.loaded_photos = list(photos)
+
+    def append_photos(self, photos):
+        self.appended_photos.extend(list(photos))
+
+    def set_all_loaded(self, has_thumbnails_remaining=True):
+        self.all_loaded = True
+        self.has_thumbnails_remaining = has_thumbnails_remaining
+
+    def reset_for_shuffle(self):
+        self.reset_for_shuffle_called = True
 
 
 class _RunningPrefetch:
@@ -224,6 +237,24 @@ def test_sample_first_screen_limit_is_doubled(monkeypatch):
     assert win._cat_offsets[app_mod.CATEGORY_SAMPLE] == app_mod.RANDOM_SAMPLE_FIRST_PAGE_SIZE
 
 
+def test_load_more_stops_at_end_without_reshuffle(monkeypatch):
+    import ui.app as app_mod
+
+    win = _make_window(app_mod)
+    monkeypatch.setattr(app_mod, "record_shown_photos", lambda photos, cat_id: None)
+    win._cat_photos[1] = [{"id": 1}, {"id": 2}]
+    win._cat_offsets[1] = 2
+    win._cat_all_loaded[1] = True
+    win._cat_shown_ids[1] = {1, 2}
+
+    win._on_load_more(1)
+
+    assert win.pages[0].all_loaded is True
+    assert win.pages[0].appended_photos == []
+    assert win.pages[0].reset_for_shuffle_called is False
+    assert win._cat_offsets[1] == 2
+
+
 def test_load_category_resets_scroll_immediately(monkeypatch):
     import ui.app as app_mod
 
@@ -313,6 +344,7 @@ def test_prefetch_cache_hit_invalidates_existing_foreground_worker(monkeypatch):
     win._cat_workers[1] = running
     win._cat_load_token = 7
     win._cat_active_tokens[1] = 7
+    win._cat_request_modes[7] = "foreground"
     monkeypatch.setattr(app_mod, "CategoryLoadWorker", _FakeWorker)
     monkeypatch.setattr(app_mod, "record_shown_photos", lambda photos, cat_id: None)
     key = win._category_visible_cache_key(1, False, ("v1",))
@@ -328,6 +360,34 @@ def test_prefetch_cache_hit_invalidates_existing_foreground_worker(monkeypatch):
 
     assert running.interrupted is True
     assert win._cat_active_tokens[1] != 7
+    assert _FakeWorker.started == []
+
+
+def test_prefetch_cache_hit_keeps_existing_offscreen_refresh(monkeypatch):
+    import ui.app as app_mod
+
+    win = _make_window(app_mod)
+    _FakeWorker.started.clear()
+    running = _RunningPrefetch()
+    win._cat_workers[1] = running
+    win._cat_load_token = 7
+    win._cat_active_tokens[1] = 7
+    win._cat_request_modes[7] = "offscreen_refresh"
+    monkeypatch.setattr(app_mod, "CategoryLoadWorker", _FakeWorker)
+    monkeypatch.setattr(app_mod, "record_shown_photos", lambda photos, cat_id: None)
+    key = win._category_visible_cache_key(1, False, ("v1",))
+    win._cat_visible_cache[key] = {
+        "first_items": [{"id": 11}],
+        "total": 123,
+        "generated_at": time.monotonic(),
+        "query_ms": 5.0,
+        "version": ("v1",),
+    }
+
+    win.load_category(0)
+
+    assert running.interrupted is False
+    assert win._cat_active_tokens[1] == 7
     assert _FakeWorker.started == []
 
 

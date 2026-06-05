@@ -44,18 +44,24 @@ def _sample_keyword_exists_sql():
 def _category_match_sql(cat_id):
     sample_keyword_match = _sample_keyword_exists_sql()
     if cat_id == CATEGORY_SAMPLE:
-        return f"(COALESCE(fc.category, {CATEGORY_LIFE}) = ? OR {sample_keyword_match})"
+        return (
+            f"(pm.category = ? OR (pm.category IS NULL AND "
+            f"(COALESCE(fc.category, {CATEGORY_LIFE}) = {CATEGORY_SAMPLE} OR {sample_keyword_match})))"
+        )
     if cat_id == CATEGORY_LIFE:
-        return f"(COALESCE(fc.category, {CATEGORY_LIFE}) = ? AND NOT {sample_keyword_match})"
-    return f"COALESCE(fc.category, {CATEGORY_LIFE}) = ?"
+        return (
+            f"(pm.category = ? OR (pm.category IS NULL AND "
+            f"COALESCE(fc.category, {CATEGORY_LIFE}) = {CATEGORY_LIFE} AND NOT {sample_keyword_match}))"
+        )
+    return "pm.category = ?"
 
 
 def _category_match_without_folder_sql(cat_id):
     sample_keyword_match = _sample_keyword_exists_sql()
     if cat_id == CATEGORY_SAMPLE:
-        return sample_keyword_match
+        return f"(pm.category = {CATEGORY_SAMPLE} OR (pm.category IS NULL AND {sample_keyword_match}))"
     if cat_id == CATEGORY_LIFE:
-        return f"NOT {sample_keyword_match}"
+        return f"(pm.category = {CATEGORY_LIFE} OR (pm.category IS NULL AND NOT {sample_keyword_match}))"
     return "1 = 0"
 
 
@@ -248,6 +254,7 @@ def _filter_photos_for_category(db, cat_id, photos):
             f"""SELECT f.id
                 FROM files f
                 LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
+                LEFT JOIN photo_metadata pm ON f.id = pm.file_id
                 WHERE {_category_match_sql(cat_id)} AND f.id IN ({placeholders})""",
             [cat_id] + photo_ids,
         ).fetchall()

@@ -201,6 +201,7 @@ class Database:
 
             CREATE TABLE IF NOT EXISTS photo_metadata (
                 file_id INTEGER PRIMARY KEY,
+                category INTEGER,
                 date_taken TEXT,
                 camera_model TEXT,
                 gps_lat REAL,
@@ -224,6 +225,7 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_meta_date ON photo_metadata(date_taken);
             CREATE INDEX IF NOT EXISTS idx_meta_phash ON photo_metadata(phash);
             CREATE INDEX IF NOT EXISTS idx_meta_duplicate ON photo_metadata(is_duplicate_of);
+            CREATE INDEX IF NOT EXISTS idx_meta_category ON photo_metadata(category);
 
             CREATE TABLE IF NOT EXISTS memories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -483,6 +485,7 @@ class Database:
                     conn.execute(f"ALTER TABLE folder_categories ADD COLUMN {col} {ddl}")
                     logger.info(f"补建缺失字段: folder_categories.{col}")
         photo_metadata_columns = [
+            ("category", "INTEGER"),
             ("phash_status", "TEXT DEFAULT 'ok'"),
             ("phash_error", "TEXT"),
             ("thumbnail_status", "TEXT DEFAULT 'ok'"),
@@ -495,6 +498,10 @@ class Database:
                 if not self._column_exists(conn, "photo_metadata", col):
                     conn.execute(f"ALTER TABLE photo_metadata ADD COLUMN {col} {ddl}")
                     logger.info(f"补建缺失字段: photo_metadata.{col}")
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_meta_category ON photo_metadata(category)")
+            except Exception:
+                pass
         memories_columns = [
             ("is_hidden", "INTEGER DEFAULT 0"),
         ]
