@@ -25,7 +25,10 @@ from ui.components.image_viewer import ImageViewer
 from ui.components.sidebar import Sidebar
 from ui.components.timeline_view import TimelineView
 from ui.components.special_memories import SpecialMemoriesView
-from ui.recommendation import rank_category_photos, load_starred_photos, reshuffle_photos
+from ui.recommendation import (
+    rank_category_photos, load_starred_photos, load_category_photos_batch,
+    count_category_photos, reshuffle_photos,
+)
 from ui.recommendation import CATEGORY_COLORS, PAGE_SIZE, record_shown_photos
 
 
@@ -38,26 +41,37 @@ CATEGORIES = [
 ]
 
 RANDOM_FIRST_PAGE_SIZE = 60
-CATEGORY_CACHE_TTL_SECONDS = 300
+RANDOM_SAMPLE_FIRST_PAGE_SIZE = RANDOM_FIRST_PAGE_SIZE * 2
+RANDOM_PREFETCH_PAGE_SIZE = 24
 BACKGROUND_BATCH_DELAY_MS = 3000
 BACKGROUND_MAX_CONTINUOUS_BATCHES = 3
 BACKGROUND_SHUTDOWN_REQUESTED = False
+
+
+def _random_first_page_size(cat_id):
+    return RANDOM_SAMPLE_FIRST_PAGE_SIZE if cat_id == CATEGORY_SAMPLE else RANDOM_FIRST_PAGE_SIZE
+
+
+def _random_prefetch_page_size(cat_id):
+    return max(RANDOM_PREFETCH_PAGE_SIZE, _random_first_page_size(cat_id))
 
 
 def _should_schedule_background_next(remaining, stopped=False, batches_run=0, max_batches=BACKGROUND_MAX_CONTINUOUS_BATCHES):
     return bool(remaining and remaining > 0 and not stopped and batches_run < max_batches)
 
 
-def _cache_hit_metrics(stage, started):
-    elapsed_ms = (time.perf_counter() - started) * 1000
-    return {
-        "cache_stage": stage,
-        "total_ms": elapsed_ms,
-        "memory_ms": 0.0,
-        "batch_ms": 0.0,
-        "cached_query_ms": 0.0,
-        "cached_filter_ms": 0.0,
-    }
+def _background_next_delay_ms(
+    remaining,
+    stopped=False,
+    batches_run=0,
+    max_batches=BACKGROUND_MAX_CONTINUOUS_BATCHES,
+    batch_delay_ms=BACKGROUND_BATCH_DELAY_MS,
+):
+    if not remaining or remaining <= 0 or stopped:
+        return None
+    if batches_run < max_batches:
+        return batch_delay_ms
+    return batch_delay_ms * 5
 
 
 class CategoryLoadWorker(QThread):
@@ -89,6 +103,43 @@ class CategoryLoadWorker(QThread):
             self.loaded.emit(self._token, self._cat_id, photos, metrics)
         except Exception as exc:
             self.failed.emit(self._token, self._cat_id, repr(exc))
+        finally:
+            if conn is not None:
+                conn.close()
+
+
+class CategoryPrefetchWorker(QThread):
+    prefetched = pyqtSignal(int, bool, object, int, list, int, float)
+    failed = pyqtSignal(int, bool, object, int, str)
+
+    def __init__(self, cat_id, starred_only, data_version, generation=0, limit=RANDOM_PREFETCH_PAGE_SIZE, parent=None):
+        super().__init__(parent)
+        self._cat_id = cat_id
+        self._starred_only = bool(starred_only)
+        self._data_version = data_version
+        self._generation = generation
+        self._limit = limit
+
+    def run(self):
+        started = time.perf_counter()
+        conn = None
+        try:
+            if self.isInterruptionRequested():
+                return
+            conn = Database().get_persistent_connection()
+            if self._starred_only:
+                photos = load_starred_photos(conn, self._cat_id, limit=self._limit)
+            else:
+                photos = load_category_photos_batch(conn, self._cat_id, 0, limit=self._limit)
+            total = count_category_photos(conn, self._cat_id, starred_only=self._starred_only)
+            if self.isInterruptionRequested():
+                return
+            query_ms = (time.perf_counter() - started) * 1000
+            self.prefetched.emit(
+                self._cat_id, self._starred_only, self._data_version, self._generation, photos, total, query_ms
+            )
+        except Exception as exc:
+            self.failed.emit(self._cat_id, self._starred_only, self._data_version, self._generation, repr(exc))
         finally:
             if conn is not None:
                 conn.close()
@@ -171,8 +222,13 @@ class MainWindow(QMainWindow):
         self._cat_shown_ids = {}
         self._cat_load_token = 0
         self._cat_active_tokens = {}
+        self._cat_request_modes = {}
         self._cat_workers = {}
         self._cat_result_cache = {}
+        self._cat_visible_cache = {}
+        self._cat_prefetch_workers = {}
+        self._cat_prefetch_generation = 0
+        self._current_random_cat_id = None
         self._folder_viewer_photos = []
         self._folder_view_counts = {}
         self._suppressed_folders = set()
@@ -585,10 +641,10 @@ class MainWindow(QMainWindow):
         if self.image_viewer.isVisible():
             self.image_viewer.hide_viewer()
         self.current_page = index
-        self.stack.setCurrentIndex(index)
         for i, btn in enumerate(self.nav_buttons):
             btn.setChecked(i == index)
         self.load_category(index)
+        self.stack.setCurrentIndex(index)
 
     def toggle_starred(self):
         self.starred_only = self.star_btn.isChecked()
@@ -622,6 +678,7 @@ class MainWindow(QMainWindow):
         self._cat_all_loaded = {}
         self._cat_shown_ids = {}
         self._cat_active_tokens = {}
+        self._cat_request_modes = {}
 
         for cat_id, _ in CATEGORIES:
             memories_repo = MemoriesRepository(Database())
@@ -629,8 +686,7 @@ class MainWindow(QMainWindow):
             summary = f"「{title}」" if title else ""
             self.pages[next(i for i, (c, _) in enumerate(CATEGORIES) if c == cat_id)].set_memory_summary(summary)
 
-        for i in range(self.stack.count()):
-            self.load_category(i)
+        self.load_category(self.current_page)
         self.stack.setCurrentIndex(self.current_page)
 
     def _reload_random(self):
@@ -640,6 +696,7 @@ class MainWindow(QMainWindow):
         self._cat_all_loaded = {}
         self._cat_shown_ids = {}
         self._cat_active_tokens = {}
+        self._cat_request_modes = {}
 
         for cat_id, _ in CATEGORIES:
             memories_repo = MemoriesRepository(Database())
@@ -647,14 +704,21 @@ class MainWindow(QMainWindow):
             summary = f"「{title}」" if title else ""
             self.pages[next(i for i, (c, _) in enumerate(CATEGORIES) if c == cat_id)].set_memory_summary(summary)
 
-        for i in range(self.stack.count()):
-            self.load_category(i)
+        self.load_category(self.current_page)
         self.stack.setCurrentIndex(self.current_page)
 
     def _invalidate_all_caches(self):
         self._timeline_loaded = False
         self._special_loaded = False
         self._cat_result_cache.clear()
+        if hasattr(self, "_cat_visible_cache"):
+            self._cat_visible_cache.clear()
+        self._cat_prefetch_generation = getattr(self, "_cat_prefetch_generation", 0) + 1
+        if hasattr(self, "_cancel_category_prefetch_workers"):
+            self._cancel_category_prefetch_workers()
+        current_cat_id = getattr(self, "_current_random_cat_id", None)
+        if current_cat_id is not None:
+            logger.info("random cache invalidated: reason=update cat_id=%s", current_cat_id)
 
     def _random_category_db_version(self):
         try:
@@ -677,57 +741,41 @@ class MainWindow(QMainWindow):
     def load_category(self, index):
         if index >= len(CATEGORIES):
             return
+        previous_cat_id = getattr(self, "_current_random_cat_id", None)
         cat_id, _ = CATEGORIES[index]
-        switch_started = time.perf_counter()
-        cache_key = (cat_id, bool(self.starred_only))
-        now = time.monotonic()
-        db_version = self._random_category_db_version()
-        cached = self._cat_result_cache.get(cache_key)
+        self._current_random_cat_id = cat_id
         logger.info("随机标签切换开始: cat_id=%s starred=%s", cat_id, self.starred_only)
-        cache_version = cached.get("version") if cached else None
-        cache_age_ok = (
-            cached
-            and now - cached.get("created_at", 0) <= CATEGORY_CACHE_TTL_SECONDS
-            and (db_version is None or cache_version is None)
-        )
-        cache_version_ok = cached and db_version is not None and cache_version == db_version
-        if cached and (cache_version_ok or cache_age_ok):
-            logger.info(
-                "随机标签缓存命中: cat_id=%s total=%s age_ms=%.1f version_match=%s",
-                cat_id,
-                len(cached.get("photos", [])),
-                (now - cached.get("created_at", now)) * 1000,
-                cache_version_ok,
-            )
-            self._render_category_photos(
-                index,
-                cat_id,
-                list(cached.get("photos", [])),
-                _cache_hit_metrics("visible_cache_hit", switch_started),
-                from_cache=True,
-            )
-            return
 
-        existing_photos = self._cat_photos.get(cat_id) or []
-        if existing_photos:
-            first_page = existing_photos[:RANDOM_FIRST_PAGE_SIZE]
-            self._cat_offsets[cat_id] = len(first_page)
-            self._cat_all_loaded[cat_id] = len(first_page) >= len(existing_photos)
-            self.pages[index].load_photos(first_page)
-            logger.info(
-                "随机标签即时复用旧结果: cat_id=%s total=%s first=%s",
-                cat_id,
-                len(existing_photos),
-                len(first_page),
-            )
+        data_version = self._random_category_db_version()
+        cache_key = self._category_visible_cache_key(cat_id, self.starred_only, data_version)
+        cached = getattr(self, "_cat_visible_cache", {}).get(cache_key)
+        logger.info("random switch: from=%s to=%s cache_hit=%s", previous_cat_id, cat_id, bool(cached))
 
         self._cat_load_token += 1
         token = self._cat_load_token
         self._cat_active_tokens[cat_id] = token
 
+        if cached:
+            old_worker = self._cat_workers.get(cat_id)
+            if old_worker and old_worker.isRunning():
+                old_worker.requestInterruption()
+            self._show_category_cache(index, cat_id, cached)
+            self._start_silent_cache_refresh(cat_id, reason="cache_hit")
+            self._start_offscreen_refresh(previous_cat_id, reason="left_tab")
+            self._schedule_category_prefetch(index, delay_ms=0)
+            return
+
+        self._reset_category_page(index, cat_id)
+        logger.info("random loading: cat_id=%s", cat_id)
+        self._start_category_load(index, cat_id, token, mode="foreground")
+        self._start_offscreen_refresh(previous_cat_id, reason="left_tab")
+        self._schedule_category_prefetch(index, delay_ms=0)
+
+    def _start_category_load(self, index, cat_id, token, mode="foreground"):
         old_worker = self._cat_workers.get(cat_id)
         if old_worker and old_worker.isRunning():
             old_worker.requestInterruption()
+        self._cat_request_modes[token] = mode
 
         worker = CategoryLoadWorker(token, cat_id, self.starred_only)
         worker.loaded.connect(self._on_category_loaded)
@@ -735,6 +783,83 @@ class MainWindow(QMainWindow):
         worker.finished.connect(lambda cat=cat_id, w=worker: self._on_category_worker_finished(cat, w))
         self._cat_workers[cat_id] = worker
         worker.start()
+
+    def _start_offscreen_refresh(self, cat_id, reason="left_tab"):
+        if cat_id is None or cat_id == getattr(self, "_current_random_cat_id", None):
+            return
+        old_worker = self._cat_workers.get(cat_id)
+        if old_worker and old_worker.isRunning():
+            return
+        self._cat_load_token += 1
+        token = self._cat_load_token
+        self._cat_active_tokens[cat_id] = token
+        logger.info("random offscreen refresh start: cat_id=%s reason=%s", cat_id, reason)
+        self._start_category_load(0, cat_id, token, mode="offscreen_refresh")
+
+    def _start_silent_cache_refresh(self, cat_id, reason="cache_hit"):
+        if cat_id is None:
+            return
+        old_worker = self._cat_workers.get(cat_id)
+        if old_worker and old_worker.isRunning():
+            return
+        self._cat_load_token += 1
+        token = self._cat_load_token
+        self._cat_active_tokens[cat_id] = token
+        logger.info("random silent cache refresh start: cat_id=%s reason=%s", cat_id, reason)
+        self._start_category_load(0, cat_id, token, mode="silent_cache_refresh")
+
+    def _show_category_cache(self, index, cat_id, cached):
+        first_items = list(cached.get("first_items", []))
+        total = cached.get("total", len(first_items))
+        logger.info("random cache hit fresh: cat_id=%s first=%s total=%s", cat_id, len(first_items), total)
+        logger.info("random show cache: cat_id=%s first=%s total=%s", cat_id, len(first_items), total)
+        self._render_category_photos(
+            index,
+            cat_id,
+            first_items,
+            {
+                "cache_stage": "prefetch_cache_hit",
+                "total_ms": 0.0,
+                "memory_ms": 0.0,
+                "batch_ms": 0.0,
+                "prefetch_query_ms": cached.get("query_ms", 0.0),
+            },
+            from_cache=True,
+            display_total=total,
+            schedule_prefetch=False,
+        )
+
+    def _reset_category_page(self, index, cat_id):
+        self._cat_offsets[cat_id] = 0
+        self._cat_all_loaded[cat_id] = False
+        self._cat_shown_ids[cat_id] = set()
+        self._cat_photos[cat_id] = []
+        self.pages[index].load_photos([])
+        self._reset_category_scroll(index)
+
+    def _reset_category_scroll(self, index):
+        try:
+            self.pages[index].scroll.verticalScrollBar().setValue(0)
+        except Exception:
+            pass
+
+    def _category_visible_cache_key(self, cat_id, starred_only, data_version):
+        return (cat_id, bool(starred_only), data_version)
+
+    def _store_category_visible_cache(self, cat_id, starred_only, data_version, first_items, total, query_ms=0.0):
+        self._cat_visible_cache[self._category_visible_cache_key(cat_id, starred_only, data_version)] = {
+            "first_items": list(first_items)[:_random_first_page_size(cat_id)],
+            "total": total,
+            "generated_at": time.monotonic(),
+            "query_ms": query_ms,
+            "version": data_version,
+        }
+
+    def _cancel_category_prefetch_workers(self):
+        for worker in list(getattr(self, "_cat_prefetch_workers", {}).values()):
+            if worker and worker.isRunning():
+                worker.requestInterruption()
+        self._cat_prefetch_workers = {}
 
     def _on_category_worker_finished(self, cat_id, worker):
         if self._cat_workers.get(cat_id) is worker:
@@ -744,54 +869,175 @@ class MainWindow(QMainWindow):
         if self._cat_active_tokens.get(cat_id) != token:
             logger.info("随机标签旧任务失败结果已忽略: cat_id=%s token=%s", cat_id, token)
             return
+        current_cat_id = getattr(self, "_current_random_cat_id", None)
+        if current_cat_id != cat_id:
+            logger.info("random foreground discarded: result_cat_id=%s current_cat_id=%s", cat_id, current_cat_id)
+            return
         page_index = next(i for i, (c, _) in enumerate(CATEGORIES) if c == cat_id)
         logger.warning("随机标签加载失败: cat_id=%s token=%s error=%s", cat_id, token, error)
 
     def _on_category_loaded(self, token, cat_id, photos, metrics):
+        current_cat_id = getattr(self, "_current_random_cat_id", None)
         if self._cat_active_tokens.get(cat_id) != token:
-            logger.info("随机标签旧任务结果已忽略: cat_id=%s token=%s total=%s", cat_id, token, len(photos))
+            logger.info("random refresh discarded: result_cat_id=%s current_cat_id=%s", cat_id, current_cat_id)
             return
-        page_index = next(i for i, (c, _) in enumerate(CATEGORIES) if c == cat_id)
+        mode = self._cat_request_modes.pop(token, "foreground")
+        data_version = self._random_category_db_version()
+        self._store_category_visible_cache(
+            cat_id,
+            self.starred_only,
+            data_version,
+            list(photos)[:_random_first_page_size(cat_id)],
+            len(photos),
+            metrics.get("total_ms", 0.0) if metrics else 0.0,
+        )
         cache_key = (cat_id, bool(self.starred_only))
         self._cat_result_cache[cache_key] = {
             "created_at": time.monotonic(),
-            "version": self._random_category_db_version(),
+            "version": data_version,
             "photos": list(photos),
             "metrics": dict(metrics),
         }
+        if mode == "offscreen_refresh":
+            logger.info("random offscreen refresh done: cat_id=%s first=%s total=%s", cat_id, min(len(photos), _random_first_page_size(cat_id)), len(photos))
+            return
+        if mode == "silent_cache_refresh":
+            logger.info("random silent cache refresh done: cat_id=%s first=%s total=%s", cat_id, min(len(photos), _random_first_page_size(cat_id)), len(photos))
+            return
+        if current_cat_id != cat_id:
+            logger.info("random refresh discarded: result_cat_id=%s current_cat_id=%s", cat_id, current_cat_id)
+            return
+        page_index = next(i for i, (c, _) in enumerate(CATEGORIES) if c == cat_id)
+        if mode == "refresh":
+            logger.info("random refresh applied: cat_id=%s total=%s reset_scroll=True", cat_id, len(photos))
+        else:
+            logger.info("random foreground applied: cat_id=%s total=%s", cat_id, len(photos))
         self._render_category_photos(page_index, cat_id, list(photos), metrics, from_cache=False)
 
-    def _render_category_photos(self, index, cat_id, all_photos, metrics=None, from_cache=False):
+    def _render_category_photos(
+        self,
+        index,
+        cat_id,
+        all_photos,
+        metrics=None,
+        from_cache=False,
+        display_total=None,
+        schedule_prefetch=True,
+    ):
         render_started = time.perf_counter()
         metrics = metrics or {}
+        total = len(all_photos) if display_total is None else display_total
 
         self._cat_offsets[cat_id] = 0
         self._cat_all_loaded[cat_id] = False
         self._cat_shown_ids[cat_id] = set()
         self._cat_photos[cat_id] = list(all_photos)
 
-        first_page = all_photos[:RANDOM_FIRST_PAGE_SIZE]
+        first_page = all_photos[:_random_first_page_size(cat_id)]
         self._cat_offsets[cat_id] = len(first_page)
         self._cat_shown_ids[cat_id].update(p["id"] for p in first_page)
-        self._cat_all_loaded[cat_id] = len(first_page) >= len(all_photos)
+        self._cat_all_loaded[cat_id] = len(first_page) >= total
 
         record_shown_photos(first_page, cat_id)
 
         self.pages[index].load_photos(first_page)
+        self._reset_category_scroll(index)
         render_ms = (time.perf_counter() - render_started) * 1000
+        logger.info("random rendered: cat_id=%s first=%s total=%s reset_scroll=True", cat_id, len(first_page), total)
         logger.info(
             "随机标签切换结束: cat_id=%s cache=%s cache_stage=%s total=%s first=%s query_ms=%.1f "
             "memory_ms=%.1f filter_ms=%.1f render_ms=%.1f",
             cat_id,
             from_cache,
             metrics.get("cache_stage", "worker_result"),
-            len(all_photos),
+            total,
             len(first_page),
             metrics.get("total_ms", 0.0),
             metrics.get("memory_ms", 0.0),
             metrics.get("batch_ms", 0.0),
             render_ms,
         )
+        if schedule_prefetch:
+            self._schedule_category_prefetch(index)
+
+    def _is_background_busy_for_prefetch(self):
+        try:
+            status = BackgroundTaskManager.get_instance().get_status()
+        except Exception:
+            return False
+        if not status.get("running"):
+            return False
+        return status.get("current_task") in {"scan", "thumbnail_index"}
+
+    def _adjacent_category_ids(self, index, count=2):
+        if not CATEGORIES:
+            return []
+        result = []
+        total = len(CATEGORIES)
+        for step in range(1, total):
+            cat_id = CATEGORIES[(index + step) % total][0]
+            if cat_id not in result and cat_id != CATEGORIES[index][0]:
+                result.append(cat_id)
+            if len(result) >= count:
+                break
+        return result
+
+    def _schedule_category_prefetch(self, index, delay_ms=250):
+        if self._is_background_busy_for_prefetch():
+            return
+        generation = getattr(self, "_cat_prefetch_generation", 0)
+        QTimer.singleShot(delay_ms, lambda gen=generation, idx=index: self._start_category_prefetch(idx, gen))
+
+    def _start_category_prefetch(self, index, generation):
+        if generation != getattr(self, "_cat_prefetch_generation", 0):
+            return
+        if self._is_background_busy_for_prefetch():
+            return
+        data_version = self._random_category_db_version()
+        starred = bool(self.starred_only)
+        for cat_id in self._adjacent_category_ids(index, count=1):
+            cache_key = self._category_visible_cache_key(cat_id, starred, data_version)
+            if cache_key in self._cat_visible_cache:
+                continue
+            old_worker = self._cat_prefetch_workers.get(cat_id)
+            if old_worker and old_worker.isRunning():
+                continue
+            worker = CategoryPrefetchWorker(cat_id, starred, data_version, generation, _random_prefetch_page_size(cat_id))
+            worker.prefetched.connect(self._on_category_prefetched)
+            worker.failed.connect(self._on_category_prefetch_failed)
+            worker.finished.connect(lambda cat=cat_id, w=worker: self._on_category_prefetch_finished(cat, w))
+            self._cat_prefetch_workers[cat_id] = worker
+            logger.info("random prefetch start: cat_id=%s", cat_id)
+            worker.start()
+
+    def _on_category_prefetched(self, cat_id, starred, data_version, generation, first_items, total, query_ms):
+        current_version = self._random_category_db_version()
+        if (
+            generation != getattr(self, "_cat_prefetch_generation", 0)
+            or bool(starred) != bool(self.starred_only)
+            or data_version != current_version
+        ):
+            logger.info(
+                "random category async discarded: result_cat_id=%s current_cat_id=%s",
+                cat_id,
+                getattr(self, "_current_random_cat_id", None),
+            )
+            return
+        self._store_category_visible_cache(cat_id, starred, data_version, first_items, total, query_ms)
+        logger.info(
+            "random prefetch done: cat_id=%s first=%s total=%s query_ms=%.1f",
+            cat_id,
+            len(first_items),
+            total,
+            query_ms,
+        )
+
+    def _on_category_prefetch_failed(self, cat_id, starred, data_version, generation, error):
+        logger.debug("random prefetch failed: cat_id=%s error=%s", cat_id, error)
+
+    def _on_category_prefetch_finished(self, cat_id, worker):
+        if self._cat_prefetch_workers.get(cat_id) is worker:
+            del self._cat_prefetch_workers[cat_id]
 
     def _on_load_more(self, cat_id):
         page_index = next(i for i, (c, _) in enumerate(CATEGORIES) if c == cat_id)
@@ -1391,6 +1637,20 @@ def main():
                             self.db_updated += tags_repo.update_status_many(status_rows, "siglip")
                             logger.debug(f"后台标签: {i + len(batch)}/{len(file_ids)}")
                         manager.mark_task("ai_tags", "done")
+                        self.remaining_after = tags_repo.count_pending("siglip")
+                        self.remaining = self.remaining_after
+                        logger.info(
+                            "后台标签批次结果: before_pending=%s batch_size=%s processed=%s ok=%s "
+                            "failed=%s skipped=%s db_updated=%s remaining_after=%s",
+                            before_pending,
+                            len(file_ids),
+                            self.processed,
+                            self.ok,
+                            self.failed,
+                            self.skipped,
+                            self.db_updated,
+                            self.remaining_after,
+                        )
                         logger.info(f"后台标签生成完成: 已处理 {len(file_ids)} 张照片")
                     except Exception as exc:
                         manager.mark_task("ai_tags", "error", error=str(exc))
@@ -1411,18 +1671,31 @@ def main():
                 if repeated_batch:
                     logger.warning("后台标签连续两批 file_ids 完全相同，停止接续以避免死循环: batch_size=%s", len(batch_signature))
                 _bg_last_tag_batch_ids[0] = batch_signature
-                if _should_schedule_background_next(
-                    getattr(worker, "remaining", 0),
-                    stopped=getattr(worker, "stopped", False) or BACKGROUND_SHUTDOWN_REQUESTED or repeated_batch,
+                remaining = getattr(worker, "remaining", 0)
+                stopped = getattr(worker, "stopped", False) or BACKGROUND_SHUTDOWN_REQUESTED or repeated_batch
+                next_delay_ms = _background_next_delay_ms(
+                    remaining,
+                    stopped=stopped,
                     batches_run=_bg_tag_batches[0],
-                ):
-                    _bg_tag_batches[0] += 1
-                    logger.info(
-                        "后台标签仍有剩余: remaining=%s, next scheduled in %sms",
-                        getattr(worker, "remaining", 0),
-                        BACKGROUND_BATCH_DELAY_MS,
-                    )
-                    QTimer.singleShot(BACKGROUND_BATCH_DELAY_MS, start_background_tags)
+                )
+                if next_delay_ms is not None:
+                    cooldown = _bg_tag_batches[0] >= BACKGROUND_MAX_CONTINUOUS_BATCHES
+                    if cooldown:
+                        logger.info(
+                            "后台标签连续批次达到上限: remaining=%s, cooldown=%sms 后继续",
+                            remaining,
+                            next_delay_ms,
+                        )
+                    else:
+                        _bg_tag_batches[0] += 1
+                        logger.info(
+                            "后台标签仍有剩余: remaining=%s, next scheduled in %sms",
+                            remaining,
+                            next_delay_ms,
+                        )
+                    QTimer.singleShot(next_delay_ms, start_background_tags)
+                    if cooldown:
+                        _bg_tag_batches[0] = 0
                 else:
                     _bg_tag_batches[0] = 0
                     start_background_faces()

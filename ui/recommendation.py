@@ -3,6 +3,7 @@ import random
 import time
 
 from db_manager import Database
+from config import CATEGORY_LIFE, CATEGORY_SAMPLE
 
 # 路径健康状态过滤条件：排除 damaged/missing/stat_failed/outside_root
 # 旧数据 path_status 为 NULL 的仍然可见（兼容）
@@ -18,9 +19,44 @@ CATEGORY_COLORS = {
 PAGE_SIZE = 30
 MAX_SAME_FOLDER_STREAK = 12
 SMALL_FOLDER_THRESHOLD = 100
-FRESHNESS_WINDOW_DAYS = 7
+FRESHNESS_WINDOW_DAYS = 30
+RANDOM_CANDIDATE_LIMIT = 9999
+MIN_FRESH_RANDOM_CANDIDATES = PAGE_SIZE * 2
 MAX_SAME_DAY_STREAK = 12
 MIN_MEMORY_VISIBLE_REFS = 4
+
+
+def _sample_keyword_exists_sql():
+    return (
+        "EXISTS ("
+        "SELECT 1 FROM sample_keywords sk "
+        "WHERE sk.keyword IS NOT NULL "
+        "AND sk.keyword != '' "
+        "AND ("
+        "lower(COALESCE(f.file_name, '')) LIKE '%' || lower(sk.keyword) || '%' "
+        "OR lower(COALESCE(f.folder_name, '')) LIKE '%' || lower(sk.keyword) || '%' "
+        "OR lower(COALESCE(f.folder_path, '')) LIKE '%' || lower(sk.keyword) || '%'"
+        ")"
+        ")"
+    )
+
+
+def _category_match_sql(cat_id):
+    sample_keyword_match = _sample_keyword_exists_sql()
+    if cat_id == CATEGORY_SAMPLE:
+        return f"(COALESCE(fc.category, {CATEGORY_LIFE}) = ? OR {sample_keyword_match})"
+    if cat_id == CATEGORY_LIFE:
+        return f"(COALESCE(fc.category, {CATEGORY_LIFE}) = ? AND NOT {sample_keyword_match})"
+    return f"COALESCE(fc.category, {CATEGORY_LIFE}) = ?"
+
+
+def _category_match_without_folder_sql(cat_id):
+    sample_keyword_match = _sample_keyword_exists_sql()
+    if cat_id == CATEGORY_SAMPLE:
+        return sample_keyword_match
+    if cat_id == CATEGORY_LIFE:
+        return f"NOT {sample_keyword_match}"
+    return "1 = 0"
 
 
 def _interleave_small_folders(photos):
@@ -211,8 +247,8 @@ def _filter_photos_for_category(db, cat_id, photos):
         r[0] for r in db.execute(
             f"""SELECT f.id
                 FROM files f
-                JOIN folder_categories fc ON f.folder_path = fc.folder_path
-                WHERE fc.category = ? AND f.id IN ({placeholders})""",
+                LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
+                WHERE {_category_match_sql(cat_id)} AND f.id IN ({placeholders})""",
             [cat_id] + photo_ids,
         ).fetchall()
     }
@@ -337,7 +373,21 @@ def _load_ranked_memory_photos(db, cat_id):
     return ranked
 
 
-def load_category_photos_batch(db, cat_id, offset, limit=PAGE_SIZE):
+def load_category_photos_batch(db, cat_id, offset, limit=PAGE_SIZE, exclude_recent_days=None, random_order=False):
+    recent_filter = ""
+    params = [cat_id]
+    if exclude_recent_days:
+        recent_filter = """
+              AND NOT EXISTS (
+                  SELECT 1 FROM photo_shown_history psh
+                  WHERE psh.file_id = f.id
+                    AND psh.category = ?
+                    AND psh.shown_at >= datetime('now', ?)
+              )
+        """
+        params.extend([cat_id, f"-{exclude_recent_days} days"])
+    order_clause = "RANDOM()" if random_order else "pm.date_taken DESC"
+    params.extend([limit, offset])
     rows = db.execute(f"""
         SELECT f.id, f.file_path, f.file_name, f.folder_path,
                f.folder_name as folder_display, f.file_mtime, pm.thumbnail_path,
@@ -345,16 +395,30 @@ def load_category_photos_batch(db, cat_id, offset, limit=PAGE_SIZE):
         FROM files f
         LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
         LEFT JOIN photo_metadata pm ON f.id = pm.file_id
-        WHERE COALESCE(fc.category, 1) = ? AND f.is_image IN (0, 1)
+        WHERE {_category_match_sql(cat_id)} AND f.is_image IN (0, 1)
               {_PATH_STATUS_FILTER}
               AND (pm.thumbnail_path IS NULL OR pm.thumbnail_path != '__FAILED__')
               AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
-        ORDER BY pm.date_taken DESC
+              {recent_filter}
+        ORDER BY {order_clause}
         LIMIT ? OFFSET ?
-    """, (cat_id, limit, offset)).fetchall()
+    """, params).fetchall()
     if not rows and offset == 0:
         total_cats = db.execute("SELECT COUNT(*) FROM folder_categories").fetchone()[0]
         if total_cats == 0:
+            fallback_filter = ""
+            fallback_params = []
+            if exclude_recent_days:
+                fallback_filter = """
+                      AND NOT EXISTS (
+                          SELECT 1 FROM photo_shown_history psh
+                          WHERE psh.file_id = f.id
+                            AND psh.category = ?
+                            AND psh.shown_at >= datetime('now', ?)
+                      )
+                """
+                fallback_params.extend([cat_id, f"-{exclude_recent_days} days"])
+            fallback_params.append(limit)
             rows = db.execute(f"""
                 SELECT f.id, f.file_path, f.file_name, f.folder_path,
                        f.folder_name as folder_display, f.file_mtime, pm.thumbnail_path,
@@ -362,12 +426,14 @@ def load_category_photos_batch(db, cat_id, offset, limit=PAGE_SIZE):
                 FROM files f
                 LEFT JOIN photo_metadata pm ON f.id = pm.file_id
                 WHERE f.is_image IN (0, 1)
+                      AND {_category_match_without_folder_sql(cat_id)}
                       {_PATH_STATUS_FILTER}
                       AND (pm.thumbnail_path IS NULL OR pm.thumbnail_path != '__FAILED__')
                       AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
-                ORDER BY pm.date_taken DESC
+                      {fallback_filter}
+                ORDER BY {order_clause}
                 LIMIT ?
-            """, (limit,)).fetchall()
+            """, fallback_params).fetchall()
     valid = []
     for r in rows:
         d = _make_photo_dict(r)
@@ -376,19 +442,24 @@ def load_category_photos_batch(db, cat_id, offset, limit=PAGE_SIZE):
     return _interleave_small_folders(valid)
 
 
-def load_starred_photos(db, cat_id):
+def load_starred_photos(db, cat_id, limit=None):
+    limit_clause = " LIMIT ?" if limit else ""
+    params = [cat_id]
+    if limit:
+        params.append(limit)
     rows = db.execute(f"""
         SELECT f.id, f.file_path, f.file_name, f.folder_path,
                f.folder_name as folder_display, f.file_mtime, pm.thumbnail_path,
                pm.width, pm.height, pm.date_taken
         FROM files f
         JOIN photo_metadata pm ON f.id = pm.file_id
-        JOIN folder_categories fc ON f.folder_path = fc.folder_path
-        WHERE pm.is_starred = 1 AND f.is_image = 1 AND fc.category = ?
+        LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
+        WHERE pm.is_starred = 1 AND f.is_image = 1 AND {_category_match_sql(cat_id)}
               {_PATH_STATUS_FILTER}
               AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
         ORDER BY pm.date_taken DESC
-    """, (cat_id,)).fetchall()
+        {limit_clause}
+    """, params).fetchall()
     import os as _os
     valid = []
     for r in rows:
@@ -398,6 +469,48 @@ def load_starred_photos(db, cat_id):
     return _interleave_small_folders(valid)
 
 
+def count_category_photos(db, cat_id, starred_only=False):
+    if starred_only:
+        row = db.execute(f"""
+            SELECT COUNT(*)
+            FROM files f
+            JOIN photo_metadata pm ON f.id = pm.file_id
+            LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
+            WHERE pm.is_starred = 1 AND f.is_image = 1 AND {_category_match_sql(cat_id)}
+                  {_PATH_STATUS_FILTER}
+                  AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
+                  AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
+        """, (cat_id,)).fetchone()
+        return row[0] if row else 0
+
+    row = db.execute(f"""
+        SELECT COUNT(*)
+        FROM files f
+        LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
+        LEFT JOIN photo_metadata pm ON f.id = pm.file_id
+        WHERE {_category_match_sql(cat_id)} AND f.is_image IN (0, 1)
+              {_PATH_STATUS_FILTER}
+              AND (pm.thumbnail_path IS NULL OR pm.thumbnail_path != '__FAILED__')
+              AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
+    """, (cat_id,)).fetchone()
+    total = row[0] if row else 0
+    if total == 0:
+        total_cats = db.execute("SELECT COUNT(*) FROM folder_categories").fetchone()[0]
+        if total_cats == 0:
+            row = db.execute(f"""
+                SELECT COUNT(*)
+                FROM files f
+                LEFT JOIN photo_metadata pm ON f.id = pm.file_id
+                WHERE f.is_image IN (0, 1)
+                      AND {_category_match_without_folder_sql(cat_id)}
+                      {_PATH_STATUS_FILTER}
+                      AND (pm.thumbnail_path IS NULL OR pm.thumbnail_path != '__FAILED__')
+                      AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
+            """).fetchone()
+            total = row[0] if row else 0
+    return total
+
+
 def rank_category_photos(db, cat_id, return_metrics=False):
     started = time.perf_counter()
     memory_started = time.perf_counter()
@@ -405,7 +518,30 @@ def rank_category_photos(db, cat_id, return_metrics=False):
     memory_ms = (time.perf_counter() - memory_started) * 1000
 
     batch_started = time.perf_counter()
-    batch_photos = _filter_renderable_photos(load_category_photos_batch(db, cat_id, 0, limit=9999))
+    batch_photos = _filter_renderable_photos(
+        load_category_photos_batch(
+            db,
+            cat_id,
+            0,
+            limit=RANDOM_CANDIDATE_LIMIT,
+            exclude_recent_days=FRESHNESS_WINDOW_DAYS,
+            random_order=True,
+        )
+    )
+    excluded_recent = True
+    if len(batch_photos) < MIN_FRESH_RANDOM_CANDIDATES:
+        fallback_photos = _filter_renderable_photos(
+            load_category_photos_batch(
+                db,
+                cat_id,
+                0,
+                limit=RANDOM_CANDIDATE_LIMIT,
+                random_order=True,
+            )
+        )
+        seen_fallback_ids = {p["id"] for p in batch_photos}
+        batch_photos.extend(p for p in fallback_photos if p["id"] not in seen_fallback_ids)
+        excluded_recent = False
     batch_ms = (time.perf_counter() - batch_started) * 1000
 
     merge_started = time.perf_counter()
@@ -448,6 +584,8 @@ def rank_category_photos(db, cat_id, return_metrics=False):
             "batch_ms": batch_ms,
             "merge_ms": (time.perf_counter() - merge_started) * 1000,
             "total_ms": (time.perf_counter() - started) * 1000,
+            "excluded_recent": excluded_recent,
+            "candidate_count": len(batch_photos),
         }
     return result
 

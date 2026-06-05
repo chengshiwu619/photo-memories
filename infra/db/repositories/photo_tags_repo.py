@@ -49,7 +49,12 @@ class PhotoTagsRepository:
                 LEFT JOIN photo_tag_status ts
                   ON ts.file_id = pm.file_id AND ts.source = ?
                 WHERE pm.thumbnail_path IS NOT NULL
+                  AND pm.thumbnail_path != ''
                   AND pm.thumbnail_path != '__FAILED__'
+                  AND COALESCE(pm.thumbnail_status, 'ok') IN ('ok', 'recovered')
+                  AND f.is_image = 1
+                  AND (f.path_status IS NULL OR f.path_status NOT IN
+                       ('damaged_path', 'missing', 'stat_failed', 'outside_root'))
                   AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
                   AND (
                       ts.file_id IS NULL

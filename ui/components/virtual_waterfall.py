@@ -203,6 +203,7 @@ class VirtualCategoryPage(QScrollArea):
 
     def _destroy_visible_cards(self):
         for card in self._card_widgets.values():
+            card.hide()
             card.deleteLater()
         self._card_widgets.clear()
 

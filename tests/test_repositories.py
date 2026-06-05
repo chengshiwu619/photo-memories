@@ -103,3 +103,43 @@ def test_photo_tag_status_excludes_processed_and_requeues_changed_file():
         assert total == 1
     finally:
         shutil.rmtree(temp_dir)
+
+
+def test_photo_tag_pending_requires_usable_thumbnail_state():
+    from db_manager import Database
+    from infra.db.repositories.photo_tags_repo import PhotoTagsRepository
+
+    temp_dir = tempfile.mkdtemp()
+    try:
+        temp_db = os.path.join(temp_dir, "test.db")
+        db = Database(temp_db)
+        db.init_tables()
+        rows = [
+            (1, "ok.jpg", "ok", None, 1),
+            (2, "", "ok", None, 1),
+            (3, "__FAILED__", "ok", None, 1),
+            (4, "failed.jpg", "failed", None, 1),
+            (5, "skipped.jpg", "skipped", None, 1),
+            (6, "missing.jpg", "ok", "missing", 1),
+            (7, "video.jpg", "ok", None, 0),
+            (8, "recovered.jpg", "recovered", None, 1),
+        ]
+        with db.connect() as conn:
+            for fid, thumb, thumb_status, path_status, is_image in rows:
+                conn.execute(
+                    """INSERT INTO files
+                       (id, file_path, file_name, folder_path, folder_name, file_size, file_mtime, is_image, path_status)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (fid, os.path.join(temp_dir, f"{fid}.jpg"), f"{fid}.jpg", temp_dir, "tmp", 100, "mtime", is_image, path_status),
+                )
+                conn.execute(
+                    "INSERT INTO photo_metadata (file_id, thumbnail_path, thumbnail_status, is_duplicate_of) VALUES (?, ?, ?, NULL)",
+                    (fid, thumb, thumb_status),
+                )
+
+        repo = PhotoTagsRepository(db)
+        pending, total = repo.get_pending_file_ids("siglip", limit=20)
+        assert pending == [1, 8]
+        assert total == 2
+    finally:
+        shutil.rmtree(temp_dir)
