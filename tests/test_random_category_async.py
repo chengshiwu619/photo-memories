@@ -359,7 +359,7 @@ def test_prefetch_cache_hit_invalidates_existing_foreground_worker(monkeypatch):
     win.load_category(0)
 
     assert running.interrupted is True
-    assert win._cat_active_tokens[1] != 7
+    assert 1 not in win._cat_active_tokens
     assert _FakeWorker.started == []
 
 

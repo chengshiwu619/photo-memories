@@ -24,6 +24,9 @@ _ES_INSTANCE = None
 _BAD_PATH_COUNT = 0
 _BAD_PATH_SAMPLES = []
 BAD_PATH_SAMPLE_LIMIT = 20
+SCAN_DEFAULT_SAFE_LIMIT = 1000
+SCAN_PROGRESS_LOG_INTERVAL = 5000
+SCAN_DB_COMMIT_BATCH = 5000
 
 _db = Database()
 _cp = CheckpointManager(_db, "scan")
@@ -687,14 +690,14 @@ def incremental_scan(
     # - limit=-1 或 0 表示不限制（全量扫描）
     # - limit=None 时使用安全默认值（避免意外全量扫描阻塞）
     # - 正整数表示每批最大文件数
-    DEFAULT_SAFE_LIMIT = 1000
+    requested_limit = limit
     if limit is None:
-        limit = DEFAULT_SAFE_LIMIT
+        limit = SCAN_DEFAULT_SAFE_LIMIT
         logger.info("limit 未指定，使用安全默认值: %s", limit)
     elif isinstance(limit, int) and limit <= 0:
         # limit=0 或负数 → 不限制，全量扫描
         limit = None
-        logger.info("limit=%s → 全量扫描（不限制）", limit)
+        logger.info("limit=%s → 全量扫描（不限制）", requested_limit)
 
     logger.info(
         "增量扫描开始: source_drive=%s limit=%s dry_run=%s prefer_everything=%s background_scan_limit=%s",
@@ -757,11 +760,9 @@ def incremental_scan(
 
     total = len(file_list)
     source_dirs = _s.source_dirs
-    PROGRESS_LOG_INTERVAL = 5000  # 每 5000 条输出一次进度日志
-
     logger.info(
         "scan processing: starting path normalize for %s files (log every %s)",
-        total, PROGRESS_LOG_INTERVAL,
+        total, SCAN_PROGRESS_LOG_INTERVAL,
     )
     for i, raw_path in enumerate(file_list):
         if _cp.is_pause_or_stop_requested() or (should_stop and should_stop()):
@@ -786,7 +787,7 @@ def incremental_scan(
                 stats["samples"]["errors"].append({"path": raw_path, "error": f"resolve_exception: {exc}"})
             _record_bad_path_sample(raw_path, f"resolve_exception: {exc}")
             logger.debug("scan resolve 异常: %s: %s", raw_path, exc)
-            if (i + 1) % PROGRESS_LOG_INTERVAL == 0:
+            if (i + 1) % SCAN_PROGRESS_LOG_INTERVAL == 0:
                 logger.info(
                     "scan processing: processed=%s/%s new=%s changed=%s existing=%s skipped=%s errors=%s",
                     i + 1, total, stats["new"], stats["changed"], stats["existing"],
@@ -812,7 +813,7 @@ def incremental_scan(
                     "reason": f"{resolve_result.status.value}: {resolve_result.reason}",
                 })
             _record_bad_path_sample(raw_path, f"{resolve_result.status.value}: {resolve_result.reason}")
-            if (i + 1) % PROGRESS_LOG_INTERVAL == 0:
+            if (i + 1) % SCAN_PROGRESS_LOG_INTERVAL == 0:
                 logger.info(
                     "scan processing: processed=%s/%s new=%s changed=%s existing=%s skipped=%s errors=%s",
                     i + 1, total, stats["new"], stats["changed"], stats["existing"],
@@ -833,7 +834,7 @@ def incremental_scan(
                 })
             _record_bad_path_sample(filepath, f"{resolve_result.status.value}: {resolve_result.reason}")
             logger.debug("增量扫描文件状态异常: %s: %s", filepath, resolve_result.reason)
-            if (i + 1) % PROGRESS_LOG_INTERVAL == 0:
+            if (i + 1) % SCAN_PROGRESS_LOG_INTERVAL == 0:
                 logger.info(
                     "scan processing: processed=%s/%s new=%s changed=%s existing=%s skipped=%s errors=%s",
                     i + 1, total, stats["new"], stats["changed"], stats["existing"],
@@ -896,7 +897,7 @@ def incremental_scan(
                 pending_path_updates.append((row, old["id"]))
 
         # 进度日志 + 回调
-        if (i + 1) % PROGRESS_LOG_INTERVAL == 0:
+        if (i + 1) % SCAN_PROGRESS_LOG_INTERVAL == 0:
             logger.info(
                 "scan processing: processed=%s/%s new=%s changed=%s existing=%s skipped=%s errors=%s",
                 i + 1, total, stats["new"], stats["changed"], stats["existing"],
@@ -916,16 +917,19 @@ def incremental_scan(
     if dry_run:
         if stats["state"] == "running":
             stats["state"] = "done"
-        logger.info("增量扫描 dry-run 完成: %s", stats)
+        logger.info(
+            "增量扫描 dry-run 完成: scanned=%s new=%s existing=%s changed=%s skipped=%s errors=%s",
+            stats["scanned"], stats["new"], stats["existing"], stats["changed"],
+            stats["skipped"], stats["errors"],
+        )
+        logger.debug("增量扫描 dry-run 详情: %s", stats)
         return stats
 
     with scan_db.connect() as conn:
-        DB_COMMIT_BATCH = 5000  # 每 5000 条 commit 一次，避免 9W 条一次性事务
-
         # --- inserts ---
         logger.info(
             "scan db write: inserting %s new files (batch=%s)",
-            len(pending_inserts), DB_COMMIT_BATCH,
+            len(pending_inserts), SCAN_DB_COMMIT_BATCH,
         )
         for idx, row in enumerate(pending_inserts):
             try:
@@ -946,7 +950,7 @@ def incremental_scan(
             except Exception as exc:
                 logger.debug("scan db insert 失败: %s: %s", row.get("file_path", "?"), exc)
                 continue
-            if (idx + 1) % DB_COMMIT_BATCH == 0:
+            if (idx + 1) % SCAN_DB_COMMIT_BATCH == 0:
                 conn.commit()
                 logger.info(
                     "scan db write: inserts committed=%s/%s db_inserted=%s",
@@ -956,7 +960,7 @@ def incremental_scan(
         # --- changed updates (重置 thumbnail) ---
         logger.info(
             "scan db write: updating %s changed files (batch=%s)",
-            len(pending_changed_updates), DB_COMMIT_BATCH,
+            len(pending_changed_updates), SCAN_DB_COMMIT_BATCH,
         )
         for idx, (row, file_id) in enumerate(pending_changed_updates):
             try:
@@ -989,7 +993,7 @@ def incremental_scan(
             except Exception as exc:
                 logger.debug("scan db changed update 失败: file_id=%s: %s", file_id, exc)
                 continue
-            if (idx + 1) % DB_COMMIT_BATCH == 0:
+            if (idx + 1) % SCAN_DB_COMMIT_BATCH == 0:
                 conn.commit()
                 logger.info(
                     "scan db write: changed committed=%s/%s db_updated=%s",
@@ -999,7 +1003,7 @@ def incremental_scan(
         # --- path-only updates (不重置 thumbnail) ---
         logger.info(
             "scan db write: updating %s path-only files (batch=%s)",
-            len(pending_path_updates), DB_COMMIT_BATCH,
+            len(pending_path_updates), SCAN_DB_COMMIT_BATCH,
         )
         for idx, (row, file_id) in enumerate(pending_path_updates):
             try:
@@ -1018,7 +1022,7 @@ def incremental_scan(
             except Exception as exc:
                 logger.debug("scan db path update 失败: file_id=%s: %s", file_id, exc)
                 continue
-            if (idx + 1) % DB_COMMIT_BATCH == 0:
+            if (idx + 1) % SCAN_DB_COMMIT_BATCH == 0:
                 conn.commit()
                 logger.info(
                     "scan db write: path-only committed=%s/%s db_updated=%s",
@@ -1045,7 +1049,7 @@ def incremental_scan(
     path_missing = sum(1 for s in stats["samples"].get("errors", [])
                        if "missing" in str(s.get("error", "")).lower() or "MISSING" in str(s.get("error", "")))
     logger.info(
-        "scan result: new=%s changed=%s existing=%s maybe_more=%s",
+        "scan result: new=%s changed=%s existing=%s batch_limit_reached=%s",
         stats["new"], stats["changed"], stats["existing"], stats["batch_limit_reached"],
     )
     logger.info(
@@ -1061,7 +1065,7 @@ def incremental_scan(
         stats["skipped"], stats["errors"], final_bad_path_count,
         discovery_source, stats["batch_limit_reached"], limit,
     )
-    logger.info("增量扫描写库完成: %s", stats)
+    logger.debug("增量扫描写库详情: %s", stats)
     return stats
 
 
@@ -1334,11 +1338,3 @@ def fast_scan(num_files=1000, progress_callback=None):
 
     logger.info(f"Everything 扫描完成: 总计 {final} 文件, 新增 {new_added}")
     return {"total": final, "new": new_added, "removed": 0}
-
-
-if __name__ == "__main__":
-    result = full_scan()
-    if result.get("paused"):
-        print(f"扫描暂停: 新增 {result['new']}, 总计 {result['total']}")
-    else:
-        print(f"扫描完成: 总计 {result['total']}, 新增 {result['new']}, 移除 {result.get('removed', 0)}")

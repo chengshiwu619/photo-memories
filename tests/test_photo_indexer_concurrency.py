@@ -197,11 +197,11 @@ def test_index_photos_workers_1_matches_serial_semantics(monkeypatch):
 
     fake_db = _FakeDb()
     fake_cp = _FakeCheckpoint()
-    photos = [(1, "a.jpg", "create_needed"), (2, "b.jpg", "create_needed"), (3, "c.jpg", "create_needed")]
+    photos = [(1, "a.jpg", "new_changed_create"), (2, "b.jpg", "new_changed_create"), (3, "c.jpg", "new_changed_create")]
 
     monkeypatch.setattr(mod, "_db", fake_db)
     monkeypatch.setattr(mod, "_cp", fake_cp)
-    monkeypatch.setattr(mod, "get_unindexed_photos", lambda force_retry=False: photos)
+    monkeypatch.setattr(mod, "get_unindexed_photos", lambda force_retry=False, priority_filter=None: photos)
     monkeypatch.setattr(mod, "dedup_by_phash", lambda progress_callback=None: {"checked": 3, "duplicates": 0})
     monkeypatch.setattr(mod, "_index_single_photo", lambda file_id, file_path: _make_row(file_id))
     monkeypatch.setattr(mod, "INDEX_COMMIT_EVERY", 20)
@@ -229,7 +229,7 @@ def test_index_photos_workers_2_process_multiple_items_and_keep_db_writes_on_mai
 
     fake_db = _FakeDb()
     fake_cp = _FakeCheckpoint()
-    photos = [(1, "a.jpg", "create_needed"), (2, "b.jpg", "create_needed"), (3, "c.jpg", "create_needed"), (4, "d.jpg", "create_needed")]
+    photos = [(1, "a.jpg", "new_changed_create"), (2, "b.jpg", "new_changed_create"), (3, "c.jpg", "new_changed_create"), (4, "d.jpg", "new_changed_create")]
     worker_thread_ids = []
     barrier = threading.Barrier(2)
     main_thread_id = threading.get_ident()
@@ -242,7 +242,7 @@ def test_index_photos_workers_2_process_multiple_items_and_keep_db_writes_on_mai
 
     monkeypatch.setattr(mod, "_db", fake_db)
     monkeypatch.setattr(mod, "_cp", fake_cp)
-    monkeypatch.setattr(mod, "get_unindexed_photos", lambda force_retry=False: photos)
+    monkeypatch.setattr(mod, "get_unindexed_photos", lambda force_retry=False, priority_filter=None: photos)
     monkeypatch.setattr(mod, "dedup_by_phash", lambda progress_callback=None: {"checked": 4, "duplicates": 0})
     monkeypatch.setattr(mod, "_index_single_photo", _fake_index_single_photo)
     monkeypatch.setattr(mod, "INDEX_COMMIT_EVERY", 2)
@@ -265,7 +265,7 @@ def test_index_photos_single_failure_does_not_block_other_rows_and_failed_marker
 
     fake_db = _FakeDb()
     fake_cp = _FakeCheckpoint()
-    photos = [(1, "a.jpg", "create_needed"), (2, "b.jpg", "create_needed"), (3, "c.jpg", "create_needed")]
+    photos = [(1, "a.jpg", "new_changed_create"), (2, "b.jpg", "new_changed_create"), (3, "c.jpg", "new_changed_create")]
 
     def _fake_index_single_photo(file_id, file_path):
         if file_id == 2:
@@ -276,7 +276,7 @@ def test_index_photos_single_failure_does_not_block_other_rows_and_failed_marker
 
     monkeypatch.setattr(mod, "_db", fake_db)
     monkeypatch.setattr(mod, "_cp", fake_cp)
-    monkeypatch.setattr(mod, "get_unindexed_photos", lambda force_retry=False: photos)
+    monkeypatch.setattr(mod, "get_unindexed_photos", lambda force_retry=False, priority_filter=None: photos)
     monkeypatch.setattr(mod, "dedup_by_phash", lambda progress_callback=None: {"checked": 2, "duplicates": 0})
     monkeypatch.setattr(mod, "_index_single_photo", _fake_index_single_photo)
     monkeypatch.setattr(mod, "INDEX_COMMIT_EVERY", 20)
@@ -298,11 +298,11 @@ def test_index_photos_batch_limit_saves_checkpoint_after_batch(monkeypatch):
 
     fake_db = _FakeDb()
     fake_cp = _FakeCheckpoint()
-    photos = [(1, "a.jpg", "create_needed"), (2, "b.jpg", "create_needed"), (3, "c.jpg", "create_needed"), (4, "d.jpg", "create_needed")]
+    photos = [(1, "a.jpg", "new_changed_create"), (2, "b.jpg", "new_changed_create"), (3, "c.jpg", "new_changed_create"), (4, "d.jpg", "new_changed_create")]
 
     monkeypatch.setattr(mod, "_db", fake_db)
     monkeypatch.setattr(mod, "_cp", fake_cp)
-    monkeypatch.setattr(mod, "get_unindexed_photos", lambda force_retry=False: photos)
+    monkeypatch.setattr(mod, "get_unindexed_photos", lambda force_retry=False, priority_filter=None: photos)
     monkeypatch.setattr(mod, "dedup_by_phash", lambda progress_callback=None: {"checked": 0, "duplicates": 0})
     monkeypatch.setattr(mod, "_index_single_photo", lambda file_id, file_path: _make_row(file_id))
     monkeypatch.setattr(mod, "INDEX_COMMIT_EVERY", 20)
@@ -327,4 +327,4 @@ def test_get_unindexed_requeues_ok_record_when_thumbnail_file_missing(monkeypatc
 
     rows = mod.get_unindexed_photos()
 
-    assert rows == [(7, "photo.jpg", "create_needed")]
+    assert rows == [(7, "photo.jpg", "historical_missing")]

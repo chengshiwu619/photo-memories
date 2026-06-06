@@ -1045,8 +1045,3 @@ def propagate_branch_category(branch_path, category):
     build_classification_history()
     logger.info(f"分支分类已传播: {branch_path} -> {category}, 影响 {len(sub_folders)} 个子文件夹")
     return len(sub_folders)
-
-
-if __name__ == "__main__":
-    result = classify_folders()
-    print(f"分类完成: 已分类 {result['classified']}, 不确定 {result['unknown']}, 需用户确认 {len(result['needs_user'])}")

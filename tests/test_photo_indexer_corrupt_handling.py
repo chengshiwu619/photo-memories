@@ -130,6 +130,7 @@ def test_unreadable_image_is_marked_skipped_without_thumbnail_retry(monkeypatch,
 
 def test_failed_thumbnail_is_not_requeued_until_file_changes_or_force_retry(monkeypatch, tmp_path):
     mod, db = _install_test_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(mod, "get_settings", lambda: _settings(tmp_path / "thumbs"))
     src = tmp_path / "same-size-mtime.jpg"
     _create_file(src)
     mtime = "2026-06-02T12:00:00"
@@ -153,12 +154,12 @@ def test_failed_thumbnail_is_not_requeued_until_file_changes_or_force_retry(monk
         )
 
     assert [tuple(row) for row in mod.get_unindexed_photos()] == []
-    assert [tuple(row) for row in mod.get_unindexed_photos(force_retry=True)] == [(10, str(src), "recover_needed")]
+    assert [tuple(row) for row in mod.get_unindexed_photos(force_retry=True)] == [(10, str(src), "failed_or_invalid")]
 
     with db.connect() as conn:
         conn.execute("UPDATE files SET file_size = ? WHERE id = ?", (20, 10))
 
-    assert [tuple(row) for row in mod.get_unindexed_photos()] == [(10, str(src), "create_needed")]
+    assert [tuple(row) for row in mod.get_unindexed_photos()] == [(10, str(src), "historical_missing")]
 
 
 def test_phash_truncated_image_uses_tolerant_retry(monkeypatch):

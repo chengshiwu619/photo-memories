@@ -1,8 +1,3 @@
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-
 def test_virtual_waterfall_layout_basic():
     from ui.components.virtual_waterfall import VirtualWaterfallLayout, COL_COUNT, GAP
 
@@ -55,12 +50,3 @@ def test_virtual_waterfall_empty():
     layout = VirtualWaterfallLayout([], COL_COUNT, 100)
     assert layout.total_height >= 0
     assert layout.cards_in_range(0, 100) == []
-
-
-if __name__ == "__main__":
-    test_virtual_waterfall_layout_basic()
-    test_virtual_waterfall_cards_in_range()
-    test_virtual_waterfall_update_card_width()
-    test_virtual_waterfall_photo_at()
-    test_virtual_waterfall_empty()
-    print("All virtual waterfall tests passed")

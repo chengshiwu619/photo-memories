@@ -546,12 +546,12 @@ class TestBackgroundScanLimitSafety:
             db=db,
             settings=settings,
         )
-        # limit=None 应该被替换为 DEFAULT_SAFE_LIMIT (1000)，不应报错
+        # limit=None 应该被替换为安全默认 limit (1000)，不应报错
         assert result["scanned"] >= 1
         assert result["batch_limit_reached"] is False  # 1 个文件 < 1000
 
-    def test_incremental_scan_limit_zero_falls_back_to_default(self, tmp_path, monkeypatch):
-        """limit=0 时 incremental_scan 强制使用安全默认值。"""
+    def test_incremental_scan_limit_zero_means_full_scan(self, tmp_path, monkeypatch):
+        """limit=0 时 incremental_scan 执行全量扫描。"""
         scan_mod, db, settings, source_dir = _configure(tmp_path, monkeypatch)
         (source_dir / "b.jpg").write_bytes(b"b")
 
@@ -565,8 +565,8 @@ class TestBackgroundScanLimitSafety:
         assert result["scanned"] >= 1
         assert result["batch_limit_reached"] is False
 
-    def test_incremental_scan_limit_negative_falls_back_to_default(self, tmp_path, monkeypatch):
-        """limit 为负数时强制使用安全默认值。"""
+    def test_incremental_scan_limit_negative_means_full_scan(self, tmp_path, monkeypatch):
+        """limit 为负数时 incremental_scan 执行全量扫描。"""
         scan_mod, db, settings, source_dir = _configure(tmp_path, monkeypatch)
         (source_dir / "c.jpg").write_bytes(b"c")
 

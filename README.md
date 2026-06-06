@@ -30,7 +30,7 @@ pip install -r requirements.txt
 ## 启动
 
 ```bash
-python main.py ui
+启动GPU相册.bat
 ```
 
 首次启动需要配置：
@@ -40,6 +40,8 @@ python main.py ui
 - API Key（仅在需要 LLM 分类/生成时）
 
 ## 常用命令
+
+### 正式维护入口
 
 完整性检查：
 
@@ -76,6 +78,12 @@ path 标签审计：
 python scripts/audit_path_tags.py --db-path D:\photo-memories-cache\photos.db --source path --top 200
 python scripts/audit_path_tags.py --db-path D:\photo-memories-cache\photos.db --source path --top 200 --json
 ```
+
+### 保留但非日常入口
+
+- `scripts/maintain_paths.py`: 旧数据路径状态回填；正常启动流程会后台维护，手动执行前先 dry-run。
+- `scripts/maintain_memories.py`: 不可渲染 memories 的维护入口；特殊回忆功能后续再整体整理。
+- `scripts/run_ai_recognition.py`: SigLIP 小批量验证入口，属于增强链路，不作为正常用户流程依赖。
 
 ## 文档入口
 

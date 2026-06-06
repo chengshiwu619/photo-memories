@@ -201,9 +201,3 @@ def generate_all_memories(progress_callback=None):
             progress_callback(i + 1, len(MEMORY_CATEGORIES), CATEGORY_NAMES[cat], "done")
         results.append(r)
     return results
-
-
-if __name__ == "__main__":
-    results = generate_all_memories()
-    for r in results:
-        print(f"{r['category']}: 生成 {r['generated']} 条回忆")

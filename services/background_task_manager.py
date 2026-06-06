@@ -218,7 +218,7 @@ class BackgroundTaskManager:
 
     def register(self, thread: QThread):
         self._threads.append(thread)
-        logger.debug(f"后台任务注册: {thread}")
+        logger.debug("后台任务注册: %s", thread.__class__.__name__)
 
     def unregister(self, thread: QThread):
         if thread in self._threads:

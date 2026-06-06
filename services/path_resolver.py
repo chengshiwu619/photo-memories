@@ -17,11 +17,9 @@
 
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
-
-from logger_setup import logger
 
 
 class PathStatus(str, Enum):

@@ -37,8 +37,12 @@ def _make_db(db_path):
             thumbnail_path TEXT,
             is_duplicate_of INTEGER,
             date_taken TEXT,
+            category INTEGER,
             width INTEGER,
             height INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS sample_keywords (
+            keyword TEXT PRIMARY KEY
         );
         CREATE TABLE IF NOT EXISTS folder_categories (
             folder_path TEXT PRIMARY KEY,

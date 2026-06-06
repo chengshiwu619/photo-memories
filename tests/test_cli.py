@@ -10,20 +10,10 @@ def test_cli_help():
         cwd=os.path.join(os.path.dirname(__file__), ".."),
     )
     assert result.returncode == 0
-    assert "NAS" in result.stdout or "scan" in result.stdout
+    assert "NAS" in result.stdout
+    assert "ui" in result.stdout
 
-
-def test_cli_setup_no_crash():
-    result = subprocess.run(
-        [sys.executable, "main.py", "setup"],
-        capture_output=True, text=True, timeout=5,
-        cwd=os.path.join(os.path.dirname(__file__), ".."),
-        stdin=subprocess.DEVNULL,
-    )
-    assert result.returncode in (0, 1)
-
-
-def test_cli_scan_without_config():
+def test_cli_rejects_removed_scan_command():
     env = os.environ.copy()
     env["DEEPSEEK_API_KEY"] = ""
     env["SOURCE_DRIVE"] = ""
@@ -35,3 +25,4 @@ def test_cli_scan_without_config():
         env=env,
     )
     assert result.returncode != 0
+    assert "invalid choice" in result.stderr

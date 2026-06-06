@@ -823,7 +823,7 @@ class MainWindow(QMainWindow):
             self._cancel_category_prefetch_workers()
         current_cat_id = getattr(self, "_current_random_cat_id", None)
         if current_cat_id is not None:
-            logger.info("random cache invalidated: reason=update cat_id=%s", current_cat_id)
+            logger.debug("random cache invalidated: reason=update cat_id=%s", current_cat_id)
 
     def _random_category_db_version(self):
         try:
@@ -877,7 +877,7 @@ class MainWindow(QMainWindow):
         token = self._cat_load_token
         self._cat_active_tokens[cat_id] = token
         self._reset_category_page(index, cat_id)
-        logger.info("random loading: cat_id=%s", cat_id)
+        logger.debug("random loading: cat_id=%s", cat_id)
         self._start_category_load(index, cat_id, token, mode="foreground")
         self._start_offscreen_refresh(previous_cat_id, reason="left_tab")
         self._schedule_category_prefetch(index, delay_ms=0)
@@ -904,7 +904,7 @@ class MainWindow(QMainWindow):
         self._cat_load_token += 1
         token = self._cat_load_token
         self._cat_active_tokens[cat_id] = token
-        logger.info("random offscreen refresh start: cat_id=%s reason=%s", cat_id, reason)
+        logger.debug("random offscreen refresh start: cat_id=%s reason=%s", cat_id, reason)
         self._start_category_load(0, cat_id, token, mode="offscreen_refresh")
 
     def _start_silent_cache_refresh(self, cat_id, reason="cache_hit"):
@@ -916,14 +916,13 @@ class MainWindow(QMainWindow):
         self._cat_load_token += 1
         token = self._cat_load_token
         self._cat_active_tokens[cat_id] = token
-        logger.info("random silent cache refresh start: cat_id=%s reason=%s", cat_id, reason)
+        logger.debug("random silent cache refresh start: cat_id=%s reason=%s", cat_id, reason)
         self._start_category_load(0, cat_id, token, mode="silent_cache_refresh")
 
     def _show_category_cache(self, index, cat_id, cached):
         first_items = list(cached.get("first_items", []))
         total = cached.get("total", len(first_items))
-        logger.info("random cache hit fresh: cat_id=%s first=%s total=%s", cat_id, len(first_items), total)
-        logger.info("random show cache: cat_id=%s first=%s total=%s", cat_id, len(first_items), total)
+        logger.info("random cache hit: cat_id=%s first=%s total=%s", cat_id, len(first_items), total)
         self._render_category_photos(
             index,
             cat_id,
@@ -978,11 +977,11 @@ class MainWindow(QMainWindow):
 
     def _on_category_failed(self, token, cat_id, error):
         if self._cat_active_tokens.get(cat_id) != token:
-            logger.info("随机标签旧任务失败结果已忽略: cat_id=%s token=%s", cat_id, token)
+            logger.debug("随机标签旧任务失败结果已忽略: cat_id=%s token=%s", cat_id, token)
             return
         current_cat_id = getattr(self, "_current_random_cat_id", None)
         if current_cat_id != cat_id:
-            logger.info("random foreground discarded: result_cat_id=%s current_cat_id=%s", cat_id, current_cat_id)
+            logger.debug("random foreground discarded: result_cat_id=%s current_cat_id=%s", cat_id, current_cat_id)
             return
         page_index = next(i for i, (c, _) in enumerate(CATEGORIES) if c == cat_id)
         logger.warning("随机标签加载失败: cat_id=%s token=%s error=%s", cat_id, token, error)
@@ -990,7 +989,7 @@ class MainWindow(QMainWindow):
     def _on_category_loaded(self, token, cat_id, photos, metrics):
         current_cat_id = getattr(self, "_current_random_cat_id", None)
         if self._cat_active_tokens.get(cat_id) != token:
-            logger.info("random refresh discarded: result_cat_id=%s current_cat_id=%s", cat_id, current_cat_id)
+            logger.debug("random refresh discarded: result_cat_id=%s current_cat_id=%s", cat_id, current_cat_id)
             return
         mode = self._cat_request_modes.pop(token, "foreground")
         data_version = self._random_category_db_version()
@@ -1010,19 +1009,19 @@ class MainWindow(QMainWindow):
             "metrics": dict(metrics),
         }
         if mode == "offscreen_refresh":
-            logger.info("random offscreen refresh done: cat_id=%s first=%s total=%s", cat_id, min(len(photos), _random_first_page_size(cat_id)), len(photos))
+            logger.debug("random offscreen refresh done: cat_id=%s first=%s total=%s", cat_id, min(len(photos), _random_first_page_size(cat_id)), len(photos))
             return
         if mode == "silent_cache_refresh":
-            logger.info("random silent cache refresh done: cat_id=%s first=%s total=%s", cat_id, min(len(photos), _random_first_page_size(cat_id)), len(photos))
+            logger.debug("random silent cache refresh done: cat_id=%s first=%s total=%s", cat_id, min(len(photos), _random_first_page_size(cat_id)), len(photos))
             return
         if current_cat_id != cat_id:
-            logger.info("random refresh discarded: result_cat_id=%s current_cat_id=%s", cat_id, current_cat_id)
+            logger.debug("random refresh discarded: result_cat_id=%s current_cat_id=%s", cat_id, current_cat_id)
             return
         page_index = next(i for i, (c, _) in enumerate(CATEGORIES) if c == cat_id)
         if mode == "refresh":
             logger.info("random refresh applied: cat_id=%s total=%s reset_scroll=True", cat_id, len(photos))
         else:
-            logger.info("random foreground applied: cat_id=%s total=%s", cat_id, len(photos))
+            logger.debug("random foreground applied: cat_id=%s total=%s", cat_id, len(photos))
         self._render_category_photos(page_index, cat_id, list(photos), metrics, from_cache=False)
 
     def _render_category_photos(
@@ -1118,7 +1117,7 @@ class MainWindow(QMainWindow):
             worker.failed.connect(self._on_category_prefetch_failed)
             worker.finished.connect(lambda cat=cat_id, w=worker: self._on_category_prefetch_finished(cat, w))
             self._cat_prefetch_workers[cat_id] = worker
-            logger.info("random prefetch start: cat_id=%s", cat_id)
+            logger.debug("random prefetch start: cat_id=%s", cat_id)
             worker.start()
 
     def _on_category_prefetched(self, cat_id, starred, data_version, generation, first_items, total, query_ms):
@@ -1128,14 +1127,14 @@ class MainWindow(QMainWindow):
             or bool(starred) != bool(self.starred_only)
             or data_version != current_version
         ):
-            logger.info(
+            logger.debug(
                 "random category async discarded: result_cat_id=%s current_cat_id=%s",
                 cat_id,
                 getattr(self, "_current_random_cat_id", None),
             )
             return
         self._store_category_visible_cache(cat_id, starred, data_version, first_items, total, query_ms)
-        logger.info(
+        logger.debug(
             "random prefetch done: cat_id=%s first=%s total=%s query_ms=%.1f",
             cat_id,
             len(first_items),
@@ -1417,7 +1416,7 @@ def main():
         _bg_last_tag_batch_ids = [None]
         _bg_classify_started = [False]
         _bg_classify_completed = [False]
-        _bg_recover_started = [False]          # recover_existing (562) 队列
+        _bg_recover_started = [False]          # recover_existing 队列
         _bg_last_scan_result = [None]          # 保存最近一次扫描结果
         _bg_pipeline_phase = ["scan"]          # 当前 pipeline 阶段
 
@@ -1579,7 +1578,7 @@ def main():
 
         def _should_defer_ai_for_thumbnails():
             """P0+P1 缩略图 pending 仍明显存在时，延迟 AI 标签/人脸。
-            recover_existing (562) 不阻塞 AI 任务。"""
+            recover_existing 不阻塞 AI 任务。"""
             try:
                 from business.indexer.photo_indexer import get_unindexed_photos
                 p0 = get_unindexed_photos(priority_filter='new_changed_create')
@@ -1948,7 +1947,7 @@ def main():
             Pipeline:
             P0: new_changed_create + historical_missing → 第一时间可用
             P1: 扫描更多批次（如果 batch_limit_reached）
-            P2: recover_existing (历史 562) → 低优先级回填
+            P2: recover_existing → 低优先级回填
             P3: path_backfill (path maintenance)
             P4: AI tags / faces / special memories
             """
@@ -2030,9 +2029,9 @@ def main():
                         self.remaining = 0
                         return
 
-                    # ---- Phase 2: recover_existing / 562 (P2, 低优先级) ----
+                    # ---- Phase 2: recover_existing (P2, 低优先级) ----
                     self.phase = "recover_existing"
-                    logger.info("后台索引 [Phase2]: recover_existing (562) 开始")
+                    logger.info("后台索引 [Phase2]: recover_existing 开始")
                     result_p2 = recover_existing_thumbnails(
                         progress_callback=lambda cur, tot: None,
                         workers=_IDX_WORKERS,
@@ -2145,7 +2144,7 @@ def main():
 
                 if p2_pending > 0 and not _bg_recover_started[0]:
                     _bg_pipeline_phase[0] = "recover_existing"
-                    logger.info("P0+P1 清完，开始 recover_existing (562): pending=%s", p2_pending)
+                    logger.info("P0+P1 清完，开始 recover_existing: pending=%s", p2_pending)
                     start_background_recover_existing()
                     return
 
@@ -2160,7 +2159,7 @@ def main():
             logger.info("后台索引线程已启动")
 
         def start_background_recover_existing():
-            """低优先级回填历史 562 队列：缩略图文件已存在但 DB 未回填。"""
+            """低优先级回填 recover_existing 队列：缩略图文件已存在但 DB 未回填。"""
             if BACKGROUND_SHUTDOWN_REQUESTED:
                 return
             if _bg_recover_started[0]:
@@ -2175,7 +2174,7 @@ def main():
                         INDEX_WORKERS as _IDX_WORKERS,
                         INDEX_COMMIT_EVERY as _IDX_COMMIT_EVERY,
                     )
-                    logger.info("后台 recover_existing (562) 开始")
+                    logger.info("后台 recover_existing 开始")
                     result = recover_existing_thumbnails(
                         progress_callback=lambda cur, tot: None,
                         workers=_IDX_WORKERS,

@@ -113,7 +113,7 @@ def get_unindexed_photos(force_retry=False, priority_filter=None):
     优先级（4 级队列）：
     1. new_changed_create: 本轮扫描新增/变化的文件，缩略图缺失 → P0 最高
     2. historical_missing: DB 中历史遗留，缩略图文件确实不存在 → P1
-    3. recover_existing: 缩略图文件已存在但 DB 未回填 (即历史 562 队列) → P2
+    3. recover_existing: 缩略图文件已存在但 DB 未回填 → P2
     4. failed_or_invalid: 之前失败的，仅 force_retry 时纳入 → P3
 
     path_status / canonical_key / path maintenance 不影响此查询。
@@ -232,7 +232,7 @@ def get_unindexed_photos(force_retry=False, priority_filter=None):
             # 默认：按优先级合并 P0 → P1 → P2 → P3
             all_rows = list(p0_rows) + list(p2_rows) + list(p3_rows)
 
-        logger.info(
+        logger.debug(
             "thumbnail queue classified: new_changed_create=%s historical_missing=%s "
             "recover_existing=%s failed_or_invalid=%s",
             sum(1 for _, _, c in p0_rows if c == 'new_changed_create'),
@@ -773,7 +773,7 @@ def index_photos(progress_callback=None, batch_limit=None, workers=INDEX_WORKERS
 
         logger.info(
             "缩略图索引批次结果: processed=%s created=%s existing=%s recovered=%s failed=%s "
-            "skipped=%s path_invalid=%s db_updated=%s output_dir=%s sample_created=%s sample_failed=%s",
+            "skipped=%s path_invalid=%s db_updated=%s output_dir=%s",
             stats["processed"],
             stats["thumbnail_created"],
             stats["thumbnail_existing"],
@@ -783,9 +783,13 @@ def index_photos(progress_callback=None, batch_limit=None, workers=INDEX_WORKERS
             stats["path_invalid"],
             stats["db_updated"],
             stats["output_dir"],
-            stats["sample_created_paths"],
-            stats["sample_failed"],
         )
+        if stats["sample_created_paths"] or stats["sample_failed"]:
+            logger.debug(
+                "缩略图索引样本: sample_created=%s sample_failed=%s",
+                stats["sample_created_paths"],
+                stats["sample_failed"],
+            )
 
         if batch_limit and batch_count >= batch_limit:
             _cp.save(CheckpointState.PAUSED, current_index=batch_end, total=total, indexed=indexed)
@@ -850,7 +854,7 @@ def index_new_or_changed_files(progress_callback=None, workers=INDEX_WORKERS, ba
     """优先索引 new/changed 文件的缩略图。
 
     仅处理 new_changed_create 和 historical_missing 队列，
-    跳过 recover_existing (历史 562) 队列。
+    跳过 recover_existing 队列。
     用于扫描完成后第一时间让新图片可用。
     """
     _db.init_tables()
@@ -912,7 +916,7 @@ def index_new_or_changed_files(progress_callback=None, workers=INDEX_WORKERS, ba
 
 
 def recover_existing_thumbnails(progress_callback=None, workers=INDEX_WORKERS, batch_size=INDEX_COMMIT_EVERY, batch_limit=None):
-    """低优先级回填历史 existing 缩略图 (即历史 562 队列)。
+    """低优先级回填历史 existing 缩略图。
 
     仅处理 recover_existing 队列：缩略图文件已存在但 DB 未回填。
     不会挡住 new/changed 缩略图创建。
@@ -969,11 +973,3 @@ def recover_existing_thumbnails(progress_callback=None, workers=INDEX_WORKERS, b
         stats["thumbnail_recovered"], stats["thumbnail_failed"], stats["db_updated"],
     )
     return stats
-
-
-if __name__ == "__main__":
-    result = index_photos()
-    if result.get("paused"):
-        print(f"索引暂停: {result['indexed']}/{result['total']}")
-    else:
-        print(f"索引完成: 总计 {result['total']}, 已索引 {result['indexed']}")
