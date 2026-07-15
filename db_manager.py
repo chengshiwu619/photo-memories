@@ -305,6 +305,8 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_shown_file ON photo_shown_history(file_id);
             CREATE INDEX IF NOT EXISTS idx_shown_at ON photo_shown_history(shown_at);
+            CREATE INDEX IF NOT EXISTS idx_shown_category_file_at
+                ON photo_shown_history(category, file_id, shown_at);
         """)
 
         self._create_v03_new_tables(conn)
@@ -429,6 +431,7 @@ class Database:
             """, [
                 "CREATE INDEX IF NOT EXISTS idx_shown_file ON photo_shown_history(file_id)",
                 "CREATE INDEX IF NOT EXISTS idx_shown_at ON photo_shown_history(shown_at)",
+                "CREATE INDEX IF NOT EXISTS idx_shown_category_file_at ON photo_shown_history(category, file_id, shown_at)",
             ]),
             ("sample_keywords", """
                 CREATE TABLE IF NOT EXISTS sample_keywords (
@@ -472,6 +475,13 @@ class Database:
                 for idx_sql in indexes:
                     conn.execute(idx_sql)
                 logger.info(f"补建缺失表: {table_name}")
+        if self._table_exists(conn, "photo_shown_history"):
+            for idx_sql in [
+                "CREATE INDEX IF NOT EXISTS idx_shown_file ON photo_shown_history(file_id)",
+                "CREATE INDEX IF NOT EXISTS idx_shown_at ON photo_shown_history(shown_at)",
+                "CREATE INDEX IF NOT EXISTS idx_shown_category_file_at ON photo_shown_history(category, file_id, shown_at)",
+            ]:
+                conn.execute(idx_sql)
         folder_category_columns = [
             ("fingerprint", "TEXT"),
             ("classifier_version", "TEXT"),

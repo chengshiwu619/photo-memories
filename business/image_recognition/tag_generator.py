@@ -34,6 +34,7 @@ TAG_CANDIDATES_EN = [
     "graduation", "school", "classroom", "office", "meeting",
     "park", "playground", "museum", "library",
     "selfie", "group photo", "portrait", "landscape",
+    "nsfw", "nude", "explicit", "lingerie", "gravure", "model portrait", "photobook",
 ]
 
 DEFAULT_TOP_K = 5

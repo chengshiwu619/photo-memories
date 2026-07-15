@@ -5,7 +5,8 @@
 - 不覆盖旧 path 字段
 - 默认 dry-run，使用 --apply 才写库
 - 支持 --limit 分批处理
-- 仅处理 path_status IS NULL 或 path_status = 'pending' 的记录
+- 默认仅处理 path_status IS NULL 或 path_status = 'pending' 的记录
+- 使用 --recheck-existing 时复查全部记录，用于发现原图已删除但缩略图仍在的旧数据
 """
 
 import argparse
@@ -27,7 +28,7 @@ from services.path_resolver import (  # noqa: E402
 from logger_setup import logger  # noqa: E402
 
 
-def backfill_paths(dry_run=True, limit=None, verbose=False):
+def backfill_paths(dry_run=True, limit=None, verbose=False, recheck_existing=False):
     """分批补充旧数据的路径状态信息。
 
     Args:
@@ -45,11 +46,17 @@ def backfill_paths(dry_run=True, limit=None, verbose=False):
     source_dirs = settings.source_dirs
 
     with db.connect() as conn:
-        rows = conn.execute(
-            """SELECT id, file_path FROM files
-               WHERE path_status IS NULL OR path_status = 'pending'
-               ORDER BY id"""
-        ).fetchall()
+        if recheck_existing:
+            rows = conn.execute(
+                """SELECT id, file_path FROM files
+                   ORDER BY id"""
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT id, file_path FROM files
+                   WHERE path_status IS NULL OR path_status = 'pending'
+                   ORDER BY id"""
+            ).fetchall()
 
     total = len(rows)
     if limit and limit < total:
@@ -60,6 +67,7 @@ def backfill_paths(dry_run=True, limit=None, verbose=False):
 
     stats = {
         "dry_run": dry_run,
+        "recheck_existing": recheck_existing,
         "total_pending": total,
         "processed": 0,
         "ok": 0,
@@ -180,6 +188,8 @@ def parse_args(argv=None):
                         help="仅分析不写入（默认）")
     parser.add_argument("--limit", type=int, help="最多处理 N 条记录")
     parser.add_argument("--verbose", action="store_true", help="打印详细信息")
+    parser.add_argument("--recheck-existing", action="store_true",
+                        help="复查所有 files 记录，包括已标记 ok 的记录；用于发现原图已删除但缩略图仍在的旧数据")
     parser.add_argument("--json", action="store_true", dest="json_output",
                         help="以 JSON 格式输出")
     return parser.parse_args(argv)
@@ -195,6 +205,7 @@ def main(argv=None):
         dry_run=dry_run,
         limit=args.limit,
         verbose=args.verbose,
+        recheck_existing=args.recheck_existing,
     )
 
     if args.json_output:

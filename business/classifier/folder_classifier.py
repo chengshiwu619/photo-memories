@@ -11,6 +11,13 @@ from config import (
     get_settings,
 )
 from db_manager import Database
+from business.classifier.category_rules import (
+    is_same_or_child_path,
+    path_keyword_priority,
+    relpath_from_source,
+    strong_life_source_priority,
+    strong_sample_source_priority,
+)
 
 _db = Database()
 
@@ -72,7 +79,7 @@ _LIFE_KEYWORDS = [
     "asus", "rog phone",
     "wechat", "微信", "weixin",
     "screenshot", "截图",
-    "dcim", "camera",
+    "dcim", "camera", "mobilebackup", "mobile backup", "moments",
 ]
 
 
@@ -128,9 +135,7 @@ def _path_like_patterns(folder_path):
 
 
 def _is_same_or_child_path(path, parent):
-    p = os.path.normpath(path).replace("\\", "/").rstrip("/")
-    base = os.path.normpath(parent).replace("\\", "/").rstrip("/")
-    return p == base or p.startswith(base + "/")
+    return is_same_or_child_path(path, parent)
 
 
 def _get_source_roots():
@@ -153,15 +158,7 @@ def _get_source_roots():
 
 
 def _relpath_from_source(folder_path, source_roots=None):
-    norm_fp = os.path.normpath(folder_path)
-    for source in source_roots or _get_source_roots():
-        if not _is_same_or_child_path(norm_fp, source):
-            continue
-        try:
-            return os.path.relpath(norm_fp, source), source
-        except ValueError:
-            continue
-    return None, None
+    return relpath_from_source(folder_path, source_roots or _get_source_roots())
 
 
 def _has_date_path_pattern(folder_path):
@@ -561,9 +558,7 @@ def classify_branches_with_llm(branch_info):
 
 
 def classify_folders(progress_callback=None):
-    from db_manager import Database
-    db = Database()
-    db.init_tables()
+    _db.init_tables()
 
     unclassified = get_unclassified_folders()
     if not unclassified:
@@ -576,6 +571,9 @@ def classify_folders(progress_callback=None):
         return {"classified": 0, "unknown": 0, "skipped": 0, "llm_queued": 0, "needs_user": []}
 
     branch_names = [os.path.basename(b) for b in branches]
+    source_roots = _get_source_roots()
+    sample_keywords = _get_all_sample_keywords()
+    life_keywords = _get_all_life_keywords()
 
     sample_branches = []
     life_branches = []
@@ -584,9 +582,18 @@ def classify_folders(progress_callback=None):
     llm_fingerprints = {}
     skipped_count = 0
     for bp, bn in zip(branches, branch_names):
+        sample_priority = path_keyword_priority(bp, sample_keywords, source_roots)
+        life_priority = path_keyword_priority(bp, life_keywords, source_roots)
+        sample_priority = max(sample_priority, strong_sample_source_priority(bp, source_roots))
+        life_priority = max(life_priority, strong_life_source_priority(bp, source_roots))
         if _match_sample_keyword(bn):
+            sample_priority = max(sample_priority, 1)
+        if _match_life_keyword(bn):
+            life_priority = max(life_priority, 1)
+
+        if sample_priority > life_priority:
             sample_branches.append((bp, bn))
-        elif _match_life_keyword(bn):
+        elif life_priority > sample_priority:
             life_branches.append((bp, bn))
         else:
             fp_info = build_folder_fingerprint(bp)
@@ -870,10 +877,11 @@ def _cleanup_stale_category_data(changes, old_categories):
 
 def refine_sample_keywords():
     PRIOR_PATH = 1
-    PRIOR_FILENAME = 2
-    PRIOR_EXIF = 3
-    PRIOR_CONTENT = 4
-    PRIOR_BRANCH = 5
+    PRIOR_DATE = 10
+    PRIOR_FILENAME = 20
+    PRIOR_EXIF = 30
+    PRIOR_CONTENT = 40
+    PRIOR_BRANCH_HISTORY = 90
 
     refined = 0
     try:
@@ -939,9 +947,6 @@ def refine_sample_keywords():
                 branch_cat_map[os.path.basename(os.path.normpath(fp)).lower()] = (cat, conf)
 
         for folder_path, current_cat, current_conf in all_folders:
-            if current_conf and "manual" in current_conf:
-                continue
-
             info = folder_info.get(folder_path)
             if not info:
                 continue
@@ -950,37 +955,47 @@ def refine_sample_keywords():
             life_priority = 0
 
             folder_name = os.path.basename(folder_path).lower()
-            parts = folder_path.replace("/", os.sep).replace("\\", os.sep).split(os.sep)
 
             norm_fp = os.path.normpath(folder_path)
             rel, _source = _relpath_from_source(norm_fp, source_roots)
             branch_name = rel.split(os.sep)[0].lower() if rel and rel != '.' else folder_name
+            strong_sample_priority = strong_sample_source_priority(folder_path, source_roots)
+            strong_life_priority = strong_life_source_priority(folder_path, source_roots)
+
+            if current_conf and "manual" in current_conf and not (strong_sample_priority or strong_life_priority):
+                continue
 
             if sample_kws:
+                sample_priority = max(
+                    sample_priority,
+                    path_keyword_priority(folder_path, sample_kws, source_roots),
+                    strong_sample_priority,
+                )
+            else:
+                sample_priority = max(sample_priority, strong_sample_priority)
+            if sample_kws:
                 if any(kw in branch_name for kw in sample_kws):
-                    sample_priority = max(sample_priority, PRIOR_BRANCH)
+                    sample_priority = max(sample_priority, PRIOR_PATH)
                 elif any(kw in folder_name for kw in sample_kws):
                     sample_priority = max(sample_priority, PRIOR_PATH)
-                for part in parts:
-                    if any(kw in part.lower() for kw in sample_kws):
-                        if sample_priority < PRIOR_PATH:
-                            sample_priority = max(sample_priority, PRIOR_PATH)
-                        break
                 for fn in info["file_names"]:
                     if any(kw in fn.lower() for kw in sample_kws):
                         sample_priority = max(sample_priority, PRIOR_CONTENT)
                         break
 
             if life_kws:
+                life_priority = max(
+                    life_priority,
+                    path_keyword_priority(folder_path, life_kws, source_roots),
+                    strong_life_priority,
+                )
+            else:
+                life_priority = max(life_priority, strong_life_priority)
+            if life_kws:
                 if any(kw in branch_name for kw in life_kws):
-                    life_priority = max(life_priority, PRIOR_BRANCH)
+                    life_priority = max(life_priority, PRIOR_PATH)
                 elif any(kw in folder_name for kw in life_kws):
                     life_priority = max(life_priority, PRIOR_PATH)
-                for part in parts:
-                    if any(kw in part.lower() for kw in life_kws):
-                        if life_priority < PRIOR_PATH:
-                            life_priority = max(life_priority, PRIOR_PATH)
-                        break
                 for fn in info["file_names"]:
                     if any(kw in fn.lower() for kw in life_kws):
                         life_priority = max(life_priority, PRIOR_FILENAME)
@@ -995,15 +1010,15 @@ def refine_sample_keywords():
                         break
 
             if _has_date_path_pattern(folder_path):
-                life_priority = max(life_priority, PRIOR_PATH)
+                life_priority = max(life_priority, PRIOR_DATE)
 
             branch_entry = branch_cat_map.get(branch_name)
             if branch_entry:
                 b_cat, b_conf = branch_entry
                 if b_cat == CATEGORY_SAMPLE and b_conf and ("keyword" in b_conf or "llm" in b_conf):
-                    sample_priority = max(sample_priority, PRIOR_BRANCH)
+                    sample_priority = max(sample_priority, PRIOR_BRANCH_HISTORY)
                 elif b_cat == CATEGORY_LIFE and b_conf and ("keyword" in b_conf or "llm" in b_conf):
-                    life_priority = max(life_priority, PRIOR_BRANCH)
+                    life_priority = max(life_priority, PRIOR_BRANCH_HISTORY)
 
             if sample_priority > life_priority and current_cat != CATEGORY_SAMPLE:
                 changes[folder_path] = CATEGORY_SAMPLE

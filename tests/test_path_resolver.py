@@ -434,6 +434,38 @@ class TestRecommendationPathFilter:
         ids = {p["id"] for p in photos}
         assert 1 in ids  # NULL status still visible
 
+    def test_recheck_existing_marks_missing_ok_record(self, tmp_path, monkeypatch):
+        """显式 recheck_existing 时，会复查已 ok 的旧记录并标记已删除原图。"""
+        from scripts import maintain_paths
+        from db_manager import Database
+        from types import SimpleNamespace
+
+        db_path = str(tmp_path / "test.db")
+        db = Database(db_path)
+        db.init_tables()
+        missing_file = tmp_path / "missing.jpg"
+        with db.connect() as conn:
+            self._insert_file(conn, 1, str(missing_file), str(tmp_path), "ok")
+
+        monkeypatch.setattr(
+            maintain_paths,
+            "get_settings",
+            lambda: SimpleNamespace(db_path=db_path, source_dirs=[str(tmp_path)]),
+        )
+
+        default_stats = maintain_paths.backfill_paths(dry_run=False)
+        with db.connect() as conn:
+            default_status = conn.execute("SELECT path_status FROM files WHERE id = 1").fetchone()[0]
+
+        recheck_stats = maintain_paths.backfill_paths(dry_run=False, recheck_existing=True)
+        with db.connect() as conn:
+            rechecked_status = conn.execute("SELECT path_status FROM files WHERE id = 1").fetchone()[0]
+
+        assert default_stats["processed"] == 0
+        assert default_status == "ok"
+        assert recheck_stats["processed"] == 1
+        assert rechecked_status == "missing"
+
 
 # ============================================================================
 # DB Schema 测试

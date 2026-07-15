@@ -127,6 +127,63 @@ def test_photo_tag_status_table_exists():
         shutil.rmtree(tmp)
 
 
+def test_photo_shown_history_compound_index_exists():
+    from db_manager import Database
+    tmp = tempfile.mkdtemp()
+    try:
+        db_path = os.path.join(tmp, "photos.db")
+        db = Database(db_path)
+        db.init_tables()
+        conn = sqlite3.connect(db_path)
+        indexes = {r[1] for r in conn.execute("PRAGMA index_list(photo_shown_history)").fetchall()}
+        index_cols = [
+            r[2]
+            for r in conn.execute("PRAGMA index_info(idx_shown_category_file_at)").fetchall()
+        ]
+        conn.close()
+        assert "idx_shown_category_file_at" in indexes
+        assert index_cols == ["category", "file_id", "shown_at"]
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_existing_photo_shown_history_gets_compound_index():
+    from db_manager import Database
+    tmp = tempfile.mkdtemp()
+    try:
+        db_path = os.path.join(tmp, "photos.db")
+        conn = sqlite3.connect(db_path)
+        conn.executescript("""
+            CREATE TABLE migration_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                version_from TEXT NOT NULL,
+                version_to TEXT NOT NULL,
+                migrated_at TEXT DEFAULT (datetime('now'))
+            );
+            INSERT INTO migration_log (version_from, version_to) VALUES ('init', '0.3');
+            CREATE TABLE photo_shown_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id INTEGER NOT NULL,
+                category INTEGER,
+                shown_at TEXT DEFAULT (datetime('now'))
+            );
+        """)
+        conn.commit()
+        conn.close()
+
+        db = Database(db_path)
+        db.init_tables()
+
+        conn = sqlite3.connect(db_path)
+        indexes = {r[1] for r in conn.execute("PRAGMA index_list(photo_shown_history)").fetchall()}
+        conn.close()
+        assert "idx_shown_file" in indexes
+        assert "idx_shown_at" in indexes
+        assert "idx_shown_category_file_at" in indexes
+    finally:
+        shutil.rmtree(tmp)
+
+
 def test_config_init_all_tables_delegates():
     from db_manager import Database
     tmp = tempfile.mkdtemp()

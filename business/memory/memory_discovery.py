@@ -9,6 +9,13 @@ from core.models import Memory
 from infra.db.repositories.memories_repo import MemoriesRepository
 from infra.db.repositories.photo_metadata_repo import PhotoMetadataRepository
 from config import get_settings
+from config import CATEGORY_LIFE
+from business.classifier.category_rules import category_match_sql
+
+
+MAX_EVENT_SPAN_DAYS = 21
+MAX_EVENT_GAP_DAYS = 2
+MAX_MEMORY_PHOTOS = 20
 
 
 def _filter_life_photos(file_ids: List[int]) -> List[int]:
@@ -18,10 +25,12 @@ def _filter_life_photos(file_ids: List[int]) -> List[int]:
     with Database().connect() as conn:
         rows = conn.execute("""
             SELECT f.id FROM files f
-            JOIN folder_categories fc ON f.folder_path = fc.folder_path
-            WHERE fc.category = 1 AND f.id IN ({})
-        """.format(",".join("?" * len(file_ids))), file_ids).fetchall()
-    return [r[0] for r in rows]
+            LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
+            LEFT JOIN photo_metadata pm ON f.id = pm.file_id
+            WHERE """ + category_match_sql(CATEGORY_LIFE) + """ AND f.id IN ({})
+        """.format(",".join("?" * len(file_ids))), [CATEGORY_LIFE] + file_ids).fetchall()
+    allowed = {r[0] for r in rows}
+    return [fid for fid in file_ids if fid in allowed]
 
 
 def discover_on_this_day(lookback_years: Optional[List[int]] = None) -> List[Memory]:
@@ -52,7 +61,7 @@ def discover_on_this_day(lookback_years: Optional[List[int]] = None) -> List[Mem
     groups = {}
     for file_id, folder_path, date_taken, category in rows:
         # 只保留生活样片分类的照片
-        if category != 1:
+        if category != CATEGORY_LIFE:
             continue
         month_day = date_taken[5:10]
         year = date_taken[:4]
@@ -73,7 +82,7 @@ def discover_on_this_day(lookback_years: Optional[List[int]] = None) -> List[Mem
             continue
 
         m = Memory(
-            category=1,
+            category=CATEGORY_LIFE,
             memory_type="on_this_day",
             title=title,
             description=description,
@@ -105,7 +114,7 @@ def discover_recent_memories(days: Optional[int] = None) -> List[Memory]:
 
     groups = {}
     for file_id, folder_path, date_taken, category in rows:
-        if category != 1:
+        if category != CATEGORY_LIFE:
             continue
         day = date_taken[:10]
         if day not in groups:
@@ -121,7 +130,7 @@ def discover_recent_memories(days: Optional[int] = None) -> List[Memory]:
             continue
 
         m = Memory(
-            category=1,
+            category=CATEGORY_LIFE,
             memory_type="recent",
             title=title,
             photo_ids=json.dumps(photo_ids),
@@ -185,7 +194,7 @@ def discover_special_date_memories(max_groups: Optional[int] = 2, min_photos: in
         folder_path = row[1]
         date_taken = row[2]
         category = row[3]
-        if category != 1:
+        if category != CATEGORY_LIFE:
             continue
         month_day = date_taken[5:10]
         year = date_taken[:4]
@@ -212,7 +221,7 @@ def discover_special_date_memories(max_groups: Optional[int] = 2, min_photos: in
             continue
 
         m = Memory(
-            category=1,
+            category=CATEGORY_LIFE,
             memory_type="special_date",
             title=title,
             photo_ids=json.dumps(photo_ids),
@@ -238,16 +247,16 @@ def discover_folder_memories(top_n: int = 5) -> List[Memory]:
                    MIN(pm.date_taken) as first_date
             FROM files f
             JOIN photo_metadata pm ON f.id = pm.file_id
-            JOIN folder_categories fc ON f.folder_path = fc.folder_path
+            LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
             WHERE f.is_image = 1
-              AND fc.category = 1
+              AND """ + category_match_sql(CATEGORY_LIFE) + """
               AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
               AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
             GROUP BY f.folder_path
             HAVING cnt >= 3
             ORDER BY cnt DESC
             LIMIT ?
-        """, (top_n,)).fetchall()
+        """, (CATEGORY_LIFE, top_n)).fetchall()
 
     if not rows:
         return []
@@ -277,7 +286,7 @@ def discover_folder_memories(top_n: int = 5) -> List[Memory]:
             continue
 
         m = Memory(
-            category=1,
+            category=CATEGORY_LIFE,
             memory_type="folder",
             title=title,
             photo_ids=json.dumps(photo_ids),
@@ -325,7 +334,7 @@ def discover_person_memories(threshold: int = 3) -> List[Memory]:
             continue
 
         m = Memory(
-            category=1,
+            category=CATEGORY_LIFE,
             memory_type="person",
             title=person_name,
             photo_ids=json.dumps(photo_ids),
@@ -384,7 +393,7 @@ def discover_scene_memories(threshold: int = 5) -> List[Memory]:
             continue
 
         m = Memory(
-            category=1,
+            category=CATEGORY_LIFE,
             memory_type="scene",
             title=title,
             photo_ids=json.dumps(photo_ids),
@@ -398,6 +407,138 @@ def discover_scene_memories(threshold: int = 5) -> List[Memory]:
 
     logger.info(f"场景回忆发现 {len(memories)} 组")
     return memories
+
+
+def _parse_date_taken(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value[:len(fmt)], fmt)
+        except Exception:
+            continue
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
+def _split_temporal_segments(photos, max_gap_days: int = MAX_EVENT_GAP_DAYS, max_span_days: int = MAX_EVENT_SPAN_DAYS):
+    segments = []
+    current = []
+    current_start = None
+    previous_dt = None
+
+    for photo in sorted(photos, key=lambda p: p[1] or ""):
+        dt = _parse_date_taken(photo[1])
+        if dt is None:
+            continue
+
+        should_break = False
+        if current and previous_dt is not None and (dt.date() - previous_dt.date()).days > max_gap_days:
+            should_break = True
+        if current and current_start is not None and (dt.date() - current_start.date()).days >= max_span_days:
+            should_break = True
+
+        if should_break:
+            segments.append(current)
+            current = []
+            current_start = None
+
+        if not current:
+            current_start = dt
+        current.append(photo)
+        previous_dt = dt
+
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _build_event_segments(rows, gps_delta: float = 0.01, max_gap_days: int = MAX_EVENT_GAP_DAYS, max_span_days: int = MAX_EVENT_SPAN_DAYS):
+    events = {}
+    for file_id, date_taken, lat, lon in rows:
+        lat_r = round(lat / gps_delta) * gps_delta
+        lon_r = round(lon / gps_delta) * gps_delta
+        key = (lat_r, lon_r)
+        events.setdefault(key, []).append((file_id, date_taken))
+
+    segments = []
+    for (lat_r, lon_r), photos in events.items():
+        for segment in _split_temporal_segments(photos, max_gap_days=max_gap_days, max_span_days=max_span_days):
+            if not segment:
+                continue
+            dates = [p[1][:10] for p in segment if p[1]]
+            if not dates:
+                continue
+            start_date = min(dates)
+            end_date = max(dates)
+            segments.append({
+                "location_key": f"{lat_r},{lon_r}",
+                "start_date": start_date,
+                "end_date": end_date,
+                "photos": segment,
+                "unique_dates": sorted(set(dates)),
+            })
+    return segments
+
+
+def _location_key(lat: float, lon: float, gps_delta: float) -> str:
+    lat_r = round(lat / gps_delta) * gps_delta
+    lon_r = round(lon / gps_delta) * gps_delta
+    return f"{lat_r},{lon_r}"
+
+
+def _build_trip_segments(rows, gps_delta: float = 0.01, max_gap_days: int = MAX_EVENT_GAP_DAYS, max_span_days: int = MAX_EVENT_SPAN_DAYS):
+    dated = []
+    for file_id, date_taken, lat, lon in rows:
+        dt = _parse_date_taken(date_taken)
+        if dt is None:
+            continue
+        dated.append((file_id, date_taken, lat, lon, dt, _location_key(lat, lon, gps_delta)))
+
+    segments = []
+    current = []
+    current_start = None
+    previous_dt = None
+    for item in sorted(dated, key=lambda p: p[4]):
+        dt = item[4]
+        should_break = False
+        if current and previous_dt is not None and (dt.date() - previous_dt.date()).days > max_gap_days:
+            should_break = True
+        if current and current_start is not None and (dt.date() - current_start.date()).days >= max_span_days:
+            should_break = True
+
+        if should_break:
+            segments.append(current)
+            current = []
+            current_start = None
+
+        if not current:
+            current_start = dt
+        current.append(item)
+        previous_dt = dt
+
+    if current:
+        segments.append(current)
+
+    trip_segments = []
+    for segment in segments:
+        dates = [p[1][:10] for p in segment if p[1]]
+        location_keys = sorted({p[5] for p in segment})
+        if len(set(dates)) < 2 or len(location_keys) < 3:
+            continue
+        start_date = min(dates)
+        end_date = max(dates)
+        trip_segments.append({
+            "event_key": f"trip|{start_date}|{end_date}|{'/'.join(location_keys[:4])}",
+            "start_date": start_date,
+            "end_date": end_date,
+            "photos": [(p[0], p[1]) for p in segment],
+            "unique_dates": sorted(set(dates)),
+            "location_keys": location_keys,
+        })
+    return trip_segments
 
 
 def discover_event_memories(threshold: int = 5, gps_delta: float = 0.01) -> List[Memory]:
@@ -419,48 +560,82 @@ def discover_event_memories(threshold: int = 5, gps_delta: float = 0.01) -> List
     if not rows:
         return []
 
-    # 按 GPS 聚类
-    events = {}  # (lat_round, lon_round) -> list of (file_id, date_taken)
-    for file_id, date_taken, lat, lon in rows:
-        lat_r = round(lat / gps_delta) * gps_delta
-        lon_r = round(lon / gps_delta) * gps_delta
-        key = (lat_r, lon_r)
-        if key not in events:
-            events[key] = []
-        events[key].append((file_id, date_taken))
-
     memories = []
-    for (lat_r, lon_r), photos in events.items():
+    trip_photo_ids = set()
+    for trip in _build_trip_segments(rows, gps_delta=gps_delta):
+        photos = trip["photos"]
         if len(photos) < threshold:
             continue
 
-        # 检查时间跨度
-        dates = [p[1][:10] for p in photos]
-        unique_dates = sorted(set(dates))
+        existing = _find_existing_memory(memories_repo, "event", trip["event_key"])
+        if existing:
+            continue
+
+        file_ids = _filter_life_photos([p[0] for p in photos])
+        if len(file_ids) < threshold:
+            continue
+        file_ids = file_ids[:MAX_MEMORY_PHOTOS]
+        trip_photo_ids.update(file_ids)
+
+        start_date = trip["start_date"]
+        end_date = trip["end_date"]
+        unique_dates = trip["unique_dates"]
+        title = f"{start_date[:7]} 旅行"
+        if len(unique_dates) > 1:
+            title += f" ({len(unique_dates)}天)"
+
+        m = Memory(
+            category=CATEGORY_LIFE,
+            memory_type="event",
+            title=title,
+            photo_ids=json.dumps(file_ids),
+            cover_file_id=file_ids[0],
+            payload=json.dumps({
+                "event_key": trip["event_key"],
+                "event_type": "trip",
+                "start_date": start_date,
+                "end_date": end_date,
+                "location_count": len(trip["location_keys"]),
+            }),
+        )
+        mid = memories_repo.insert(m)
+        m.id = mid
+        memories.append(m)
+        logger.info(f"旅行回忆: {title}, {len(file_ids)} 张, 位置={len(trip['location_keys'])}")
+
+    for segment in _build_event_segments(rows, gps_delta=gps_delta):
+        photos = segment["photos"]
+        if len(photos) < threshold:
+            continue
+
+        unique_dates = segment["unique_dates"]
         if len(unique_dates) < 1:
             continue
 
         # 检查是否已存在
-        location_key = f"{lat_r},{lon_r}"
-        existing = _find_existing_memory(memories_repo, "event", location_key)
+        location_key = segment["location_key"]
+        start_date = segment["start_date"]
+        end_date = segment["end_date"]
+        event_key = f"{location_key}|{start_date}|{end_date}"
+        existing = _find_existing_memory(memories_repo, "event", event_key)
         if existing:
             continue
 
-        file_ids = [p[0] for p in photos[:20]]
+        file_ids = [p[0] for p in photos]
+        if trip_photo_ids and len(set(file_ids) & trip_photo_ids) / max(1, len(file_ids)) > 0.6:
+            continue
         # 只保留生活样片分类的照片
         file_ids = _filter_life_photos(file_ids)
         if len(file_ids) < threshold:
             continue
-        start_date = min(dates)
-        end_date = max(dates)
+        file_ids = file_ids[:MAX_MEMORY_PHOTOS]
 
         # 判断是否为 trip（跨多天且 ≥3天）
-        from datetime import datetime
         try:
             start_dt = datetime.strptime(start_date, "%Y-%m-%d")
             end_dt = datetime.strptime(end_date, "%Y-%m-%d")
             days_diff = (end_dt - start_dt).days
-            event_type = "trip" if days_diff >= 3 else "event"
+            event_type = "trip" if 2 <= days_diff <= MAX_EVENT_SPAN_DAYS else "event"
         except:
             event_type = "event"
 
@@ -469,12 +644,13 @@ def discover_event_memories(threshold: int = 5, gps_delta: float = 0.01) -> List
             title += f" ({len(unique_dates)}天)"
 
         m = Memory(
-            category=1,
+            category=CATEGORY_LIFE,
             memory_type="event",
             title=title,
             photo_ids=json.dumps(file_ids),
             cover_file_id=file_ids[0],
             payload=json.dumps({
+                "event_key": event_key,
                 "event_type": event_type,
                 "gps_cluster": location_key,
                 "start_date": start_date,
@@ -505,6 +681,10 @@ def _find_existing_memory(memories_repo: MemoriesRepository, memory_type: str, p
             if "cluster_id" in payload and str(payload["cluster_id"]) == payload_key:
                 return mid
             if "event_id" in payload and str(payload["event_id"]) == payload_key:
+                return mid
+            if "event_key" in payload and payload["event_key"] == payload_key:
+                return mid
+            if "gps_cluster" in payload and payload["gps_cluster"] == payload_key:
                 return mid
             if "scene_cluster_idx" in payload and str(payload["scene_cluster_idx"]) == payload_key:
                 return mid

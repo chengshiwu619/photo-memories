@@ -1,5 +1,7 @@
 from typing import List, Optional, Tuple
 from core.models import PhotoMetadata
+from config import CATEGORY_LIFE, CATEGORY_SAMPLE
+from business.classifier.category_rules import category_match_sql
 
 
 PhotoDiscoveryRow = Tuple[int, str, Optional[str], Optional[int]]
@@ -43,11 +45,17 @@ class PhotoMetadataRepository:
             conn.execute("UPDATE photo_metadata SET is_starred = ? WHERE file_id = ?", (1 if starred else 0, file_id))
 
     def get_starred_file_ids(self, category: Optional[int] = None) -> List[int]:
-        query = "SELECT file_id FROM photo_metadata WHERE is_starred = 1"
+        query = "SELECT pm.file_id FROM photo_metadata pm"
         params = []
         if category is not None:
-            query += " AND file_id IN (SELECT id FROM files f JOIN folder_categories fc ON f.folder_path = fc.folder_path WHERE fc.category = ?)"
+            query += """
+                JOIN files f ON pm.file_id = f.id
+                LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
+                WHERE pm.is_starred = 1
+                  AND """ + category_match_sql(category)
             params.append(category)
+        else:
+            query += " WHERE pm.is_starred = 1"
         with self.db.connect() as conn:
             return [r[0] for r in conn.execute(query, params).fetchall()]
 
@@ -73,9 +81,11 @@ class PhotoMetadataRepository:
         if not month_days:
             return []
         conditions = " OR ".join("substr(pm.date_taken, 6, 5) = ?" for _ in month_days)
+        life_match = category_match_sql(CATEGORY_LIFE)
         with self.db.connect() as conn:
             rows = conn.execute(f"""
-                SELECT f.id, f.folder_path, pm.date_taken, fc.category
+                SELECT f.id, f.folder_path, pm.date_taken,
+                       CASE WHEN {life_match} THEN {CATEGORY_LIFE} ELSE {CATEGORY_SAMPLE} END AS category
                 FROM files f
                 JOIN photo_metadata pm ON f.id = pm.file_id
                 LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
@@ -85,13 +95,15 @@ class PhotoMetadataRepository:
                   AND pm.thumbnail_path IS NOT NULL AND pm.thumbnail_path != '__FAILED__'
                   AND ({conditions})
                 ORDER BY pm.date_taken DESC
-            """, month_days).fetchall()
+            """, [CATEGORY_LIFE] + month_days).fetchall()
         return rows
 
     def get_recent_photos(self, since: str, limit: int = 200) -> List[PhotoDiscoveryRow]:
+        life_match = category_match_sql(CATEGORY_LIFE)
         with self.db.connect() as conn:
-            rows = conn.execute("""
-                SELECT f.id, f.folder_path, pm.date_taken, fc.category
+            rows = conn.execute(f"""
+                SELECT f.id, f.folder_path, pm.date_taken,
+                       CASE WHEN {life_match} THEN {CATEGORY_LIFE} ELSE {CATEGORY_SAMPLE} END AS category
                 FROM files f
                 JOIN photo_metadata pm ON f.id = pm.file_id
                 LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
@@ -102,7 +114,7 @@ class PhotoMetadataRepository:
                   AND pm.date_taken >= ?
                 ORDER BY pm.date_taken DESC
                 LIMIT ?
-            """, (since, limit)).fetchall()
+            """, (CATEGORY_LIFE, since, limit)).fetchall()
         return rows
 
     def update_phash(self, file_id: int, phash: str, is_duplicate_of: Optional[int] = None):
