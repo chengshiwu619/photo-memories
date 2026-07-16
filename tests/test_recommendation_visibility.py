@@ -1,3 +1,5 @@
+from itertools import groupby
+
 from db_manager import Database
 
 
@@ -37,7 +39,7 @@ def _insert_photo(conn, tmp_path, photo_id, category=1, thumbnail=True, failed=F
 
 
 def test_category_batch_includes_unclassified_photo_without_thumbnail(tmp_path):
-    from ui.recommendation import load_category_photos_batch
+    from business.recommendation import load_category_photos_batch
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -58,7 +60,7 @@ def test_category_batch_includes_unclassified_photo_without_thumbnail(tmp_path):
 
 
 def test_category_batch_includes_video_without_thumbnail(tmp_path):
-    from ui.recommendation import load_category_photos_batch
+    from business.recommendation import load_category_photos_batch
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -79,7 +81,7 @@ def test_category_batch_includes_video_without_thumbnail(tmp_path):
 
 
 def test_category_batch_can_require_existing_thumbnail(tmp_path):
-    from ui.recommendation import load_category_photos_batch
+    from business.recommendation import load_category_photos_batch
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -100,7 +102,7 @@ def test_category_batch_can_require_existing_thumbnail(tmp_path):
 
 
 def test_memory_photos_filter_failed_refs_without_empty_slots(tmp_path):
-    from ui.recommendation import _load_ranked_memory_photos
+    from business.recommendation import _load_ranked_memory_photos
     import json
 
     db = Database(str(tmp_path / "photos.db"))
@@ -128,7 +130,7 @@ def test_memory_photos_filter_failed_refs_without_empty_slots(tmp_path):
 
 
 def test_memory_below_visible_threshold_is_skipped(tmp_path):
-    from ui.recommendation import _load_ranked_memory_photos
+    from business.recommendation import _load_ranked_memory_photos
     import json
 
     db = Database(str(tmp_path / "photos.db"))
@@ -154,7 +156,7 @@ def test_memory_below_visible_threshold_is_skipped(tmp_path):
 
 
 def test_memory_below_threshold_can_be_supplemented(tmp_path):
-    from ui.recommendation import _load_ranked_memory_photos
+    from business.recommendation import _load_ranked_memory_photos
     import json
 
     db = Database(str(tmp_path / "photos.db"))
@@ -183,7 +185,7 @@ def test_memory_below_threshold_can_be_supplemented(tmp_path):
 
 
 def test_load_photos_from_ids_can_preserve_memory_order(tmp_path):
-    from ui.recommendation import load_photos_from_ids
+    from business.recommendation import load_photos_from_ids
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -204,7 +206,7 @@ def test_load_photos_from_ids_can_preserve_memory_order(tmp_path):
 
 
 def test_rank_category_filters_pending_and_missing_thumbnails(tmp_path):
-    from ui.recommendation import load_category_photos_batch, rank_category_photos
+    from business.recommendation import load_category_photos_batch, rank_category_photos
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -228,7 +230,7 @@ def test_rank_category_filters_pending_and_missing_thumbnails(tmp_path):
 
 
 def test_category_batch_can_exclude_recently_shown_photos(tmp_path):
-    from ui.recommendation import load_category_photos_batch
+    from business.recommendation import load_category_photos_batch
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -260,7 +262,7 @@ def test_category_batch_can_exclude_recently_shown_photos(tmp_path):
 
 def test_sample_keyword_in_file_name_overrides_life_folder_for_random_category(tmp_path):
     from config import CATEGORY_LIFE, CATEGORY_SAMPLE
-    from ui.recommendation import count_category_photos, load_category_photos_batch
+    from business.recommendation import count_category_photos, load_category_photos_batch
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -299,7 +301,7 @@ def test_sample_keyword_in_file_name_overrides_life_folder_for_random_category(t
 
 def test_sample_keyword_in_parent_folder_path_overrides_child_life_category(tmp_path):
     from config import CATEGORY_LIFE, CATEGORY_SAMPLE
-    from ui.recommendation import count_category_photos, load_category_photos_batch
+    from business.recommendation import count_category_photos, load_category_photos_batch
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -355,7 +357,7 @@ def test_sample_keyword_in_parent_folder_path_overrides_child_life_category(tmp_
 
 def test_strong_sample_source_overrides_life_folder_for_random_category(tmp_path):
     from config import CATEGORY_LIFE, CATEGORY_SAMPLE
-    from ui.recommendation import count_category_photos, load_category_photos_batch
+    from business.recommendation import count_category_photos, load_category_photos_batch
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -386,7 +388,7 @@ def test_strong_sample_source_overrides_life_folder_for_random_category(tmp_path
 
 def test_strong_life_source_overrides_sample_folder_for_random_category(tmp_path):
     from config import CATEGORY_LIFE, CATEGORY_SAMPLE
-    from ui.recommendation import count_category_photos, load_category_photos_batch
+    from business.recommendation import count_category_photos, load_category_photos_batch
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -416,9 +418,66 @@ def test_strong_life_source_overrides_sample_folder_for_random_category(tmp_path
     assert life_count == 1
 
 
+def test_photos_moments_tree_is_always_life_for_random_category(tmp_path):
+    from config import CATEGORY_LIFE, CATEGORY_SAMPLE
+    from business.recommendation import count_category_photos, load_category_photos_batch
+
+    db = Database(str(tmp_path / "photos.db"))
+    db.init_tables()
+    moments_folder = r"\\crh\homes\waxzml\Photos\Moments\new"
+    near_miss_folder = r"\\crh\homes\waxzml\Photos\MomentsBackup\new"
+
+    with db.connect() as conn:
+        for photo_id, folder_path in ((1, moments_folder), (2, near_miss_folder)):
+            thumb = tmp_path / "thumbs" / f"{photo_id}.jpg"
+            _write_thumb(thumb)
+            file_name = "JP-Model-Name-Series-001.jpg"
+            conn.execute(
+                """
+                INSERT INTO files
+                    (id, file_path, file_name, folder_path, folder_name, file_mtime, is_image)
+                VALUES (?, ?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    photo_id,
+                    folder_path + "\\" + file_name,
+                    file_name,
+                    folder_path,
+                    "new",
+                    "2026-06-02T12:00:00",
+                ),
+            )
+            conn.execute(
+                "INSERT INTO folder_categories (folder_path, category) VALUES (?, ?)",
+                (folder_path, CATEGORY_SAMPLE),
+            )
+            conn.execute(
+                """
+                INSERT INTO photo_metadata
+                    (file_id, thumbnail_path, width, height, date_taken, category)
+                VALUES (?, ?, 100, 80, ?, ?)
+                """,
+                (photo_id, str(thumb), "2026-06-02T12:00:00", CATEGORY_SAMPLE),
+            )
+
+    conn = db.get_persistent_connection()
+    try:
+        sample_photos = load_category_photos_batch(conn, CATEGORY_SAMPLE, 0, limit=10)
+        life_photos = load_category_photos_batch(conn, CATEGORY_LIFE, 0, limit=10)
+        sample_count = count_category_photos(conn, CATEGORY_SAMPLE)
+        life_count = count_category_photos(conn, CATEGORY_LIFE)
+    finally:
+        conn.close()
+
+    assert [photo["id"] for photo in life_photos] == [1]
+    assert [photo["id"] for photo in sample_photos] == [2]
+    assert life_count == 1
+    assert sample_count == 1
+
+
 def test_strong_sample_filename_overrides_mobile_backup_life_source(tmp_path):
     from config import CATEGORY_LIFE, CATEGORY_SAMPLE
-    from ui.recommendation import count_category_photos, load_category_photos_batch
+    from business.recommendation import count_category_photos, load_category_photos_batch
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -456,7 +515,7 @@ def test_strong_sample_filename_overrides_mobile_backup_life_source(tmp_path):
 
 def test_photobook_sequence_filename_overrides_mobile_backup_life_source(tmp_path):
     from config import CATEGORY_LIFE, CATEGORY_SAMPLE
-    from ui.recommendation import count_category_photos, load_category_photos_batch
+    from business.recommendation import count_category_photos, load_category_photos_batch
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -494,7 +553,7 @@ def test_photobook_sequence_filename_overrides_mobile_backup_life_source(tmp_pat
 
 def test_photobook_date_filename_without_sequence_overrides_mobile_backup_life_source(tmp_path):
     from config import CATEGORY_LIFE, CATEGORY_SAMPLE
-    from ui.recommendation import count_category_photos, load_category_photos_batch
+    from business.recommendation import count_category_photos, load_category_photos_batch
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -532,7 +591,7 @@ def test_photobook_date_filename_without_sequence_overrides_mobile_backup_life_s
 
 def test_mobile_backup_camera_filename_remains_life(tmp_path):
     from config import CATEGORY_LIFE, CATEGORY_SAMPLE
-    from ui.recommendation import count_category_photos, load_category_photos_batch
+    from business.recommendation import count_category_photos, load_category_photos_batch
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -570,7 +629,7 @@ def test_mobile_backup_camera_filename_remains_life(tmp_path):
 
 def test_mobile_backup_nested_camera_filename_stays_life_after_sample_override(tmp_path):
     from config import CATEGORY_LIFE, CATEGORY_SAMPLE
-    from ui.recommendation import count_category_photos, load_category_photos_batch
+    from business.recommendation import count_category_photos, load_category_photos_batch
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -612,7 +671,7 @@ def test_mobile_backup_nested_camera_filename_stays_life_after_sample_override(t
 
 def test_mobile_backup_legacy_iphone_img_number_stays_life_after_sample_override(tmp_path):
     from config import CATEGORY_LIFE, CATEGORY_SAMPLE
-    from ui.recommendation import count_category_photos, load_category_photos_batch
+    from business.recommendation import count_category_photos, load_category_photos_batch
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -654,7 +713,7 @@ def test_mobile_backup_legacy_iphone_img_number_stays_life_after_sample_override
 
 def test_photo_sample_override_beats_moments_source_for_random_category(tmp_path):
     from config import CATEGORY_LIFE, CATEGORY_SAMPLE
-    from ui.recommendation import count_category_photos, load_category_photos_batch
+    from business.recommendation import count_category_photos, load_category_photos_batch
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -689,7 +748,7 @@ def test_photo_sample_override_beats_moments_source_for_random_category(tmp_path
 
 def test_moments_mobile_dcim_camera_filename_stays_life_even_after_sample_override(tmp_path):
     from config import CATEGORY_LIFE, CATEGORY_SAMPLE
-    from ui.recommendation import count_category_photos, load_category_photos_batch
+    from business.recommendation import count_category_photos, load_category_photos_batch
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -731,7 +790,7 @@ def test_moments_mobile_dcim_camera_filename_stays_life_even_after_sample_overri
 
 def test_film_output_life_tree_beats_photo_sample_override_for_random_category(tmp_path):
     from config import CATEGORY_LIFE, CATEGORY_SAMPLE
-    from ui.recommendation import count_category_photos, load_category_photos_batch
+    from business.recommendation import count_category_photos, load_category_photos_batch
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -773,7 +832,7 @@ def test_film_output_life_tree_beats_photo_sample_override_for_random_category(t
 
 def test_film_output_sample_collect_exception_stays_sample_for_random_category(tmp_path):
     from config import CATEGORY_LIFE, CATEGORY_SAMPLE
-    from ui.recommendation import count_category_photos, load_category_photos_batch
+    from business.recommendation import count_category_photos, load_category_photos_batch
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -805,7 +864,7 @@ def test_film_output_sample_collect_exception_stays_sample_for_random_category(t
 
 def test_photo_category_override_moves_single_photo_to_sample(tmp_path):
     from config import CATEGORY_LIFE, CATEGORY_SAMPLE
-    from ui.recommendation import count_category_photos, load_category_photos_batch
+    from business.recommendation import count_category_photos, load_category_photos_batch
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -833,7 +892,7 @@ def test_photo_category_override_moves_single_photo_to_sample(tmp_path):
 
 
 def test_rank_category_prefers_unshown_random_pool_when_enough_candidates(tmp_path):
-    from ui.recommendation import rank_category_photos
+    from business.recommendation import rank_category_photos
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -863,8 +922,8 @@ def test_rank_category_prefers_unshown_random_pool_when_enough_candidates(tmp_pa
 
 
 def test_rank_category_photos_excludes_already_loaded_ids(tmp_path, monkeypatch):
-    import ui.recommendation as rec
-    from ui.recommendation import rank_category_photos
+    import business.recommendation as rec
+    from business.recommendation import rank_category_photos
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -887,7 +946,7 @@ def test_rank_category_photos_excludes_already_loaded_ids(tmp_path, monkeypatch)
 
 
 def test_rank_category_supplements_after_dedup_to_keep_limited_pool_size(monkeypatch):
-    import ui.recommendation as rec
+    import business.recommendation as rec
 
     def photo(photo_id):
         return {
@@ -922,7 +981,7 @@ def test_rank_category_supplements_after_dedup_to_keep_limited_pool_size(monkeyp
     assert calls[2]["exclude_ids"] == {1, 2, 3, 4}
 
 def test_large_exclude_ids_use_temp_table_for_category_and_starred(tmp_path):
-    import ui.recommendation as rec
+    import business.recommendation as rec
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()
@@ -949,7 +1008,7 @@ def test_large_exclude_ids_use_temp_table_for_category_and_starred(tmp_path):
 
 def test_limited_memory_loading_stops_after_first_memory_batch(monkeypatch):
     import json
-    import ui.recommendation as rec
+    import business.recommendation as rec
 
     class FakeCursor:
         def __init__(self):
@@ -1008,7 +1067,7 @@ def test_limited_memory_loading_stops_after_first_memory_batch(monkeypatch):
 
 def test_limited_memory_loading_respects_memory_row_scan_limit(monkeypatch):
     import json
-    import ui.recommendation as rec
+    import business.recommendation as rec
 
     class FakeCursor:
         def __init__(self):
@@ -1053,7 +1112,7 @@ def test_limited_memory_loading_respects_memory_row_scan_limit(monkeypatch):
 
 
 def test_rank_category_limited_load_uses_foreground_memory_row_limit(monkeypatch):
-    import ui.recommendation as rec
+    import business.recommendation as rec
 
     calls = []
 
@@ -1071,7 +1130,7 @@ def test_rank_category_limited_load_uses_foreground_memory_row_limit(monkeypatch
 
 
 def test_rank_category_limited_load_uses_foreground_memory_priority_limit(monkeypatch):
-    import ui.recommendation as rec
+    import business.recommendation as rec
 
     calls = []
 
@@ -1087,17 +1146,17 @@ def test_rank_category_limited_load_uses_foreground_memory_priority_limit(monkey
     assert calls[0]["limit"] == rec.FOREGROUND_MEMORY_PRIORITY_LIMIT
 
 
-def test_random_thumbnail_window_does_not_triple_overfetch(monkeypatch):
-    import ui.recommendation as rec
+def test_random_thumbnail_window_uses_one_global_hash_query(monkeypatch):
+    import business.recommendation as rec
 
     calls = []
 
     monkeypatch.setattr(rec, "_max_file_id", lambda _db: 1000)
-    monkeypatch.setattr(rec.random, "randint", lambda _start, _end: 100)
+    monkeypatch.setattr(rec.random, "randint", lambda _start, _end: 12345)
 
     def fake_rows(_db, _cat_id, **kwargs):
         calls.append(kwargs)
-        return [{"id": i} for i in range(1, kwargs["limit"] + 1)]
+        return [{"id": i} for i in range(kwargs["limit"])]
 
     monkeypatch.setattr(rec, "_load_category_photo_rows", fake_rows)
     monkeypatch.setattr(rec, "_rows_to_visible_photos", lambda rows, **_kwargs: list(rows))
@@ -1105,11 +1164,13 @@ def test_random_thumbnail_window_does_not_triple_overfetch(monkeypatch):
     photos = rec._load_category_photos_random_window(object(), 1, 50, require_thumbnail=True)
 
     assert len(photos) == 50
+    assert len(calls) == 1
     assert calls[0]["limit"] == 50
+    assert "1103515245" in calls[0]["order_clause"]
 
 
 def test_interleave_by_time_preserves_same_day_overflow():
-    import ui.recommendation as rec
+    import business.recommendation as rec
 
     photos = [
         {
@@ -1127,8 +1188,8 @@ def test_interleave_by_time_preserves_same_day_overflow():
     assert {p["id"] for p in interleaved} == {p["id"] for p in photos}
 
 
-def test_spread_nearby_photos_limits_default_folder_density():
-    import ui.recommendation as rec
+def test_spread_nearby_photos_keeps_short_folder_event_together():
+    import business.recommendation as rec
 
     photos = [
         {
@@ -1150,21 +1211,13 @@ def test_spread_nearby_photos_limits_default_folder_density():
 
     spread = rec._spread_nearby_photos(photos)
 
-    max_streak = 0
-    streak = 0
-    last_folder = None
-    for photo in spread:
-        folder = photo["folder_path"]
-        streak = streak + 1 if folder == last_folder else 1
-        max_streak = max(max_streak, streak)
-        last_folder = folder
-
     assert len(spread) == len(photos)
-    assert max_streak <= rec.DEFAULT_RANDOM_NEARBY_STREAK
+    nearby_positions = [index for index, photo in enumerate(spread) if photo["folder_path"] == "nearby"]
+    assert nearby_positions == list(range(min(nearby_positions), max(nearby_positions) + 1))
 
 
 def test_spread_nearby_photos_limits_default_day_density():
-    import ui.recommendation as rec
+    import business.recommendation as rec
 
     photos = [
         {
@@ -1186,21 +1239,13 @@ def test_spread_nearby_photos_limits_default_day_density():
 
     spread = rec._spread_nearby_photos(photos)
 
-    max_streak = 0
-    streak = 0
-    last_day = None
-    for photo in spread:
-        day = photo["date_taken"][:10]
-        streak = streak + 1 if day == last_day else 1
-        max_streak = max(max_streak, streak)
-        last_day = day
-
     assert len(spread) == len(photos)
-    assert max_streak <= rec.DEFAULT_RANDOM_NEARBY_STREAK
+    assert "2026-07-01" in [photo["date_taken"][:10] for photo in spread[:3]]
 
 
-def test_spread_nearby_photos_expands_clicked_or_starred_folder():
-    import ui.recommendation as rec
+def test_random_feed_builds_coherent_memory_runs():
+    import business.recommendation as rec
+    import random
 
     photos = [
         {
@@ -1219,13 +1264,58 @@ def test_spread_nearby_photos_expands_clicked_or_starred_folder():
         }
     ]
 
-    spread = rec._spread_nearby_photos(photos, expanded_folders={"nearby"})
+    spread, boundaries = rec._sequence_memory_segments(
+        photos,
+        rng=random.Random(7),
+        with_boundaries=True,
+    )
+    starts = sorted(boundaries)
+    lengths = [
+        (starts[index + 1] if index + 1 < len(starts) else len(spread)) - start
+        for index, start in enumerate(starts)
+    ]
 
-    assert [p["folder_path"] for p in spread[:rec.EXPANDED_RANDOM_NEARBY_STREAK]] == ["nearby"] * rec.EXPANDED_RANDOM_NEARBY_STREAK
+    assert sorted(photo["id"] for photo in spread) == list(range(1, 27))
+    assert all(length <= rec.MEMORY_SEGMENT_MAX for length in lengths)
+    assert any(length >= rec.MEMORY_SEGMENT_MIN for length in lengths)
+    for index, start in enumerate(starts):
+        end = starts[index + 1] if index + 1 < len(starts) else len(spread)
+        segment = spread[start:end]
+        assert len({photo["folder_path"] for photo in segment}) == 1
+        assert [photo["date_taken"] for photo in segment] == sorted(photo["date_taken"] for photo in segment)
 
 
-def test_spread_nearby_photos_prioritizes_folder_cap_over_day_cap():
-    import ui.recommendation as rec
+def test_memory_runs_take_up_to_25_and_keep_the_actual_short_remainder():
+    import business.recommendation as rec
+    import random
+
+    photos = [
+        {
+            "id": photo_id,
+            "folder_path": "one-event",
+            "date_taken": f"2026-06-01T12:{photo_id:02d}:00",
+            "file_mtime": f"2026-06-01T12:{photo_id:02d}:00",
+        }
+        for photo_id in range(1, 54)
+    ]
+
+    spread, boundaries = rec._sequence_memory_segments(
+        photos,
+        rng=random.Random(9),
+        with_boundaries=True,
+    )
+    starts = sorted(boundaries)
+    lengths = sorted(
+        (starts[index + 1] if index + 1 < len(starts) else len(spread)) - start
+        for index, start in enumerate(starts)
+    )
+
+    assert lengths == [3, 25, 25]
+    assert sorted(photo["id"] for photo in spread) == list(range(1, 54))
+
+
+def test_memory_run_keeps_same_event_together_even_with_interest_arguments():
+    import business.recommendation as rec
 
     photos = [
         {
@@ -1246,11 +1336,12 @@ def test_spread_nearby_photos_prioritizes_folder_cap_over_day_cap():
 
     spread = rec._spread_nearby_photos(photos, expanded_folders={"nearby"}, expanded_days={"2026-06-01"})
 
-    assert spread[rec.EXPANDED_RANDOM_NEARBY_STREAK]["folder_path"] == "other"
+    nearby_positions = [index for index, photo in enumerate(spread) if photo["folder_path"] == "nearby"]
+    assert nearby_positions == list(range(min(nearby_positions), max(nearby_positions) + 1))
 
 
-def test_rank_category_uses_click_or_star_interest_to_allow_nearby_expansion(monkeypatch):
-    import ui.recommendation as rec
+def test_rank_category_ignores_click_or_star_interest_for_memory_segments(monkeypatch):
+    import business.recommendation as rec
 
     def photo(photo_id, folder):
         return {
@@ -1266,16 +1357,24 @@ def test_rank_category_uses_click_or_star_interest_to_allow_nearby_expansion(mon
     monkeypatch.setattr(rec, "load_category_photos_batch", lambda *_args, **_kwargs: list(batch))
     monkeypatch.setattr(rec, "_get_recently_shown_ids", lambda *_args, **_kwargs: set())
     monkeypatch.setattr(rec.random, "shuffle", lambda _items: None)
-    monkeypatch.setattr(rec, "_load_proximity_interest_keys", lambda *_args, **_kwargs: {"folders": {"nearby"}, "days": set()})
+    monkeypatch.setattr(
+        rec,
+        "_load_proximity_interest_keys",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("interest lookup should not run")),
+    )
 
     photos, metrics = rec.rank_category_photos(object(), 1, return_metrics=True, limit=26)
 
-    assert [p["folder_path"] for p in photos[:rec.EXPANDED_RANDOM_NEARBY_STREAK]] == ["nearby"] * rec.EXPANDED_RANDOM_NEARBY_STREAK
-    assert metrics["expanded_folder_count"] == 1
+    assert len(photos) == 26
+    assert max(
+        sum(1 for _ in group)
+        for _folder, group in groupby(photos, key=lambda photo: photo["folder_path"])
+    ) >= rec.MEMORY_SEGMENT_MIN
+    assert metrics["expanded_folder_count"] == 0
 
 
-def test_rank_category_spreads_nearby_photos_without_interest(monkeypatch):
-    import ui.recommendation as rec
+def test_rank_category_keeps_small_event_contiguous_without_interest(monkeypatch):
+    import business.recommendation as rec
 
     def photo(photo_id, folder):
         return {
@@ -1295,11 +1394,69 @@ def test_rank_category_spreads_nearby_photos_without_interest(monkeypatch):
 
     photos = rec.rank_category_photos(object(), 1, limit=7)
 
-    assert [p["folder_path"] for p in photos[:4]] == ["nearby", "nearby", "nearby", "other"]
+    nearby_positions = [index for index, photo in enumerate(photos) if photo["folder_path"] == "nearby"]
+    assert nearby_positions == list(range(min(nearby_positions), max(nearby_positions) + 1))
+
+
+def test_random_diversity_uses_previous_scroll_batch_as_cooldown():
+    import business.recommendation as rec
+
+    previous = [{
+        "id": 1,
+        "folder_path": "same-folder",
+        "date_taken": "2026-06-01T12:00:00",
+    }]
+    candidates = [
+        {
+            "id": 2,
+            "folder_path": "same-folder",
+            "date_taken": "2026-06-01T13:00:00",
+        },
+        {
+            "id": 3,
+            "folder_path": "different-folder",
+            "date_taken": "2025-11-20T12:00:00",
+        },
+    ]
+
+    diversified = rec._diversify_random_photos(candidates, prior_photos=previous)
+
+    assert diversified[0]["id"] == 3
+
+
+def test_rank_category_deduplicates_exact_phash(monkeypatch):
+    import business.recommendation as rec
+
+    def photo(photo_id, phash):
+        return {
+            "id": photo_id,
+            "phash": phash,
+            "file_path": f"photo-{photo_id}.jpg",
+            "folder_path": f"folder-{photo_id}",
+            "date_taken": f"2026-06-{photo_id:02d}T12:00:00",
+            "thumbnail_path": f"thumb-{photo_id}.jpg",
+        }
+
+    monkeypatch.setattr(
+        rec,
+        "_load_ranked_memory_photos",
+        lambda *_args, **_kwargs: [photo(1, "abc123")],
+    )
+    monkeypatch.setattr(
+        rec,
+        "load_category_photos_batch",
+        lambda *_args, **_kwargs: [photo(2, "ABC123"), photo(3, "unique")],
+    )
+    monkeypatch.setattr(rec, "_get_recently_shown_ids", lambda *_args, **_kwargs: set())
+    monkeypatch.setattr(rec.random, "shuffle", lambda _items: None)
+
+    ranked = rec.rank_category_photos(object(), 1, limit=2)
+
+    assert [photo["id"] for photo in ranked] == [1, 3]
 
 
 def test_rank_category_requests_thumbnail_filtered_batches(monkeypatch):
-    import ui.recommendation as rec
+    import business.recommendation as rec
 
     def photo(photo_id):
         return {
@@ -1333,7 +1490,7 @@ def test_rank_category_requests_thumbnail_filtered_batches(monkeypatch):
 
 
 def test_rank_category_limited_pool_defers_recent_filter_to_merge(monkeypatch):
-    import ui.recommendation as rec
+    import business.recommendation as rec
 
     def photo(photo_id):
         return {
@@ -1363,7 +1520,7 @@ def test_rank_category_limited_pool_defers_recent_filter_to_merge(monkeypatch):
 
 
 def test_recently_shown_lookup_can_be_limited_to_candidate_ids(tmp_path):
-    import ui.recommendation as rec
+    import business.recommendation as rec
 
     db = Database(str(tmp_path / "photos.db"))
     db.init_tables()

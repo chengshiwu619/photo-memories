@@ -6,24 +6,35 @@ from typing import Iterable, List
 from config import CATEGORY_LIFE, CATEGORY_SAMPLE
 from db_manager import Database
 from business.classifier.category_rules import (
+    CONFIRMED_SAMPLE_SOURCE,
+    CONFIRMED_SAMPLE_TAG,
     category_match_sql,
     protected_life_override_sql,
     strong_life_source_sql,
     strong_sample_filename_sql,
 )
+from business.deletion_queue import pending_delete_filter_sql
 
 
 DISMISSED_TAG = "nsfw-review:dismissed"
 DISMISSED_SOURCE = "manual"
-VISUAL_REVIEW_TAGS = {
+CALIBRATED_REVIEW_TAG = "nsfw-review:calibrated-v3"
+VISUAL_TRIGGER_TAGS = {
     "nsfw",
     "nude",
     "explicit",
+    "nipples",
+    "female genitals",
+    "vulva",
+    "labia",
+}
+VISUAL_CONTEXT_TAGS = {
     "lingerie",
     "gravure",
     "model portrait",
     "photobook",
 }
+VISUAL_REVIEW_TAGS = VISUAL_TRIGGER_TAGS | VISUAL_CONTEXT_TAGS
 VISUAL_REASON_WEIGHT = 20
 FILENAME_REASON_WEIGHT = 10
 
@@ -38,6 +49,7 @@ class NsfwReviewCandidate:
     width: int | None
     height: int | None
     date_taken: str | None
+    is_starred: bool
     reasons: List[str]
     score: int
 
@@ -52,6 +64,7 @@ class NsfwReviewCandidate:
             "width": self.width,
             "height": self.height,
             "date_taken": self.date_taken,
+            "is_starred": self.is_starred,
             "reasons": list(self.reasons),
             "reason_text": " / ".join(self.reasons),
             "score": self.score,
@@ -59,7 +72,7 @@ class NsfwReviewCandidate:
 
 
 def nsfw_visual_candidates() -> List[str]:
-    return sorted(VISUAL_REVIEW_TAGS)
+    return sorted(VISUAL_TRIGGER_TAGS)
 
 
 def _normalize_tag(tag: str | None) -> str:
@@ -95,8 +108,11 @@ def load_review_candidates(limit=120, offset=0, db=None) -> list[dict]:
     strong_life_source = strong_life_source_sql("f.folder_path")
     filename_sql = strong_sample_filename_sql("f.file_name")
     protected_life_override = protected_life_override_sql("f.folder_path", "f.file_name")
-    visual_placeholders = ",".join("?" for _ in VISUAL_REVIEW_TAGS)
-    params = [CATEGORY_LIFE, *sorted(VISUAL_REVIEW_TAGS), limit, offset]
+    trigger_tags = sorted(VISUAL_TRIGGER_TAGS)
+    review_tags = sorted(VISUAL_REVIEW_TAGS | {CALIBRATED_REVIEW_TAG})
+    trigger_placeholders = ",".join("?" for _ in trigger_tags)
+    visual_placeholders = ",".join("?" for _ in review_tags)
+    params = [*trigger_tags, *review_tags, CATEGORY_LIFE, limit, offset]
     with db.connect() as conn:
         rows = conn.execute(
             f"""
@@ -109,7 +125,13 @@ def load_review_candidates(limit=120, offset=0, db=None) -> list[dict]:
                 pm.width,
                 pm.height,
                 pm.date_taken,
+                pm.is_starred,
                 CASE WHEN {filename_sql} THEN 1 ELSE 0 END AS filename_match,
+                COUNT(DISTINCT CASE
+                    WHEN lower(pt.tag) IN ({trigger_placeholders}) THEN lower(pt.tag)
+                END) AS visual_trigger_count,
+                MAX(CASE WHEN lower(pt.tag) = '{CALIBRATED_REVIEW_TAG}' THEN 1 ELSE 0 END)
+                    AS calibrated_visual_match,
                 GROUP_CONCAT(DISTINCT lower(pt.tag)) AS visual_tags
             FROM files f
             LEFT JOIN folder_categories fc ON f.folder_path = fc.folder_path
@@ -121,17 +143,26 @@ def load_review_candidates(limit=120, offset=0, db=None) -> list[dict]:
             WHERE ({life_sql} OR ({strong_life_source} AND {filename_sql}))
               AND f.is_image = 1
               AND (pm.category IS NULL OR pm.category != {CATEGORY_SAMPLE})
-              AND NOT {protected_life_override}
               AND pm.thumbnail_path IS NOT NULL
               AND pm.thumbnail_path != ''
               AND pm.thumbnail_path != '__FAILED__'
               AND (pm.is_duplicate_of IS NULL OR pm.is_duplicate_of = 0)
               AND (f.path_status IS NULL OR f.path_status NOT IN
                   ('damaged_path', 'missing', 'stat_failed', 'outside_root'))
+              {pending_delete_filter_sql("f")}
               AND {_dismissed_filter_sql("f")}
-              AND ({filename_sql} OR pt.file_id IS NOT NULL)
             GROUP BY f.id
-        ORDER BY pm.date_taken DESC, f.file_mtime DESC, filename_match DESC, f.id DESC
+            HAVING (
+                    filename_match = 1
+                    OR visual_trigger_count >= 2
+                    OR (calibrated_visual_match = 1 AND visual_trigger_count >= 1)
+               )
+               AND (
+                    NOT {protected_life_override}
+                    OR visual_trigger_count >= 2
+                    OR (calibrated_visual_match = 1 AND visual_trigger_count >= 1)
+               )
+            ORDER BY pm.date_taken DESC, f.file_mtime DESC, filename_match DESC, f.id DESC
             LIMIT ? OFFSET ?
             """,
             params,
@@ -144,7 +175,7 @@ def load_review_candidates(limit=120, offset=0, db=None) -> list[dict]:
             reasons.append("filename:sample-pattern")
         visual_tags = [
             tag for tag in (_normalize_tag(t) for t in (row["visual_tags"] or "").split(","))
-            if tag
+            if tag in VISUAL_REVIEW_TAGS
         ]
         for tag in visual_tags:
             reasons.append(f"visual:{tag}")
@@ -157,6 +188,7 @@ def load_review_candidates(limit=120, offset=0, db=None) -> list[dict]:
             width=row["width"],
             height=row["height"],
             date_taken=row["date_taken"],
+            is_starred=bool(row["is_starred"]),
             reasons=reasons,
             score=_reason_score(reasons),
         )
@@ -217,9 +249,8 @@ def mark_review_candidate_as_sample(file_id: int, db=None) -> bool:
 
     db = db or Database()
     with db.connect() as conn:
-        protected_life_override = protected_life_override_sql("f.folder_path", "f.file_name")
         row = conn.execute(
-            f"SELECT 1 FROM files f WHERE f.id = ? AND NOT {protected_life_override}",
+            "SELECT 1 FROM files WHERE id = ?",
             (fid,),
         ).fetchone()
         if not row:
@@ -233,6 +264,10 @@ def mark_review_candidate_as_sample(file_id: int, db=None) -> bool:
                 indexed_at = datetime('now')
             """,
             (fid, CATEGORY_SAMPLE),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO photo_tags (file_id, tag, source) VALUES (?, ?, ?)",
+            (fid, CONFIRMED_SAMPLE_TAG, CONFIRMED_SAMPLE_SOURCE),
         )
         return True
 
@@ -261,9 +296,8 @@ def mark_review_candidates_as_sample(file_ids: Iterable[int], db=None) -> dict:
             for start in range(0, len(ids), 500):
                 batch = ids[start:start + 500]
                 placeholders = ",".join("?" for _ in batch)
-                protected_life_override = protected_life_override_sql("f.folder_path", "f.file_name")
                 rows = conn.execute(
-                    f"SELECT f.id FROM files f WHERE f.id IN ({placeholders}) AND NOT {protected_life_override}",
+                    f"SELECT id FROM files WHERE id IN ({placeholders})",
                     batch,
                 ).fetchall()
                 found_ids = [int(row["id"]) for row in rows]
@@ -279,6 +313,13 @@ def mark_review_candidates_as_sample(file_ids: Iterable[int], db=None) -> dict:
                         indexed_at = datetime('now')
                     """,
                     [(fid, CATEGORY_SAMPLE) for fid in found_ids],
+                )
+                conn.executemany(
+                    "INSERT OR IGNORE INTO photo_tags (file_id, tag, source) VALUES (?, ?, ?)",
+                    [
+                        (fid, CONFIRMED_SAMPLE_TAG, CONFIRMED_SAMPLE_SOURCE)
+                        for fid in found_ids
+                    ],
                 )
                 updated += len(found_ids)
             conn.commit()

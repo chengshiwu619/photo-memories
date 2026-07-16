@@ -11,7 +11,9 @@ def test_cli_help():
     )
     assert result.returncode == 0
     assert "NAS" in result.stdout
-    assert "ui" in result.stdout
+    assert "web" in result.stdout
+    assert "setup" in result.stdout
+    assert "ui" not in result.stdout
 
 def test_cli_rejects_removed_scan_command():
     env = os.environ.copy()

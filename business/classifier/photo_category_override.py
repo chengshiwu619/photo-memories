@@ -5,6 +5,7 @@ from datetime import datetime
 from config import CATEGORY_LIFE, CATEGORY_SAMPLE
 from db_manager import Database
 from logger_setup import logger
+from business.classifier.category_rules import CONFIRMED_SAMPLE_SOURCE, CONFIRMED_SAMPLE_TAG
 
 
 def batch_set_photo_category(file_ids, category=CATEGORY_SAMPLE, batch_size=1000, user="user", db=None):
@@ -58,6 +59,22 @@ def batch_set_photo_category(file_ids, category=CATEGORY_SAMPLE, batch_size=1000
                     """,
                     [(fid, category) for fid in found],
                 )
+                if category == CATEGORY_SAMPLE:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO photo_tags (file_id, tag, source) VALUES (?, ?, ?)",
+                        [
+                            (fid, CONFIRMED_SAMPLE_TAG, CONFIRMED_SAMPLE_SOURCE)
+                            for fid in found
+                        ],
+                    )
+                elif category == CATEGORY_LIFE:
+                    conn.executemany(
+                        "DELETE FROM photo_tags WHERE file_id = ? AND tag = ? AND source = ?",
+                        [
+                            (fid, CONFIRMED_SAMPLE_TAG, CONFIRMED_SAMPLE_SOURCE)
+                            for fid in found
+                        ],
+                    )
                 updated += len(found)
             conn.commit()
         except Exception:

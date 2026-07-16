@@ -3,7 +3,6 @@ import sys
 
 from logger_setup import logger, mark_startup, mark_ok_exit, check_previous_crash, _write_crash
 from db_manager import Database
-from ui.app import main as ui_main
 
 
 def run_setup():
@@ -37,9 +36,9 @@ def main():
     check_previous_crash()
 
     parser = argparse.ArgumentParser(description="NAS 照片回忆系统")
-    parser.add_argument("command", nargs="?", default="ui",
-                        choices=["ui", "setup"],
-                        help="执行步骤: ui 或 setup")
+    parser.add_argument("command", nargs="?", default="web",
+                        choices=["web", "setup"],
+                        help="执行步骤: web 或 setup")
     args = parser.parse_args()
     logger.info(f"命令行参数: {args.command}")
 
@@ -53,8 +52,10 @@ def main():
     if is_configured():
         Database().init_tables()
 
-    if args.command == "ui":
-        ui_main()
+    if args.command == "web":
+        from webapp import run_web
+
+        run_web()
 
     mark_ok_exit()
 
@@ -67,11 +68,3 @@ if __name__ == "__main__":
         exc_type, exc_value, exc_tb = sys.exc_info()
         _write_crash(exc_type, exc_value, exc_tb, source="main")
         traceback.print_exc()
-        try:
-            import tkinter.messagebox as mb
-            mb.showerror(
-                "NAS 照片回忆 - 启动失败",
-                f"程序遇到错误，详情请查看 storage/logs/crash.log\n\n{exc_value}",
-            )
-        except Exception:
-            pass

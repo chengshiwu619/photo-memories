@@ -390,7 +390,7 @@ class TestRecommendationPathFilter:
 
     def test_damaged_path_excluded_from_batch(self, tmp_path):
         """damaged_path 状态的照片不出现在瀑布流查询结果中。"""
-        from ui.recommendation import load_category_photos_batch
+        from business.recommendation import load_category_photos_batch
 
         db_path = str(tmp_path / "test.db")
         from db_manager import Database
@@ -415,7 +415,7 @@ class TestRecommendationPathFilter:
 
     def test_null_path_status_still_visible(self, tmp_path):
         """旧数据 path_status=NULL 仍然可见（向后兼容）。"""
-        from ui.recommendation import load_category_photos_batch
+        from business.recommendation import load_category_photos_batch
 
         db_path = str(tmp_path / "test.db")
         from db_manager import Database

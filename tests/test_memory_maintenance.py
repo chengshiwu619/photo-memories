@@ -44,6 +44,13 @@ def _make_db(db_path):
         CREATE TABLE IF NOT EXISTS sample_keywords (
             keyword TEXT PRIMARY KEY
         );
+        CREATE TABLE IF NOT EXISTS photo_tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL,
+            tag TEXT NOT NULL,
+            source TEXT NOT NULL,
+            UNIQUE(file_id, tag, source)
+        );
         CREATE TABLE IF NOT EXISTS folder_categories (
             folder_path TEXT PRIMARY KEY,
             category INTEGER DEFAULT 1
@@ -112,7 +119,7 @@ class TestMemoryWaterfallFilter:
         conn.commit()
         conn.close()
 
-        import ui.recommendation as rec
+        import business.recommendation as rec
         from db_manager import Database
         db = Database(db_path)
         monkeypatch.setattr(rec, "Database", lambda: db)
@@ -152,7 +159,7 @@ class TestMemoryWaterfallFilter:
         conn.commit()
         conn.close()
 
-        import ui.recommendation as rec
+        import business.recommendation as rec
         from db_manager import Database
         db = Database(db_path)
         monkeypatch.setattr(rec, "Database", lambda: db)
@@ -178,7 +185,7 @@ class TestMemoryWaterfallFilter:
         conn.commit()
         conn.close()
 
-        import ui.recommendation as rec
+        import business.recommendation as rec
         from db_manager import Database
         db = Database(db_path)
         monkeypatch.setattr(rec, "Database", lambda: db)
@@ -362,7 +369,7 @@ class TestMemoryMaintenanceCLI:
             monkeypatch.setattr(mm, "get_settings", lambda: _fake_settings(db_path, tmp_path))
             mm.disable_unrenderable_memories(dry_run=False, verbose=False)
 
-            import ui.recommendation as rec
+            import business.recommendation as rec
             from db_manager import Database
             db = Database(db_path)
             monkeypatch.setattr(rec, "Database", lambda: db)

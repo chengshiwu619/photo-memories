@@ -36,8 +36,39 @@ def test_batch_set_photo_category_updates_only_requested_files(tmp_path):
         rows = conn.execute(
             "SELECT file_id, category FROM photo_metadata ORDER BY file_id"
         ).fetchall()
+        confirmed_ids = {
+            row[0]
+            for row in conn.execute(
+                "SELECT file_id FROM photo_tags WHERE tag = 'category:confirmed-sample' AND source = 'manual'"
+            ).fetchall()
+        }
 
     assert result["requested"] == 3
     assert result["updated"] == 2
     assert result["missing"] == 1
     assert [(r["file_id"], r["category"]) for r in rows] == [(1, 2), (2, 2), (3, None)]
+    assert confirmed_ids == {1, 2}
+
+
+def test_setting_photo_back_to_life_removes_confirmed_sample_override(tmp_path):
+    from config import CATEGORY_LIFE, CATEGORY_SAMPLE
+    from business.classifier.photo_category_override import batch_set_photo_category
+
+    db = Database(str(tmp_path / "photos.db"))
+    db.init_tables()
+    with db.connect() as conn:
+        _insert_file(conn, 1, folder_path="/Photos/Moments/new")
+
+    batch_set_photo_category([1], CATEGORY_SAMPLE, db=db)
+    batch_set_photo_category([1], CATEGORY_LIFE, db=db)
+
+    with db.connect() as conn:
+        category = conn.execute(
+            "SELECT category FROM photo_metadata WHERE file_id = 1"
+        ).fetchone()[0]
+        marker = conn.execute(
+            "SELECT 1 FROM photo_tags WHERE file_id = 1 AND tag = 'category:confirmed-sample' AND source = 'manual'"
+        ).fetchone()
+
+    assert category == CATEGORY_LIFE
+    assert marker is None

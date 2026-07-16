@@ -97,3 +97,37 @@ def test_open_clip_present_importerror_during_model_load_is_model_failure(monkey
     assert len(logger.errors) == 1
     assert "model_load_failed" in logger.errors[0]
     assert "huggingface_hub cache error" in logger.errors[0]
+
+
+def test_missing_local_model_never_falls_back_to_remote_pretrained(monkeypatch):
+    ce = _reload_clip_encoder(monkeypatch)
+    logger = _CaptureLogger()
+    create_calls = []
+
+    fake_open_clip = types.SimpleNamespace(
+        create_model_and_transforms=lambda *args, **kwargs: create_calls.append((args, kwargs)),
+    )
+    fake_torch = types.SimpleNamespace(
+        __version__="2.5.1+cu121",
+        cuda=types.SimpleNamespace(is_available=lambda: True),
+    )
+    monkeypatch.setitem(sys.modules, "open_clip", fake_open_clip)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(ce, "logger", logger)
+    monkeypatch.setattr(ce, "_local_pretrained_path", lambda: None)
+
+    assert ce._load_model(preferred_device="cpu") is False
+    assert create_calls == []
+    assert "local SigLIP model cache missing" in logger.errors[0]
+
+
+def test_local_snapshot_resolution_only_reads_existing_cache(monkeypatch, tmp_path):
+    ce = _reload_clip_encoder(monkeypatch)
+    cache_root = tmp_path / "hub"
+    snapshot = cache_root / "models--example--model" / "snapshots" / "abc123"
+    snapshot.mkdir(parents=True)
+    (snapshot / "weights.bin").write_bytes(b"local")
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache_root))
+
+    assert ce._local_hf_snapshot("example/model", ("weights.bin",)) == snapshot
+    assert ce._local_hf_snapshot("example/model", ("missing.bin",)) is None

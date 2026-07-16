@@ -1,6 +1,7 @@
 import numpy as np
+import os
 import sys
-import warnings
+from pathlib import Path
 from typing import Optional, List, Tuple
 
 from logger_setup import logger
@@ -12,18 +13,9 @@ _preprocess = None
 _tokenizer = None
 _device = None
 _model_name = "ViT-SO400M-14-SigLIP-384"
-_pretrained = "webli"
+_tokenizer_repo = "timm/ViT-B-16-SigLIP"
+_model_repo = "timm/ViT-SO400M-14-SigLIP-384"
 _missing_open_clip_warned = False
-_hf_warning_filters_installed = False
-
-
-def _install_hf_warning_filters():
-    global _hf_warning_filters_installed
-    if _hf_warning_filters_installed:
-        return
-    _hf_warning_filters_installed = True
-    warnings.filterwarnings("once", message=".*unauthenticated.*", module="huggingface_hub.*")
-    warnings.filterwarnings("once", message=".*symlink.*", module="huggingface_hub.*")
 
 
 def _reset_model():
@@ -69,7 +61,7 @@ def _log_model_load_failed(exc, target_device, open_clip_imported):
         runtime.get("cuda_available"),
         open_clip_imported,
         _model_name,
-        _pretrained,
+        "local-only",
         exc,
     )
 
@@ -91,6 +83,81 @@ def _import_open_clip():
         raise
 
 
+def _hf_cache_root() -> Path:
+    configured = os.environ.get("HF_HUB_CACHE")
+    if configured:
+        return Path(configured).expanduser()
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        return Path(hf_home).expanduser() / "hub"
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def _local_hf_snapshot(repo_id: str, required_files=()) -> Optional[Path]:
+    """Resolve an existing Hugging Face cache snapshot without any network call."""
+    repo_dir = _hf_cache_root() / ("models--" + repo_id.replace("/", "--"))
+    snapshots_dir = repo_dir / "snapshots"
+    candidates = []
+
+    ref_path = repo_dir / "refs" / "main"
+    try:
+        revision = ref_path.read_text(encoding="utf-8").strip()
+        if revision:
+            candidates.append(snapshots_dir / revision)
+    except OSError:
+        pass
+
+    try:
+        candidates.extend(
+            sorted(
+                (path for path in snapshots_dir.iterdir() if path.is_dir()),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+        )
+    except OSError:
+        pass
+
+    seen = set()
+    for snapshot in candidates:
+        try:
+            key = snapshot.resolve()
+        except OSError:
+            key = snapshot
+        if key in seen:
+            continue
+        seen.add(key)
+        if snapshot.is_dir() and all((snapshot / name).is_file() for name in required_files):
+            return snapshot
+    return None
+
+
+def _local_pretrained_path() -> Optional[str]:
+    snapshot = _local_hf_snapshot(_model_repo, ("open_clip_model.safetensors",))
+    if snapshot is None:
+        return None
+    weights = snapshot / "open_clip_model.safetensors"
+    return str(weights)
+
+
+def _load_tokenizer():
+    snapshot = _local_hf_snapshot(
+        _tokenizer_repo,
+        ("tokenizer.json", "tokenizer_config.json"),
+    )
+    if snapshot is None:
+        raise FileNotFoundError(f"local SigLIP tokenizer cache missing: {_tokenizer_repo}")
+
+    from open_clip.tokenizer import HFTokenizer
+
+    return HFTokenizer(
+        str(snapshot),
+        context_length=64,
+        clean="canonicalize",
+        local_files_only=True,
+    )
+
+
 def _load_model(preferred_device: Optional[str] = None):
     global _model, _preprocess, _tokenizer, _device
     if _model is not None:
@@ -108,9 +175,14 @@ def _load_model(preferred_device: Optional[str] = None):
 
         info = resolve_ai_device()
         target_device = preferred_device or info.device
-        _install_hf_warning_filters()
-        _model, _, _preprocess = open_clip.create_model_and_transforms(_model_name, pretrained=_pretrained)
-        _tokenizer = open_clip.get_tokenizer(_model_name)
+        pretrained_source = _local_pretrained_path()
+        if pretrained_source is None:
+            raise FileNotFoundError(f"local SigLIP model cache missing: {_model_repo}")
+        _model, _, _preprocess = open_clip.create_model_and_transforms(
+            _model_name,
+            pretrained=pretrained_source,
+        )
+        _tokenizer = _load_tokenizer()
         try:
             _model = _model.to(target_device)
         except Exception as exc:
@@ -147,7 +219,14 @@ def _load_model(preferred_device: Optional[str] = None):
 def is_available() -> bool:
     if _model is not None:
         return True
-    return _import_open_clip() is not None
+    return (
+        _import_open_clip() is not None
+        and _local_pretrained_path() is not None
+        and _local_hf_snapshot(
+            _tokenizer_repo,
+            ("tokenizer.json", "tokenizer_config.json"),
+        ) is not None
+    )
 
 
 def encode_image(file_id: int) -> Optional[np.ndarray]:

@@ -13,6 +13,9 @@ STRONG_SAMPLE_FILENAME_LIKE_PATTERNS = [
 CAMERA_BACKUP_ROOT_COMPONENTS = ["mobilebackup", "mobile backup"]
 CAMERA_BACKUP_ALBUM_ROOT_COMPONENTS = ["moments"]
 CAMERA_BACKUP_ALBUM_CHILD_COMPONENTS = ["dcim", "camera"]
+FORCED_LIFE_PATH_COMPONENT_CHAINS = [("photos", "moments")]
+CONFIRMED_SAMPLE_TAG = "category:confirmed-sample"
+CONFIRMED_SAMPLE_SOURCE = "manual"
 CAMERA_BACKUP_FILENAME_GLOB_PATTERNS = [
     "img_[0-9][0-9][0-9][0-9]*",
     "img[_-][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][_-][0-9][0-9][0-9][0-9][0-9][0-9]*",
@@ -81,6 +84,19 @@ def _source_candidates(folder_path, source_roots=None):
     return candidates, parts
 
 
+def is_forced_life_path(folder_path):
+    parts = [
+        part.lower()
+        for part in os.path.normpath(folder_path).replace("\\", "/").split("/")
+        if part
+    ]
+    for chain in FORCED_LIFE_PATH_COMPONENT_CHAINS:
+        chain_size = len(chain)
+        if any(tuple(parts[index:index + chain_size]) == chain for index in range(len(parts) - chain_size + 1)):
+            return True
+    return False
+
+
 def path_keyword_priority(folder_path, keywords, source_roots=None):
     if not keywords:
         return 0
@@ -105,6 +121,8 @@ def path_keyword_priority(folder_path, keywords, source_roots=None):
 
 
 def strong_life_source_priority(folder_path, source_roots=None):
+    if is_forced_life_path(folder_path):
+        return STRONG_LIFE_PRIORITY
     candidates, parts = _source_candidates(folder_path, source_roots)
     if any(any(kw in candidate for kw in STRONG_LIFE_SOURCE_KEYWORDS) for candidate in candidates):
         return STRONG_LIFE_PRIORITY
@@ -137,6 +155,24 @@ def _component_like_sql(path_sql, component):
 
 def _any_component_like_sql(path_sql, components):
     return "(" + " OR ".join(_component_like_sql(path_sql, component) for component in components) + ")"
+
+
+def _component_chain_like_sql(path_sql, components):
+    chain = "/".join(components)
+    return (
+        "("
+        f"{path_sql} = '{chain}' OR {path_sql} LIKE '{chain}/%' "
+        f"OR {path_sql} LIKE '%/{chain}' OR {path_sql} LIKE '%/{chain}/%'"
+        ")"
+    )
+
+
+def forced_life_path_sql(folder_path_expr="f.folder_path"):
+    path_sql = path_text_sql(folder_path_expr)
+    return "(" + " OR ".join(
+        _component_chain_like_sql(path_sql, chain)
+        for chain in FORCED_LIFE_PATH_COMPONENT_CHAINS
+    ) + ")"
 
 
 def strong_life_source_sql(folder_path_expr="f.folder_path"):
@@ -214,6 +250,8 @@ def protected_film_output_life_sql(folder_path_expr="f.folder_path"):
 def protected_life_override_sql(folder_path_expr="f.folder_path", file_name_expr="f.file_name"):
     return (
         "("
+        + forced_life_path_sql(folder_path_expr)
+        + " OR "
         + protected_camera_backup_sql(folder_path_expr, file_name_expr)
         + " OR "
         + protected_film_output_life_sql(folder_path_expr)
@@ -236,28 +274,46 @@ def sample_keyword_exists_sql(file_alias="f"):
     )
 
 
+def confirmed_sample_override_sql(file_alias="f"):
+    return (
+        "EXISTS ("
+        "SELECT 1 FROM photo_tags confirmed_sample "
+        f"WHERE confirmed_sample.file_id = {file_alias}.id "
+        f"AND confirmed_sample.tag = '{CONFIRMED_SAMPLE_TAG}' "
+        f"AND confirmed_sample.source = '{CONFIRMED_SAMPLE_SOURCE}'"
+        ")"
+    )
+
+
 def category_match_sql(cat_id, file_alias="f", folder_alias="fc", metadata_alias="pm"):
     sample_keyword_match = sample_keyword_exists_sql(file_alias)
     strong_life_source = strong_life_source_sql(f"{file_alias}.folder_path")
     strong_sample_source = strong_sample_source_sql(f"{file_alias}.folder_path")
     strong_sample_filename = strong_sample_filename_sql(f"{file_alias}.file_name")
     protected_life_override = protected_life_override_sql(f"{file_alias}.folder_path", f"{file_alias}.file_name")
+    forced_life_path = forced_life_path_sql(f"{file_alias}.folder_path")
+    confirmed_sample_override = confirmed_sample_override_sql(file_alias)
     if cat_id == CATEGORY_SAMPLE:
-        return (
-            f"((NOT {protected_life_override}) AND ({strong_sample_filename} OR {metadata_alias}.category = ? OR (NOT {strong_life_source} AND "
+        base_sample = (
+            f"({strong_sample_filename} OR {metadata_alias}.category = ? OR (NOT {strong_life_source} AND "
             f"({strong_sample_source} OR "
             f"({metadata_alias}.category IS NULL AND "
             f"(COALESCE({folder_alias}.category, {CATEGORY_LIFE}) = {CATEGORY_SAMPLE} "
-            f"OR {sample_keyword_match}))))))"
+            f"OR {sample_keyword_match})))))"
+        )
+        return (
+            f"({confirmed_sample_override} OR ((NOT {forced_life_path}) AND "
+            f"((NOT {protected_life_override}) AND {base_sample})))"
         )
     if cat_id == CATEGORY_LIFE:
-        return (
-            f"({protected_life_override} OR {metadata_alias}.category = ? OR (NOT {strong_sample_filename} AND {metadata_alias}.category IS NULL "
+        base_life = (
+            f"({protected_life_override} OR {metadata_alias}.category = ? OR "
+            f"(NOT {strong_sample_filename} AND {metadata_alias}.category IS NULL "
             f"AND ({strong_life_source} OR (NOT {strong_sample_source} AND "
-            f"("
             f"(COALESCE({folder_alias}.category, {CATEGORY_LIFE}) = {CATEGORY_LIFE} "
-            f"AND NOT {sample_keyword_match}))))))"
+            f"AND NOT {sample_keyword_match})))))"
         )
+        return f"((NOT {confirmed_sample_override}) AND ({forced_life_path} OR {base_life}))"
     return f"{metadata_alias}.category = ?"
 
 
@@ -267,16 +323,25 @@ def category_match_without_folder_sql(cat_id, file_alias="f", metadata_alias="pm
     strong_sample_source = strong_sample_source_sql(f"{file_alias}.folder_path")
     strong_sample_filename = strong_sample_filename_sql(f"{file_alias}.file_name")
     protected_life_override = protected_life_override_sql(f"{file_alias}.folder_path", f"{file_alias}.file_name")
+    forced_life_path = forced_life_path_sql(f"{file_alias}.folder_path")
+    confirmed_sample_override = confirmed_sample_override_sql(file_alias)
     if cat_id == CATEGORY_SAMPLE:
-        return (
-            f"((NOT {protected_life_override}) AND ({strong_sample_filename} OR {metadata_alias}.category = {CATEGORY_SAMPLE} OR (NOT {strong_life_source} AND "
+        base_sample = (
+            f"({strong_sample_filename} OR {metadata_alias}.category = {CATEGORY_SAMPLE} OR "
+            f"(NOT {strong_life_source} AND "
             f"({strong_sample_source} OR "
-            f"({metadata_alias}.category IS NULL AND {sample_keyword_match})))))"
+            f"({metadata_alias}.category IS NULL AND {sample_keyword_match}))))"
+        )
+        return (
+            f"({confirmed_sample_override} OR ((NOT {forced_life_path}) AND "
+            f"((NOT {protected_life_override}) AND {base_sample})))"
         )
     if cat_id == CATEGORY_LIFE:
-        return (
-            f"({protected_life_override} OR {metadata_alias}.category = {CATEGORY_LIFE} OR (NOT {strong_sample_filename} AND "
+        base_life = (
+            f"({protected_life_override} OR {metadata_alias}.category = {CATEGORY_LIFE} OR "
+            f"(NOT {strong_sample_filename} AND "
             f"{metadata_alias}.category IS NULL AND ({strong_life_source} OR "
             f"(NOT {strong_sample_source} AND NOT {sample_keyword_match}))))"
         )
+        return f"((NOT {confirmed_sample_override}) AND ({forced_life_path} OR {base_life}))"
     return "1 = 0"

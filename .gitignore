@@ -11,13 +11,15 @@ venv/
 *.code-workspace
 PROJECT_FULL_DUMP.txt
 error.log
-启动GPU相册.bat
+!启动GPU相册.bat
 *.log
 *.tmp
 *.bak
 *.old
 .pytest_cache/
+.codex-diagnostics/
 *.egg-info/
+node_modules/
 dist/
 build/
 *.exe.old

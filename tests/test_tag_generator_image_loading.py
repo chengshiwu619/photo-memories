@@ -153,3 +153,58 @@ def test_generate_tags_batch_returns_partial_success_with_encode_failures(monkey
     assert result["encoded_count"] == 1
     assert result["encode_failed_count"] == 1
     assert result["encode_errors"][0]["reason"] == "thumbnail_not_found"
+
+
+def test_generate_tags_batch_reports_text_model_failure(monkeypatch, tmp_path):
+    settings = _FakeSettings(str(tmp_path / "thumbs"))
+    monkeypatch.setattr(tg, "is_available", lambda: True)
+    monkeypatch.setattr(tg, "_get_text_embeddings", lambda candidates: _FakeArray([]))
+
+    result = tg.generate_tags_batch(
+        [3, 4],
+        candidates=["nsfw"],
+        settings=settings,
+        return_diagnostics=True,
+    )
+
+    assert result["tags_by_file"] == {}
+    assert result["encoded_count"] == 0
+    assert result["encode_failed_count"] == 2
+    assert {item["reason"] for item in result["encode_errors"]} == {"model_text_encode_failed"}
+
+
+def test_visual_review_tags_use_calibrated_thresholds_only_for_default_candidates():
+    assert tg._candidate_threshold("gravure", 0.25, True) == 0.25
+    assert tg._candidate_threshold("nsfw", 0.25, True) == 0.052
+    assert tg._candidate_threshold("nude", 0.25, True) == 0.07
+    assert tg._candidate_threshold("explicit", 0.25, True) == 0.097
+    assert tg._candidate_threshold("nipples", 0.25, True) == 0.083
+    assert tg._candidate_threshold("female genitals", 0.25, True) == 0.1
+    assert tg._candidate_threshold("vulva", 0.25, True) == 0.061
+    assert tg._candidate_threshold("labia", 0.25, True) == 0.076
+    assert tg._candidate_threshold("beach", 0.25, True) == 0.25
+    assert tg._candidate_threshold("gravure", 0.25, False) == 0.25
+
+
+def test_visual_review_prompts_use_explicit_descriptions(monkeypatch):
+    captured = []
+    tg._text_embeddings_cache.clear()
+    monkeypatch.setattr(tg, "encode_text", lambda prompts: captured.extend(prompts) or _FakeArray([[1.0]]))
+
+    tg._get_text_embeddings(["vulva"])
+
+    assert captured == ["a clearly visible vulva"]
+
+
+def test_calibrated_anatomy_tag_is_checked_outside_top_k():
+    similarities = tg.np.array([0.9, 0.07])
+
+    tags = tg._select_tags(
+        similarities,
+        ["beach", "vulva"],
+        top_k=1,
+        threshold=0.25,
+        use_visual_calibration=True,
+    )
+
+    assert tags == ["beach", "vulva", tg.CALIBRATED_REVIEW_TAG]

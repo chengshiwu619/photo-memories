@@ -34,25 +34,96 @@ TAG_CANDIDATES_EN = [
     "graduation", "school", "classroom", "office", "meeting",
     "park", "playground", "museum", "library",
     "selfie", "group photo", "portrait", "landscape",
-    "nsfw", "nude", "explicit", "lingerie", "gravure", "model portrait", "photobook",
+    "nsfw", "nude", "explicit", "nipples", "female genitals", "vulva", "labia",
+    "lingerie", "gravure", "model portrait", "photobook",
 ]
 
 DEFAULT_TOP_K = 5
 DEFAULT_THRESHOLD = 0.25
 THUMBNAIL_MODEL_SIZE = (384, 384)
+SIGLIP_STATUS_SOURCE = "siglip-v3-nsfw"
+CALIBRATED_REVIEW_TAG = "nsfw-review:calibrated-v3"
+VISUAL_REVIEW_TRIGGER_TAGS = {
+    "nsfw",
+    "nude",
+    "explicit",
+    "nipples",
+    "female genitals",
+    "vulva",
+    "labia",
+}
+VISUAL_REVIEW_PROMPTS = {
+    "nsfw": "adult content, not safe for work",
+    "nude": "an erotic nude photo",
+    "explicit": "a sexually explicit image",
+    "nipples": "visible nipples in a photo",
+    "female genitals": "visible female genitals in a photo",
+    "vulva": "a clearly visible vulva",
+    "labia": "clearly visible labia",
+}
+VISUAL_REVIEW_THRESHOLDS = {
+    "nsfw": 0.052,
+    "nude": 0.070,
+    "explicit": 0.097,
+    "nipples": 0.083,
+    "female genitals": 0.100,
+    "vulva": 0.061,
+    "labia": 0.076,
+}
 
 _text_embeddings_cache: Dict[str, np.ndarray] = {}
 
 
+def _candidate_threshold(candidate: str, default_threshold: float, use_visual_calibration: bool) -> float:
+    if use_visual_calibration:
+        return VISUAL_REVIEW_THRESHOLDS.get(candidate, default_threshold)
+    return default_threshold
+
+
+def _candidate_prompt(candidate: str) -> str:
+    return VISUAL_REVIEW_PROMPTS.get(candidate, candidate)
+
+
 def _get_text_embeddings(candidates: List[str]) -> np.ndarray:
-    key = "|".join(candidates)
+    prompts = [_candidate_prompt(candidate) for candidate in candidates]
+    key = "|".join(f"{candidate}\0{prompt}" for candidate, prompt in zip(candidates, prompts))
     if key not in _text_embeddings_cache:
-        result = encode_text(candidates)
+        result = encode_text(prompts)
         if result is not None:
             _text_embeddings_cache[key] = result
         else:
             return np.array([])
     return _text_embeddings_cache[key]
+
+
+def _select_tags(
+    similarities,
+    candidates: List[str],
+    top_k: int,
+    threshold: float,
+    use_visual_calibration: bool,
+) -> List[str]:
+    ranked_indices = list(np.argsort(similarities)[::-1][:top_k])
+    if use_visual_calibration:
+        ranked_indices.extend(
+            index
+            for index, candidate in enumerate(candidates)
+            if candidate in VISUAL_REVIEW_TRIGGER_TAGS and index not in ranked_indices
+        )
+
+    tags = []
+    for index in ranked_indices:
+        candidate = candidates[index]
+        if similarities[index] >= _candidate_threshold(
+            candidate,
+            threshold,
+            use_visual_calibration,
+        ):
+            tags.append(candidate)
+
+    if use_visual_calibration and any(tag in VISUAL_REVIEW_TRIGGER_TAGS for tag in tags):
+        tags.append(CALIBRATED_REVIEW_TAG)
+    return tags
 
 
 def _resolve_settings(settings: Any = None):
@@ -195,6 +266,7 @@ def generate_tags_for_image(
     if not is_available():
         return []
 
+    use_visual_calibration = candidates is None
     if candidates is None:
         candidates = TAG_CANDIDATES_ZH + TAG_CANDIDATES_EN
 
@@ -208,13 +280,13 @@ def generate_tags_for_image(
 
     similarities = compute_similarity(image_emb, text_emb)
 
-    top_indices = np.argsort(similarities)[::-1][:top_k]
-    tags = []
-    for idx in top_indices:
-        if similarities[idx] >= threshold:
-            tags.append(candidates[idx])
-
-    return tags
+    return _select_tags(
+        similarities,
+        candidates,
+        top_k,
+        threshold,
+        use_visual_calibration,
+    )
 
 
 def generate_tags_batch(
@@ -237,16 +309,26 @@ def generate_tags_batch(
         }
         return detailed if return_diagnostics else {}
 
+    use_visual_calibration = candidates is None
     if candidates is None:
         candidates = TAG_CANDIDATES_ZH + TAG_CANDIDATES_EN
 
     text_emb = _get_text_embeddings(candidates)
     if text_emb.size == 0:
+        resolved_settings = _resolve_settings(settings)
         detailed = {
             "tags_by_file": {},
             "encoded_count": 0,
-            "encode_failed_count": 0,
-            "encode_errors": [],
+            "encode_failed_count": len(file_ids),
+            "encode_errors": [
+                _thumbnail_error(
+                    file_id,
+                    resolved_settings,
+                    "model_text_encode_failed",
+                    "SigLIP text model unavailable",
+                )
+                for file_id in file_ids
+            ],
         }
         return detailed if return_diagnostics else {}
 
@@ -255,9 +337,13 @@ def generate_tags_batch(
     result = {}
     for file_id, image_emb in image_results["embeddings"]:
         similarities = compute_similarity(image_emb, text_emb)
-        top_indices = np.argsort(similarities)[::-1][:top_k]
-        tags = [candidates[idx] for idx in top_indices if similarities[idx] >= threshold]
-        result[file_id] = tags
+        result[file_id] = _select_tags(
+            similarities,
+            candidates,
+            top_k,
+            threshold,
+            use_visual_calibration,
+        )
 
     if return_diagnostics:
         return {
